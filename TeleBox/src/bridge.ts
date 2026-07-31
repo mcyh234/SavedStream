@@ -852,10 +852,10 @@ async function thumbnail(
   } catch (error) {
     if (!String(msg.file?.mimeType || "").startsWith("image/")) throw error;
   }
-  if (!data && String(msg.file?.mimeType || "").startsWith("image/")) {
+  if ((!data || data.length === 0) && String(msg.file?.mimeType || "").startsWith("image/")) {
     data = (await a.client.downloadMedia(msg, {})) as Buffer;
   }
-  if (!data) return send(res, 404, { detail: "thumbnail unavailable" });
+  if (!data || data.length === 0) return send(res, 404, { detail: "thumbnail unavailable" });
   send(res, 200, data, "image/jpeg");
 }
 

@@ -261,7 +261,7 @@ async def list_media(
         item["local_title"] = local_titles.get(item["id"])
         item["title"] = item["local_title"] or item["original_title"]
         item["account_id"] = account
-        item["thumbnail_url"] = f"/api/media/{item['id']}/thumbnail?account={quote(account)}&size={item['size']}" if item["has_thumbnail"] else None
+        item["thumbnail_url"] = f"/api/media/{item['id']}/thumbnail?account={quote(account)}&size={item['size']}&v=2" if item["has_thumbnail"] else None
         item["stream_url"] = f"/api/media/{item['id']}/stream?account={quote(account)}"
     return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
 
