@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+backend/tests
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+work
+*.log

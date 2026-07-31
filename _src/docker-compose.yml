@@ -1,0 +1,87 @@
+services:
+  telebox:
+    build:
+      context: ../TeleBox
+      dockerfile: Dockerfile.bridge
+    image: "${TELEBOX_IMAGE:-telebox-bridge:local}"
+    restart: unless-stopped
+    init: true
+    environment:
+      TELEBOX_API_TOKEN: "${TELEBOX_API_TOKEN:?TELEBOX_API_TOKEN is required}"
+      TELEBOX_SECRET_KEY: "${TELEBOX_SECRET_KEY:-}"
+      TELEBOX_DEFAULT_ACCOUNT: "${TELEBOX_DEFAULT_ACCOUNT:-default}"
+      TELEBOX_DATA_DIR: /data
+      TB_LOCALSTORAGE_FILE: /tmp/node-localstorage
+      XDG_CACHE_HOME: /tmp/.cache
+    volumes:
+      - telebox-data:/data
+    expose:
+      - "9000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,noexec,nosuid,nodev
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+
+  savedstream:
+    build:
+      context: .
+    image: "${SAVEDSTREAM_IMAGE:-savedstream:local}"
+    restart: unless-stopped
+    init: true
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:-0}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
+      ADMIN_KEY: "${ADMIN_KEY:-}"
+      TELEBOX_URL: "http://telebox:9000"
+      TELEBOX_API_TOKEN: "${TELEBOX_API_TOKEN:?TELEBOX_API_TOKEN is required}"
+      DATA_DIR: /data
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      SESSION_COOKIE_DAYS: "${SESSION_COOKIE_DAYS:-30}"
+    ports:
+      - "127.0.0.1:${PORT:-8000}:8000"
+    depends_on:
+      telebox:
+        condition: service_healthy
+    volumes:
+      - savedstream-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      savedstream:
+        condition: service_healthy
+    environment:
+      CADDY_SITE: "${CADDY_SITE:-http://localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  savedstream-data:
+  telebox-data:
+  caddy-data:
+  caddy-config:

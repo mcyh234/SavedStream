@@ -1,0 +1,51 @@
+# Local deployment credentials and generated packages
+deploy.config.json
+savedstream.zip
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Secrets and runtime data
+.env
+.env.*
+!.env.example
+!.env-sample
+*.db
+*.sqlite
+*.sqlite3
+*.enc
+*.session
+data/
+.bridge-smoke/
+
+# Dependencies and build output
+**/node_modules/
+**/dist/
+**/build/
+**/coverage/
+**/.cache/
+**/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+*.tsbuildinfo
+
+# TeleBox runtime directories
+TeleBox/config.json
+TeleBox/logs/
+TeleBox/temp/
+TeleBox/my_session/
+TeleBox/assets/*
+!TeleBox/assets/.gitkeep
+TeleBox/plugins/*
+!TeleBox/plugins/.gitkeep
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+*.swp
+*.swo
+*~
