@@ -3,6 +3,7 @@ import { AlertTriangle, LoaderCircle, ServerCog } from "lucide-react";
 import { api, errorMessage } from "./api";
 import { AdminKeyGate, CenterShell, ViewerGate } from "./AuthPanels";
 import GalleryPage from "./GalleryPage";
+import { MediaEncryptionGate } from "./MediaCrypto";
 import AdminPage from "./AdminPage";
 import type { PublicStatus } from "./types";
 
@@ -78,5 +79,9 @@ export default function App() {
     );
   }
 
-  return <GalleryPage />;
+  if (!status.media_authenticated) {
+    return <AdminKeyGate onAuthenticated={refreshStatus} />;
+  }
+
+  return <MediaEncryptionGate><GalleryPage /></MediaEncryptionGate>;
 }

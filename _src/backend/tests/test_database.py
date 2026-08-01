@@ -67,3 +67,22 @@ def test_local_titles_are_isolated_by_account(tmp_path: Path) -> None:
         assert await database.get_local_titles([42], "beta") == {42: "Account B"}
 
     asyncio.run(verify())
+
+
+def test_device_keys_can_be_registered_touched_and_revoked(tmp_path: Path) -> None:
+    async def verify() -> None:
+        database = Database(tmp_path / "device-keys.db")
+        await database.initialize()
+        await database.register_device_key("fingerprint", "public-key")
+        record = await database.get_device_key("fingerprint")
+        assert record is not None
+        assert record["public_key_pem"] == "public-key"
+        assert record["revoked"] == 0
+        await database.revoke_device_key("fingerprint")
+        assert (await database.get_device_key("fingerprint"))["revoked"] == 1
+        assert not await database.register_device_key("fingerprint", "updated-key")
+        restored = await database.get_device_key("fingerprint")
+        assert restored["public_key_pem"] == "updated-key"
+        assert restored["revoked"] == 1
+
+    asyncio.run(verify())

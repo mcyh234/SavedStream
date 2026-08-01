@@ -59,6 +59,9 @@ class TokenSigner:
             body_text, signature_text = token.split(".", 1)
             body = body_text.encode("ascii")
             signature = _decode_base64(signature_text)
+            canonical_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+            if not hmac.compare_digest(signature_text, canonical_signature):
+                return False
             expected = hmac.new(self._secret, body, hashlib.sha256).digest()
             if not hmac.compare_digest(signature, expected):
                 return False

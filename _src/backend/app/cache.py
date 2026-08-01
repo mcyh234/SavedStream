@@ -9,11 +9,19 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from .media_crypto import CacheCipher, CacheDecryptionError
+
 
 class DiskCache:
-    def __init__(self, root: Path, limit_provider: Callable[[], Awaitable[int]]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        limit_provider: Callable[[], Awaitable[int]],
+        encryption_key: str,
+    ) -> None:
         self.root = root
         self._limit_provider = limit_provider
+        self._cipher = CacheCipher(encryption_key)
         self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._locks_guard = asyncio.Lock()
         self._eviction_lock = asyncio.Lock()
@@ -30,21 +38,24 @@ class DiskCache:
         loader: Callable[[], Awaitable[bytes]],
     ) -> bytes:
         path = self.root / "chunks" / self._key_digest(media_key) / f"{chunk_index}.bin"
-        return await self._get_or_create(path, loader, expected_size=expected_size)
+        return await self._get_or_create(
+            path, media_key, loader, expected_size=expected_size
+        )
 
     async def get_thumbnail(
         self, media_key: str, loader: Callable[[], Awaitable[bytes]]
     ) -> bytes:
         path = self.root / "thumbnails" / f"{self._key_digest(media_key)}.img"
-        return await self._get_or_create(path, loader)
+        return await self._get_or_create(path, media_key, loader)
 
     async def get_cached_thumbnail(self, media_key: str) -> bytes | None:
         path = self.root / "thumbnails" / f"{self._key_digest(media_key)}.img"
-        return await asyncio.to_thread(self._read_cached, path, None)
+        return await asyncio.to_thread(self._read_cached, path, media_key, None)
 
     async def _get_or_create(
         self,
         path: Path,
+        media_key: str,
         loader: Callable[[], Awaitable[bytes]],
         *,
         expected_size: int | None = None,
@@ -53,7 +64,7 @@ class DiskCache:
         try:
             async with lock:
                 cached = await asyncio.to_thread(
-                    self._read_cached, path, expected_size
+                    self._read_cached, path, media_key, expected_size
                 )
                 if cached is not None:
                     return cached
@@ -69,7 +80,9 @@ class DiskCache:
 
                 async with self._eviction_lock:
                     if generation == self._generation:
-                        await asyncio.to_thread(self._atomic_write, path, data)
+                        await asyncio.to_thread(
+                            self._atomic_write, path, media_key, data
+                        )
                 await self.evict_if_needed()
                 return data
         finally:
@@ -110,14 +123,20 @@ class DiskCache:
             limit = await self._limit_provider()
             await asyncio.to_thread(self._evict_sync, limit)
 
-    @staticmethod
-    def _read_cached(path: Path, expected_size: int | None) -> bytes | None:
+    def _read_cached(
+        self, path: Path, media_key: str, expected_size: int | None
+    ) -> bytes | None:
         try:
-            if expected_size is not None and path.stat().st_size != expected_size:
-                path.unlink(missing_ok=True)
-                return None
-            data = path.read_bytes()
+            payload = path.read_bytes()
         except FileNotFoundError:
+            return None
+        try:
+            data = self._cipher.decrypt(payload, media_key.encode("utf-8"))
+        except CacheDecryptionError:
+            path.unlink(missing_ok=True)
+            return None
+        if expected_size is not None and len(data) != expected_size:
+            path.unlink(missing_ok=True)
             return None
         try:
             now = time.time()
@@ -130,13 +149,13 @@ class DiskCache:
     def _key_digest(key: str) -> str:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
+    def _atomic_write(self, path: Path, media_key: str, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        encrypted = self._cipher.encrypt(data, media_key.encode("utf-8"))
         handle, temporary_name = tempfile.mkstemp(prefix=".part-", dir=path.parent)
         try:
             with os.fdopen(handle, "wb") as temporary:
-                temporary.write(data)
+                temporary.write(encrypted)
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, path)

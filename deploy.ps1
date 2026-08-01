@@ -264,6 +264,7 @@ $teleBoxImage = "telebox-bridge:deploy-$stamp"
 $adminCandidate = New-HexSecret
 $apiTokenCandidate = New-HexSecret
 $secretKeyCandidate = New-HexSecret
+$mediaCacheKeyCandidate = New-HexSecret
 $site = if ($Domain) { $Domain.ToLowerInvariant() } else { "http://$Server" }
 $cookieSecure = if ($Domain) { "true" } else { "false" }
 
@@ -330,6 +331,7 @@ COOKIE_SECURE='__COOKIE_SECURE__'
 ADMIN_CANDIDATE='__ADMIN_CANDIDATE__'
 API_TOKEN_CANDIDATE='__API_TOKEN_CANDIDATE__'
 SECRET_KEY_CANDIDATE='__SECRET_KEY_CANDIDATE__'
+MEDIA_CACHE_KEY_CANDIDATE='__MEDIA_CACHE_KEY_CANDIDATE__'
 SAVEDSTREAM_IMAGE='__SAVEDSTREAM_IMAGE__'
 TELEBOX_IMAGE='__TELEBOX_IMAGE__'
 
@@ -389,6 +391,7 @@ set_env() {
 ensure_secret ADMIN_KEY "$ADMIN_CANDIDATE"
 ensure_secret TELEBOX_API_TOKEN "$API_TOKEN_CANDIDATE"
 ensure_secret TELEBOX_SECRET_KEY "$SECRET_KEY_CANDIDATE"
+ensure_secret MEDIA_CACHE_KEY "$MEDIA_CACHE_KEY_CANDIDATE"
 ensure_env TELEBOX_DEFAULT_ACCOUNT default
 ensure_env SESSION_COOKIE_DAYS 30
 set_env PORT 8000
@@ -543,6 +546,7 @@ docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-direct
         Replace('__ADMIN_CANDIDATE__', $adminCandidate).
         Replace('__API_TOKEN_CANDIDATE__', $apiTokenCandidate).
         Replace('__SECRET_KEY_CANDIDATE__', $secretKeyCandidate).
+        Replace('__MEDIA_CACHE_KEY_CANDIDATE__', $mediaCacheKeyCandidate).
         Replace('__SAVEDSTREAM_IMAGE__', $savedStreamImage).
         Replace('__TELEBOX_IMAGE__', $teleBoxImage)
 

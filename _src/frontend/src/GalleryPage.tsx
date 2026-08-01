@@ -19,6 +19,7 @@ import {
   X,
 } from "lucide-react";
 import { api, errorMessage } from "./api";
+import { useMediaCrypto } from "./MediaCrypto";
 import type { AccountStatus, MediaItem, MediaKind, MediaPage } from "./types";
 
 const filters: Array<{ value: MediaKind; label: string; icon: typeof Home }> = [
@@ -220,6 +221,7 @@ export default function GalleryPage() {
 
 function MediaCard({ item, onOpen }: { item: MediaItem; onOpen: () => void }) {
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const handleThumbnailError = useCallback(() => setThumbnailFailed(true), []);
   return (
     <button className="media-card" onClick={onOpen} type="button" aria-label={`打开 ${item.title}`}>
       <div className={`media-poster kind-${item.kind}`}>
@@ -227,7 +229,7 @@ function MediaCard({ item, onOpen }: { item: MediaItem; onOpen: () => void }) {
           <ThumbnailImage
             src={item.thumbnail_url}
             alt=""
-            onError={() => setThumbnailFailed(true)}
+            onError={handleThumbnailError}
           />
         ) : (
           <FileKindIcon kind={item.kind} mime={item.mime_type} />
@@ -262,9 +264,7 @@ function MediaViewer({ item, onClose }: { item: MediaItem; onClose: () => void }
         <div className="viewer-topbar">
           <h2 id="viewer-title">{item.title}</h2>
           <div>
-            <a className="icon-button" href={downloadUrl(item.stream_url)} aria-label="下载文件" title="下载">
-              <Download size={20} />
-            </a>
+            <EncryptedDownloadButton item={item} iconOnly />
             <button className="icon-button" onClick={onClose} aria-label="关闭播放器" title="关闭" type="button">
               <X size={22} />
             </button>
@@ -275,19 +275,12 @@ function MediaViewer({ item, onClose }: { item: MediaItem; onClose: () => void }
             <ViewerVideo item={item} />
           )}
           {item.kind === "image" && <ViewerImage item={item} />}
-          {item.kind === "audio" && (
-            <div className="audio-player">
-              <AudioLines size={64} />
-              <audio controls autoPlay src={item.stream_url} />
-            </div>
-          )}
+          {item.kind === "audio" && <ViewerAudio item={item} />}
           {item.kind === "file" && (
             <div className="file-download">
               <FileKindIcon kind={item.kind} mime={item.mime_type} />
               <p>{item.filename}</p>
-              <a className="button primary" href={downloadUrl(item.stream_url)}>
-                <Download size={18} />下载文件
-              </a>
+              <EncryptedDownloadButton item={item} />
             </div>
           )}
         </div>
@@ -320,8 +313,27 @@ export function ThumbnailImage({
   alt: string;
   onError: () => void;
 }) {
+  const mediaCrypto = useMediaCrypto();
   const [loaded, setLoaded] = useState(false);
-  useEffect(() => setLoaded(false), [src]);
+  const [objectUrl, setObjectUrl] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    let createdUrl = "";
+    const encryptedUrl = src.replace("/thumbnail", "/encrypted-thumbnail");
+    setLoaded(false);
+    setObjectUrl("");
+    void mediaCrypto.fetchAndDecrypt(encryptedUrl).then(({ data, headers }) => {
+      if (cancelled) return;
+      createdUrl = URL.createObjectURL(new Blob([data], { type: headers.get("X-SavedStream-Mime") || "image/jpeg" }));
+      setObjectUrl(createdUrl);
+    }).catch(() => {
+      if (!cancelled) onError();
+    });
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [src, mediaCrypto, onError]);
   return (
     <>
       {!loaded && (
@@ -329,55 +341,217 @@ export function ThumbnailImage({
           <LoaderCircle className="spin" size={26} />
         </span>
       )}
-      <img
-        className={loaded ? "thumbnail-ready" : "thumbnail-pending"}
-        src={src}
-        alt={alt}
-        loading="lazy"
-        onLoad={() => setLoaded(true)}
-        onError={onError}
-      />
+      {objectUrl && (
+        <img
+          className={loaded ? "thumbnail-ready" : "thumbnail-pending"}
+          src={objectUrl}
+          alt={alt}
+          onLoad={() => setLoaded(true)}
+          onError={onError}
+        />
+      )}
     </>
   );
 }
 
+async function loadEncryptedBlob(item: MediaItem, mediaCrypto: ReturnType<typeof useMediaCrypto>) {
+  const chunks: ArrayBuffer[] = [];
+  const chunkSize = 512 * 1024;
+  for (let offset = 0; offset < item.size; offset += chunkSize) {
+    const length = Math.min(chunkSize, item.size - offset);
+    const url = `/api/media/${item.id}/encrypted-chunk?account=${encodeURIComponent(item.account_id)}&offset=${offset}&length=${length}`;
+    const result = await mediaCrypto.fetchAndDecrypt(url);
+    chunks.push(result.data);
+  }
+  return new Blob(chunks, { type: item.mime_type });
+}
+
+interface FileWriter {
+  write(data: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+interface FilePickerWindow extends Window {
+  showSaveFilePicker?: (options: { suggestedName: string }) => Promise<{
+    createWritable(): Promise<FileWriter>;
+  }>;
+}
+
+function encryptedChunkUrl(item: MediaItem, offset: number, length: number) {
+  return `/api/media/${item.id}/encrypted-chunk?account=${encodeURIComponent(item.account_id)}&offset=${offset}&length=${length}`;
+}
+
+async function downloadEncryptedMedia(item: MediaItem, mediaCrypto: ReturnType<typeof useMediaCrypto>) {
+  const picker = (window as FilePickerWindow).showSaveFilePicker;
+  if (picker) {
+    const handle = await picker({ suggestedName: item.filename });
+    const writable = await handle.createWritable();
+    try {
+      const chunkSize = 512 * 1024;
+      for (let offset = 0; offset < item.size; offset += chunkSize) {
+        const result = await mediaCrypto.fetchAndDecrypt(encryptedChunkUrl(item, offset, Math.min(chunkSize, item.size - offset)));
+        await writable.write(new Uint8Array(result.data));
+      }
+      await writable.close();
+    } catch (reason) {
+      await writable.abort().catch(() => undefined);
+      throw reason;
+    }
+    return;
+  }
+
+  const blob = await loadEncryptedBlob(item, mediaCrypto);
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = item.filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
+function EncryptedDownloadButton({ item, iconOnly = false }: { item: MediaItem; iconOnly?: boolean }) {
+  const mediaCrypto = useMediaCrypto();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const download = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await downloadEncryptedMedia(item, mediaCrypto);
+    } catch (reason) {
+      if ((reason as DOMException)?.name !== "AbortError") setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }, [item, mediaCrypto]);
+  return (
+    <>
+      <button className={iconOnly ? "icon-button" : "button primary"} disabled={busy} onClick={() => void download()} aria-label="Encrypted download" title="Encrypted download" type="button">
+        {busy ? <LoaderCircle className="spin" size={iconOnly ? 20 : 18} /> : <Download size={iconOnly ? 20 : 18} />}
+        {!iconOnly && "Encrypted download"}
+      </button>
+      {error && <span className="form-error" role="alert">{error}</span>}
+    </>
+  );
+}
+
+function ViewerAudio({ item }: { item: MediaItem }) {
+  const mediaCrypto = useMediaCrypto();
+  const [source, setSource] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = "";
+    void loadEncryptedBlob(item, mediaCrypto).then((blob) => {
+      if (cancelled) return;
+      objectUrl = URL.createObjectURL(blob);
+      setSource(objectUrl);
+    }).catch((reason) => { if (!cancelled) setError(errorMessage(reason)); });
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [item, mediaCrypto]);
+  return (
+    <div className="audio-player">
+      <AudioLines size={64} />
+      {!source && !error && <LoaderCircle className="spin" size={28} />}
+      {error ? <span className="form-error" role="alert">{error}</span> : source ? <audio controls autoPlay src={source} /> : null}
+    </div>
+  );
+}
 function ViewerImage({ item }: { item: MediaItem }) {
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const mediaCrypto = useMediaCrypto();
+  const [source, setSource] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void loadEncryptedBlob(item, mediaCrypto).then((blob) => {
+      if (!cancelled) setSource(URL.createObjectURL(blob));
+    }).catch((reason) => {
+      if (!cancelled) setError(errorMessage(reason));
+    });
+    return () => {
+      cancelled = true;
+      setSource((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return "";
+      });
+    };
+  }, [item, mediaCrypto]);
   return (
     <div className="viewer-media-loader">
-      {!loaded && !failed && <LoaderCircle className="spin" size={34} aria-label="正在加载图片" />}
-      {failed ? (
-        <div className="viewer-media-error"><ImageIcon size={42} /><span>图片加载失败</span></div>
-      ) : (
-        <img src={item.stream_url} alt={item.title} onLoad={() => setLoaded(true)} onError={() => setFailed(true)} />
-      )}
+      {!source && !error && <LoaderCircle className="spin" size={34} aria-label="正在解密图片" />}
+      {error ? (
+        <div className="viewer-media-error"><ImageIcon size={42} /><span>图片解密失败：{error}</span></div>
+      ) : source ? <img src={source} alt={item.title} /> : null}
     </div>
   );
 }
 
 function ViewerVideo({ item }: { item: MediaItem }) {
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const mediaCrypto = useMediaCrypto();
+  const [source, setSource] = useState("");
+  const [error, setError] = useState("");
+  const [progress, setProgress] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let mediaSource: MediaSource | undefined;
+    let objectUrl = "";
+    async function stream() {
+      if (!MediaSource.isTypeSupported(item.mime_type)) {
+        throw new Error("当前浏览器不支持该视频格式的加密流播放");
+      }
+      mediaSource = new MediaSource();
+      objectUrl = URL.createObjectURL(mediaSource);
+      if (!cancelled) setSource(objectUrl);
+      await new Promise<void>((resolve, reject) => {
+        mediaSource!.addEventListener("sourceopen", () => resolve(), { once: true });
+        mediaSource!.addEventListener("error", () => reject(new Error("视频解密流初始化失败")), { once: true });
+      });
+      const buffer = mediaSource.addSourceBuffer(item.mime_type);
+      const chunkSize = 512 * 1024;
+      for (let offset = 0; offset < item.size; offset += chunkSize) {
+        const length = Math.min(chunkSize, item.size - offset);
+        const url = `/api/media/${item.id}/encrypted-chunk?account=${encodeURIComponent(item.account_id)}&offset=${offset}&length=${length}`;
+        const result = await mediaCrypto.fetchAndDecrypt(url);
+        await appendBuffer(buffer, result.data);
+        if (!cancelled) setProgress(Math.min(100, ((offset + length) / item.size) * 100));
+      }
+      if (!cancelled && mediaSource.readyState === "open") mediaSource.endOfStream();
+    }
+    void stream().catch((reason) => {
+      if (!cancelled) setError(errorMessage(reason));
+    });
+    return () => {
+      cancelled = true;
+      if (mediaSource?.readyState === "open" && !mediaSource.sourceBuffers[0]?.updating) {
+        try { mediaSource.endOfStream(); } catch { /* source is already closing */ }
+      }
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [item, mediaCrypto]);
   return (
     <div className="viewer-media-loader">
-      {!loaded && !failed && <LoaderCircle className="spin" size={34} aria-label="正在加载视频" />}
-      {failed ? (
-        <div className="viewer-media-error"><Film size={42} /><span>视频加载失败</span></div>
-      ) : (
-        <video
-          controls
-          autoPlay
-          poster={item.thumbnail_url || undefined}
-          src={item.stream_url}
-          onLoadedData={() => setLoaded(true)}
-          onError={() => setFailed(true)}
-        />
-      )}
+      {!source && !error && <LoaderCircle className="spin" size={34} aria-label={`正在解密视频 ${progress.toFixed(0)}%`} />}
+      {source && progress === 0 && !error && <span className="thumbnail-loading"><LoaderCircle className="spin" size={34} aria-label="Decrypting first video chunk" /></span>}
+      {error ? (
+        <div className="viewer-media-error">
+          <Film size={42} /><span>加密视频播放失败：{error}</span>
+          <EncryptedDownloadButton item={item} />
+        </div>
+      ) : source ? <video controls autoPlay src={source} /> : null}
     </div>
   );
 }
 
+function appendBuffer(buffer: SourceBuffer, data: ArrayBuffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const done = () => { buffer.removeEventListener("updateend", done); buffer.removeEventListener("error", failed); resolve(); };
+    const failed = () => { buffer.removeEventListener("updateend", done); buffer.removeEventListener("error", failed); reject(new Error("视频分块写入失败")); };
+    buffer.addEventListener("updateend", done, { once: true });
+    buffer.addEventListener("error", failed, { once: true });
+    buffer.appendBuffer(data);
+  });
+}
 function MediaSkeleton() {
   return (
     <div className="media-grid" aria-label="正在加载">

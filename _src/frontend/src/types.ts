@@ -8,6 +8,7 @@ export interface PublicStatus {
   access_restricted: boolean;
   viewer_authenticated: boolean;
   admin_authenticated: boolean;
+  media_authenticated: boolean;
 }
 
 export interface MediaItem {

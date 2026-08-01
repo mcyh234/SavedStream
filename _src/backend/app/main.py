@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .cache import DiskCache
 from .config import settings
 from .database import Database
+from .media_crypto import DeviceKeyError, encrypt_for_device, load_device_public_key, parse_device_public_key
 from .ranges import InvalidRange, parse_range_header
 from .security import TokenSigner, constant_time_equal, hash_secret, verify_secret
 from .telebox_client import (
@@ -27,12 +28,18 @@ from .telebox_client import (
 
 ADMIN_COOKIE = "savedstream_admin"
 VIEWER_COOKIE = "savedstream_viewer"
+DEVICE_COOKIE = "savedstream_device"
 COOKIE_TTL = settings.session_cookie_days * 24 * 60 * 60
 signer = TokenSigner(f"{settings.admin_key}:{settings.api_hash}:savedstream")
 
 
 class KeyPayload(BaseModel):
     key: str = Field(min_length=1, max_length=512)
+
+
+class DeviceKeyPayload(BaseModel):
+    device_public_key: str = Field(min_length=300, max_length=4096)
+    key_format: str = Field(pattern="^spki-rsa-oaep-v1$")
 
 
 class PasswordPayload(BaseModel):
@@ -71,7 +78,7 @@ async def lifespan(app: FastAPI):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     database = Database(settings.database_path)
     await database.initialize()
-    cache = DiskCache(settings.cache_dir, database.get_cache_limit)
+    cache = DiskCache(settings.cache_dir, database.get_cache_limit, settings.media_cache_key)
     await cache.initialize()
     telegram = TeleBoxClient(settings)
     await telegram.initialize()
@@ -117,6 +124,17 @@ async def require_viewer(
     if viewer_hash and signer.verify(viewer_cookie, "viewer", viewer_hash):
         return
     raise HTTPException(status_code=401, detail={"code": "VIEWER_AUTH_REQUIRED"})
+async def require_media_access(
+    database: Database = Depends(get_database),
+    admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE),
+    viewer_cookie: str | None = Cookie(default=None, alias=VIEWER_COOKIE),
+) -> None:
+    if signer.verify(admin_cookie, "admin", "control"):
+        return
+    viewer_hash = await database.get_setting("viewer_key_hash", "")
+    if viewer_hash and signer.verify(viewer_cookie, "viewer", viewer_hash):
+        return
+    raise HTTPException(status_code=401, detail={"code": "MEDIA_AUTH_REQUIRED"})
 
 
 @app.exception_handler(TelegramUnavailable)
@@ -145,6 +163,9 @@ async def public_status(
         or admin_authenticated
         or bool(viewer_hash and signer.verify(viewer_cookie, "viewer", viewer_hash))
     )
+    media_authenticated = admin_authenticated or bool(
+        viewer_hash and signer.verify(viewer_cookie, "viewer", viewer_hash)
+    )
     return {
         "configuration_ok": settings.configuration_ok,
         "telegram_authenticated": tg_status["authenticated"],
@@ -153,6 +174,7 @@ async def public_status(
         "access_restricted": restricted,
         "viewer_authenticated": viewer_authenticated,
         "admin_authenticated": admin_authenticated,
+        "media_authenticated": media_authenticated,
     }
 
 
@@ -236,6 +258,110 @@ async def telegram_logout(
     return {"ok": True}
 
 
+
+async def registered_device_public_key(
+    fingerprint: str,
+    device_cookie: str | None,
+    database: Database,
+):
+    if not signer.verify(device_cookie, "device", fingerprint):
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_SESSION_REQUIRED"})
+    record = await database.get_device_key(fingerprint)
+    if not record or int(record["revoked"]):
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_KEY_REQUIRED"})
+    try:
+        key = load_device_public_key(str(record["public_key_pem"]))
+    except DeviceKeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await database.touch_device_key(fingerprint)
+    return key
+
+
+async def read_media_bytes(
+    message: dict,
+    item: dict,
+    cache_key: str,
+    offset: int,
+    length: int,
+    cache: DiskCache,
+    telegram: TeleBoxClient,
+) -> bytes:
+    total = int(item["size"])
+    if offset < 0 or offset >= total:
+        raise HTTPException(status_code=416, detail="Media offset is outside the file")
+    end = min(total, offset + length)
+    parts: list[bytes] = []
+    position = offset
+    while position < end:
+        chunk_index = position // TELEGRAM_CHUNK_SIZE
+        chunk_start = chunk_index * TELEGRAM_CHUNK_SIZE
+        expected_size = min(TELEGRAM_CHUNK_SIZE, total - chunk_start)
+        chunk = await cache.get_chunk(
+            cache_key,
+            chunk_index,
+            expected_size,
+            lambda start=chunk_start: telegram.download_chunk(message, start, total),
+        )
+        local_start = position - chunk_start
+        local_end = min(len(chunk), end - chunk_start)
+        parts.append(chunk[local_start:local_end])
+        position += local_end - local_start
+    return b"".join(parts)
+
+
+@app.get("/api/security/device-key", dependencies=[Depends(require_media_access)])
+async def device_key_status(
+    x_savedstream_device_key: str | None = Header(default=None),
+    device_cookie: str | None = Cookie(default=None, alias=DEVICE_COOKIE),
+    database: Database = Depends(get_database),
+) -> dict:
+    if not x_savedstream_device_key or not signer.verify(device_cookie, "device", x_savedstream_device_key):
+        return {"registered": False}
+    record = await database.get_device_key(x_savedstream_device_key)
+    return {
+        "registered": bool(record and not int(record["revoked"])),
+        "fingerprint": x_savedstream_device_key,
+    }
+
+
+@app.post("/api/security/device-key", dependencies=[Depends(require_media_access)])
+async def register_device_key(
+    payload: DeviceKeyPayload,
+    response: Response,
+    database: Database = Depends(get_database),
+) -> dict:
+    try:
+        parsed = parse_device_public_key(payload.device_public_key)
+    except DeviceKeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    registered = await database.register_device_key(parsed.fingerprint, parsed.public_key_pem)
+    if not registered:
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_KEY_REVOKED"})
+    response.set_cookie(
+        DEVICE_COOKIE,
+        signer.issue("device", parsed.fingerprint, COOKIE_TTL),
+        max_age=COOKIE_TTL,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="strict",
+        path="/",
+    )
+    return {"registered": True, "fingerprint": parsed.fingerprint}
+
+
+@app.delete("/api/security/device-key", dependencies=[Depends(require_media_access)])
+async def revoke_device_key(
+    response: Response,
+    x_savedstream_device_key: str = Header(),
+    device_cookie: str | None = Cookie(default=None, alias=DEVICE_COOKIE),
+    database: Database = Depends(get_database),
+) -> dict[str, bool]:
+    if not signer.verify(device_cookie, "device", x_savedstream_device_key):
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_SESSION_REQUIRED"})
+    await database.revoke_device_key(x_savedstream_device_key)
+    response.delete_cookie(DEVICE_COOKIE, path="/")
+    return {"ok": True}
+
 @app.get("/api/media", dependencies=[Depends(require_viewer)])
 async def list_media(
     limit: int = Query(default=36, ge=1, le=72),
@@ -314,6 +440,70 @@ async def media_thumbnail(
         headers={"Cache-Control": "private, max-age=604800, immutable"},
     )
 
+
+
+@app.get("/api/media/{message_id}/encrypted-thumbnail", dependencies=[Depends(require_media_access)])
+async def encrypted_thumbnail(
+    message_id: int,
+    account: str = Query(default=settings.telebox_default_account, min_length=1, max_length=40),
+    x_savedstream_device_key: str = Header(),
+    device_cookie: str | None = Cookie(default=None, alias=DEVICE_COOKIE),
+    cache: DiskCache = Depends(get_cache),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> Response:
+    device_key = await registered_device_public_key(x_savedstream_device_key, device_cookie, database)
+    account = await telegram.resolve_account(account)
+    message, item = await telegram.get_media_message(account, message_id)
+    if not item["has_thumbnail"]:
+        raise MediaNotFound("The media has no thumbnail")
+    cache_key = telegram.media_cache_key(message, item)
+    data = await cache.get_thumbnail(cache_key, lambda: telegram.download_thumbnail(message))
+    aad = f"thumbnail:{account}:{message_id}:{item['size']}".encode("utf-8")
+    encrypted, crypto_headers = encrypt_for_device(data, device_key, aad)
+    headers = {**crypto_headers, "X-SavedStream-Mime": guess_image_content_type(data), "Cache-Control": "private, no-store", "Content-Length": str(len(encrypted))}
+    return Response(content=encrypted, media_type="application/octet-stream", headers=headers)
+
+
+@app.get("/api/media/{message_id}/encrypted-chunk", dependencies=[Depends(require_media_access)])
+async def encrypted_chunk(
+    message_id: int,
+    offset: int = Query(default=0, ge=0),
+    length: int = Query(default=TELEGRAM_CHUNK_SIZE, ge=1, le=TELEGRAM_CHUNK_SIZE),
+    account: str = Query(default=settings.telebox_default_account, min_length=1, max_length=40),
+    x_savedstream_device_key: str = Header(),
+    device_cookie: str | None = Cookie(default=None, alias=DEVICE_COOKIE),
+    cache: DiskCache = Depends(get_cache),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> Response:
+    device_key = await registered_device_public_key(x_savedstream_device_key, device_cookie, database)
+    account = await telegram.resolve_account(account)
+    message, item = await telegram.get_media_message(account, message_id)
+    total = int(item["size"])
+    if offset >= total:
+        raise HTTPException(status_code=416, detail="Media offset is outside the file")
+    data = await read_media_bytes(
+        message,
+        item,
+        telegram.media_cache_key(message, item),
+        offset,
+        min(length, total - offset),
+        cache,
+        telegram,
+    )
+    actual_length = len(data)
+    aad = f"chunk:{account}:{message_id}:{offset}:{actual_length}:{total}".encode("utf-8")
+    encrypted, crypto_headers = encrypt_for_device(data, device_key, aad)
+    headers = {
+        **crypto_headers,
+        "Cache-Control": "private, no-store",
+        "Content-Length": str(len(encrypted)),
+        "X-SavedStream-Offset": str(offset),
+        "X-SavedStream-Total-Length": str(total),
+        "X-SavedStream-Mime": item["mime_type"],
+    }
+    return Response(content=encrypted, media_type="application/octet-stream", headers=headers)
 
 @app.get("/api/media/{message_id}/stream", dependencies=[Depends(require_viewer)])
 async def media_stream(

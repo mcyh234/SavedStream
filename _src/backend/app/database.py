@@ -32,6 +32,14 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS device_keys (
+                    fingerprint TEXT PRIMARY KEY,
+                    public_key_pem TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS media_metadata_v2 (
                     account_id TEXT NOT NULL,
                     message_id INTEGER NOT NULL,
@@ -94,6 +102,43 @@ class Database:
 
     async def access_restricted(self) -> bool:
         return await self.get_setting("access_restricted", "0") == "1"
+
+
+    async def register_device_key(self, fingerprint: str, public_key_pem: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO device_keys(fingerprint, public_key_pem, created_at, last_used_at, revoked) VALUES(?,?,?,?,0) "
+                "ON CONFLICT(fingerprint) DO UPDATE SET public_key_pem=excluded.public_key_pem, last_used_at=excluded.last_used_at",
+                (fingerprint, public_key_pem, now, now),
+            )
+            cursor = await db.execute("SELECT revoked FROM device_keys WHERE fingerprint=?", (fingerprint,))
+            row = await cursor.fetchone()
+            await db.commit()
+        return bool(row and not int(row[0]))
+
+    async def get_device_key(self, fingerprint: str) -> dict[str, str | int] | None:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "SELECT fingerprint, public_key_pem, created_at, last_used_at, revoked FROM device_keys WHERE fingerprint=?",
+                (fingerprint,),
+            )
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return {"fingerprint": str(row[0]), "public_key_pem": str(row[1]), "created_at": str(row[2]), "last_used_at": str(row[3]), "revoked": int(row[4])}
+
+    async def touch_device_key(self, fingerprint: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE device_keys SET last_used_at=? WHERE fingerprint=?", (now, fingerprint))
+            await db.commit()
+
+    async def revoke_device_key(self, fingerprint: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE device_keys SET last_used_at=?, revoked=1 WHERE fingerprint=?", (now, fingerprint))
+            await db.commit()
 
     async def get_local_titles(self, message_ids: list[int], account_id: str = "default") -> dict[int, str]:
         if not message_ids:

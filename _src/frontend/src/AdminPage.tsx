@@ -35,6 +35,7 @@ import QRCode from "qrcode";
 import { ApiError, api, errorMessage } from "./api";
 import { AdminKeyGate, CenterShell, TelegramLogin } from "./AuthPanels";
 import { FileKindIcon, ThumbnailImage, formatBytes } from "./GalleryPage";
+import { MediaEncryptionGate, useMediaCrypto } from "./MediaCrypto";
 import type {
   AdminSettings,
   MediaItem,
@@ -54,6 +55,7 @@ interface AdminPageProps {
 }
 
 export default function AdminPage({ onSessionChanged }: AdminPageProps) {
+  const mediaCrypto = useMediaCrypto();
   const [phase, setPhase] = useState<AdminPhase>("checking");
   const [bootstrapError, setBootstrapError] = useState("");
   const [settings, setSettings] = useState<AdminSettings | null>(null);
@@ -400,6 +402,10 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
         )}
       </CenterShell>
     );
+  }
+
+  if (mediaCrypto.status !== "ready") {
+    return <MediaEncryptionGate><div /></MediaEncryptionGate>;
   }
 
   const telegram = settings.telegram;

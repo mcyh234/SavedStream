@@ -41,6 +41,7 @@ services:
       TELEGRAM_API_ID: "${TELEGRAM_API_ID:-0}"
       TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
       ADMIN_KEY: "${ADMIN_KEY:-}"
+      MEDIA_CACHE_KEY: "${MEDIA_CACHE_KEY:?MEDIA_CACHE_KEY is required}"
       TELEBOX_URL: "http://telebox:9000"
       TELEBOX_API_TOKEN: "${TELEBOX_API_TOKEN:?TELEBOX_API_TOKEN is required}"
       DATA_DIR: /data

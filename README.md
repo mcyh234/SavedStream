@@ -1,4 +1,17 @@
-# SavedStream
+# SavedStream Private
+
+> Personal private edition. Private changes are pushed only to `origin` (`SavedStream-Private`). The public `upstream` repository remains read-only for syncing public fixes.
+
+## Encrypted media edition
+
+- Thumbnail and media cache files are encrypted at rest with AES-256-GCM and the independent `MEDIA_CACHE_KEY`.
+- The browser creates an RSA-OAEP device key. Its private key is password-encrypted with PBKDF2/AES-GCM and stored only in IndexedDB.
+- SavedStream wraps a random AES-GCM response key to the registered device public key for every thumbnail and media chunk. Decryption happens in the browser.
+- Video playback uses MediaSource and decrypted chunks when the browser and codec support it. Unsupported formats use encrypted download fallback.
+- Keep `MEDIA_CACHE_KEY` unchanged across deployments. Rotating it invalidates media cache only; Telegram sessions, database records and local titles remain intact.
+- This phase is not strict end-to-end encryption for existing Telegram media: TeleBox receives Telegram plaintext in server memory before the encrypted cache and browser transport layers. Upload-before-Telegram E2EE is intentionally deferred.
+
+## SavedStream
 
 家里人喜欢看电影，但设备硬盘空间有限，上传带宽也常常不够用。既然 Telegram 的“收藏夹”（Saved Messages）可以保存媒体和文件，为什么不借助它来管理电影、图片和音频，并在需要时按需加载？SavedStream 因此诞生。
 
@@ -86,6 +99,7 @@ cp .env.example .env
 ADMIN_KEY=请使用随机长密钥
 TELEBOX_API_TOKEN=请使用随机长密钥
 TELEBOX_SECRET_KEY=请使用随机长密钥
+MEDIA_CACHE_KEY=请使用独立的 32 字节随机密钥
 ```
 
 然后启动：

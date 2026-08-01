@@ -44,6 +44,7 @@ class Settings:
     telebox_url: str = "http://telebox:9000"
     telebox_api_token: str = ""
     telebox_default_account: str = "default"
+    media_cache_key: str = ""
 
     @property
     def database_path(self) -> Path:
@@ -61,7 +62,7 @@ class Settings:
     def configuration_ok(self) -> bool:
         # Telegram API IDs are positive integers. Do not treat a negative
         # value as configured just because bool(-1) is true.
-        return bool(self.admin_key and self.telebox_url and self.telebox_api_token)
+        return bool(self.admin_key and self.telebox_url and self.telebox_api_token and self.media_cache_key)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -81,6 +82,7 @@ class Settings:
             telebox_url=os.getenv("TELEBOX_URL", "http://telebox:9000").rstrip("/"),
             telebox_api_token=os.getenv("TELEBOX_API_TOKEN", "").strip(),
             telebox_default_account=os.getenv("TELEBOX_DEFAULT_ACCOUNT", "default").strip() or "default",
+            media_cache_key=os.getenv("MEDIA_CACHE_KEY", "").strip(),
         )
 
 
