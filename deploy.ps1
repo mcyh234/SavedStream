@@ -550,6 +550,7 @@ docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-direct
         Replace('__SAVEDSTREAM_IMAGE__', $savedStreamImage).
         Replace('__TELEBOX_IMAGE__', $teleBoxImage)
 
+    $remoteScript = $remoteScript.Replace("`r`n", "`n")
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteScript))
     Write-Host "Building, backing up, and deploying..." -ForegroundColor Cyan
     $result = Invoke-SSHCommand -SessionId $ssh.SessionId -Command "echo '$encoded' | base64 -d | bash" -TimeOut 3600000
