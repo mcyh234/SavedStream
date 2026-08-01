@@ -784,6 +784,11 @@ video {
   line-height: 1.65;
 }
 
+.gate-message a { color: var(--secondary); font-weight: 650; }
+.gate-message code { color: var(--text); }
+.telegram-access-state { min-height: 150px; display: grid; place-items: center; align-content: center; gap: 12px; color: var(--text-muted); text-align: center; }
+.telegram-access-state p, .telegram-access-state small { margin: 0; }
+
 .auth-form {
   display: grid;
   gap: 12px;
@@ -1100,6 +1105,8 @@ video {
   margin-top: 0;
 }
 
+.admin-settings-form .cache-section { grid-column: 1 / -1; }
+
 .metric-value {
   color: var(--text);
   font-size: 14px;
@@ -1374,6 +1381,12 @@ video {
 .coordination-row { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--border); }
 .coordination-row span { display: grid; min-width: 0; }
 .coordination-row strong, .coordination-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.access-users-section { display: grid; gap: 18px; }
+.access-users-list { display: grid; }
+.access-user-row { min-height: 64px; }
+.access-user-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.access-user-actions .button { min-height: 34px; padding: 0 12px; }
+.admin-empty-state.compact { min-height: 120px; }
 .ingest-jobs { min-width: 0; grid-column: 1 / -1; border-top: 1px solid var(--border); }
 .ingest-jobs summary { min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; font-size: 15px; font-weight: 650; list-style: none; }
 .ingest-jobs summary::-webkit-details-marker { display: none; }
@@ -1388,6 +1401,8 @@ video {
 
 @media (max-width: 700px) {
   .coordination-lists { grid-template-columns: 1fr; }
+  .access-user-row { align-items: flex-start; flex-direction: column; padding: 12px 0; }
+  .access-user-actions { width: 100%; }
 }
 
 .media-title-section {

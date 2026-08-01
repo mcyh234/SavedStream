@@ -9,6 +9,7 @@ import { StringSession } from "teleproto/sessions";
 import { NewMessage } from "teleproto/events";
 import { Telegraf } from "telegraf";
 import Database from "better-sqlite3";
+import { boundWebLoginIdentity, consumeWebLoginCode, issueWebLoginCode } from "./web-login";
 
 type AccountConfig = {
   id: string;
@@ -72,7 +73,8 @@ fs.mkdirSync(MEDIA_CACHE, { recursive: true });
 const db = new Database(DB_FILE);
 db.exec(`CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, account_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
 CREATE TABLE IF NOT EXISTS bindings (telegram_user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, created_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, source_chat_id TEXT NOT NULL, source_message_id INTEGER NOT NULL, relay_message_id INTEGER, saved_message_id INTEGER, status TEXT NOT NULL, status_message_id INTEGER, error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(account_id, source_chat_id, source_message_id));`);
+CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, source_chat_id TEXT NOT NULL, source_message_id INTEGER NOT NULL, relay_message_id INTEGER, saved_message_id INTEGER, status TEXT NOT NULL, status_message_id INTEGER, error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(account_id, source_chat_id, source_message_id));
+CREATE TABLE IF NOT EXISTS web_login_codes (code_hash TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, account_id TEXT NOT NULL, username TEXT, display_name TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);`);
 
 function jsonFile<T>(file: string, fallback: T): T {
   try {
@@ -511,9 +513,11 @@ class AccountManager {
     const me = await bot.telegram.getMe();
     this.botUsername = me.username || undefined;
     bot.start(async (ctx) =>
-      ctx.reply("已连接。请使用管理员提供的邀请码绑定账号。"),
+      ctx.reply("已连接。请使用 /bind 邀请码绑定账号；绑定后发送 /web 获取网页登录码。"),
     );
     bot.command("bind", async (ctx) => {
+      if (!ctx.chat || ctx.chat.type !== "private" || !ctx.from)
+        return ctx.reply("请在 Bot 私聊中完成绑定");
       const code = String(ctx.message.text || "").split(/\s+/)[1] || "";
       const invite = db
         .prepare(
@@ -528,7 +532,26 @@ class AccountManager {
         Date.now(),
         code,
       );
-      return ctx.reply(`绑定成功：${invite.account_id}`);
+      return ctx.reply(`绑定成功：${invite.account_id}\n发送 /web 获取网页登录码。`);
+    });
+    bot.command("web", async (ctx) => {
+      if (!ctx.chat || ctx.chat.type !== "private" || !ctx.from)
+        return ctx.reply("请在 Bot 私聊中获取网页登录码");
+      const identity = boundWebLoginIdentity(db, ctx.from);
+      if (!identity)
+        return ctx.reply("你尚未绑定托管账号，请先使用 /bind 邀请码绑定");
+      const displayName = [ctx.from.first_name, ctx.from.last_name]
+        .filter(Boolean)
+        .join(" ") || `Telegram ${ctx.from.id}`;
+      const issued = issueWebLoginCode(db, {
+        telegram_user_id: String(ctx.from.id),
+        account_id: identity.account_id,
+        username: ctx.from.username || null,
+        display_name: displayName,
+      });
+      return ctx.reply(
+        `SavedStream 网页登录码（10 分钟内有效，仅可使用一次）：\n\n${issued.code}\n\n登录后仍需管理员批准媒体库访问。`,
+      );
     });
     bot.on("message", async (ctx) => {
       const m: any = ctx.message;
@@ -1035,6 +1058,15 @@ const server = http.createServer(async (req, res) => {
       const p = await body(req);
       await manager.setBotToken(String(p.token || ""));
       return send(res, 200, { ok: true });
+    }
+    if (u.pathname === "/v1/web-login/consume" && req.method === "POST") {
+      const p = await body(req);
+      const code = String(p.code || "").trim();
+      if (!code) return send(res, 422, { detail: "web login code required" });
+      const identity = consumeWebLoginCode(db, code);
+      if (!identity)
+        return send(res, 401, { detail: "web login code is invalid, expired, or already used" });
+      return send(res, 200, identity);
     }
     const invite = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/invites$/);
     if (invite && req.method === "POST") {

@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import {
   CheckCircle2,
+  Bot,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
@@ -65,21 +66,63 @@ export function AdminKeyGate({ onAuthenticated }: GateProps) {
   );
 }
 
-export function ViewerGate({ onAuthenticated }: GateProps) {
-  const [key, setKey] = useState("");
+type AccessStatus = "unauthenticated" | "pending" | "approved" | "disabled" | "denied" | "admin";
+
+interface TelegramAccessGateProps extends GateProps {
+  botUsername: string | null;
+  initialStatus: AccessStatus;
+}
+
+interface TelegramAccessResponse {
+  authenticated?: boolean;
+  status: AccessStatus;
+  helper_bot_username?: string | null;
+}
+
+export function accessStatusMessage(status: AccessStatus): string {
+  if (status === "pending") return "身份已确认，正在等待管理员批准访问。";
+  if (status === "disabled") return "该账号的媒体访问已被禁用。";
+  if (status === "denied") return "管理员未批准该账号访问媒体库。";
+  return "";
+}
+
+export function TelegramAccessGate({ botUsername, initialStatus, onAuthenticated }: TelegramAccessGateProps) {
+  const [code, setCode] = useState("");
+  const [accessStatus, setAccessStatus] = useState<AccessStatus>(initialStatus);
+  const [activeBot, setActiveBot] = useState(botUsername);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => setAccessStatus(initialStatus), [initialStatus]);
+
+  useEffect(() => {
+    if (accessStatus !== "pending") return;
+    const poll = async () => {
+      try {
+        const next = await api<TelegramAccessResponse>("/api/access/telegram/status");
+        setAccessStatus(next.status);
+        if (next.helper_bot_username) setActiveBot(next.helper_bot_username);
+        if (next.status === "approved") onAuthenticated();
+      } catch (reason) {
+        setError(errorMessage(reason));
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 2500);
+    return () => window.clearInterval(timer);
+  }, [accessStatus, onAuthenticated]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     setLoading(true);
     setError("");
     try {
-      await api("/api/access/login", {
+      const result = await api<TelegramAccessResponse>("/api/access/telegram", {
         method: "POST",
-        body: JSON.stringify({ key }),
+        body: JSON.stringify({ code: code.trim() }),
       });
-      onAuthenticated();
+      setCode("");
+      setAccessStatus(result.status);
+      if (result.status === "approved") onAuthenticated();
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -88,27 +131,43 @@ export function ViewerGate({ onAuthenticated }: GateProps) {
   }
 
   return (
-    <CenterShell icon={<LockKeyhole size={30} />} title="私人媒体库">
+    <CenterShell icon={<Bot size={30} />} title="Telegram 身份验证">
+      {accessStatus === "pending" ? (
+        <div className="telegram-access-state">
+          <LoaderCircle className="spin" size={28} />
+          <p>{accessStatusMessage(accessStatus)}</p>
+          <small>本页会在审批通过后自动进入媒体库。</small>
+        </div>
+      ) : (
       <form className="auth-form" onSubmit={submit}>
-        <label htmlFor="viewer-key">访问口令</label>
+        {accessStatusMessage(accessStatus) && <p className="form-error" role="alert">{accessStatusMessage(accessStatus)}</p>}
+        {activeBot ? (
+          <p className="gate-message">在 <a href={`https://t.me/${activeBot}`} target="_blank" rel="noreferrer">@{activeBot}</a> 私聊发送 <code>/web</code>，然后输入一次性登录码。</p>
+        ) : (
+          <p className="gate-message">辅助 Bot 尚未配置，请联系管理员。</p>
+        )}
+        <label htmlFor="telegram-login-code">一次性登录码</label>
         <div className="input-with-icon">
           <KeyRound size={18} aria-hidden="true" />
           <input
-            id="viewer-key"
-            type="password"
-            autoComplete="current-password"
-            value={key}
-            onChange={(event) => setKey(event.target.value)}
+            id="telegram-login-code"
+            type="text"
+            autoComplete="one-time-code"
+            value={code}
+            onChange={(event) => setCode(event.target.value)}
             required
+            minLength={16}
             autoFocus
+            disabled={!activeBot}
           />
         </div>
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button primary wide" disabled={loading} type="submit">
           {loading ? <LoaderCircle className="spin" size={18} /> : <ShieldCheck size={18} />}
-          进入媒体库
+          验证 Telegram 身份
         </button>
       </form>
+      )}
     </CenterShell>
   );
 }
@@ -252,4 +311,3 @@ export function CenterShell({ icon, title, children }: CenterShellProps) {
     </main>
   );
 }
-

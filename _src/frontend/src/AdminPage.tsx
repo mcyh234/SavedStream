@@ -8,13 +8,10 @@ import {
   CircleAlert,
   Copy,
   Database,
-  Eye,
-  EyeOff,
   Gauge,
   HardDrive,
   KeyRound,
   LoaderCircle,
-  LockKeyhole,
   LogOut,
   Pencil,
   Play,
@@ -22,8 +19,6 @@ import {
   RotateCcw,
   Save,
   Search,
-  ShieldCheck,
-  ShieldOff,
   Trash2,
   UserPlus,
   Users,
@@ -63,10 +58,6 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
   const [telegramLoginOpen, setTelegramLoginOpen] = useState(false);
 
   const [cacheMaxGb, setCacheMaxGb] = useState(10);
-  const [accessRestricted, setAccessRestricted] = useState(false);
-  const [viewerKey, setViewerKey] = useState("");
-  const [viewerKeyVisible, setViewerKeyVisible] = useState(false);
-  const [clearViewerKey, setClearViewerKey] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [settingsNotice, setSettingsNotice] = useState("");
@@ -117,9 +108,6 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
   function applySettings(next: AdminSettings) {
     setSettings(next);
     setCacheMaxGb(next.cache_max_gb);
-    setAccessRestricted(next.access_restricted);
-    setViewerKey("");
-    setClearViewerKey(false);
   }
 
   async function loadDashboard(search = activeMediaQuery) {
@@ -256,19 +244,8 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
 
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const nextViewerKey = viewerKey.trim();
-    const existingKeyWillRemain = Boolean(settings?.viewer_key_configured && !clearViewerKey);
     setSettingsError("");
     setSettingsNotice("");
-
-    if (nextViewerKey && nextViewerKey.length < 8) {
-      setSettingsError("访客口令至少需要 8 个字符。");
-      return;
-    }
-    if (accessRestricted && !existingKeyWillRemain && nextViewerKey.length < 8) {
-      setSettingsError("开启访问限制前，请设置至少 8 个字符的访客口令。");
-      return;
-    }
 
     setSettingsSaving(true);
     try {
@@ -276,9 +253,6 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
         method: "PUT",
         body: JSON.stringify({
           cache_max_gb: cacheMaxGb,
-          access_restricted: accessRestricted,
-          viewer_key: nextViewerKey || null,
-          clear_viewer_key: clearViewerKey,
         }),
       });
       const next = await api<AdminSettings>("/api/admin/settings");
@@ -503,6 +477,7 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
         </section>)}
 
         <CoordinationPanel settings={settings} onRefresh={refreshSettings} />
+        <AccessUsersPanel settings={settings} onRefresh={refreshSettings} />
 
         <form className="admin-settings-form" onSubmit={saveSettings}>
           <section className="admin-section cache-section" aria-labelledby="cache-heading">
@@ -551,84 +526,6 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
               {cacheClearing ? <LoaderCircle className="spin" size={18} /> : <Trash2 size={18} />}
               清空缓存
             </button>
-          </section>
-
-          <section className="admin-section privacy-section" aria-labelledby="privacy-heading">
-            <div className="admin-section-heading">
-              <div className={`section-icon ${accessRestricted ? "success" : ""}`} aria-hidden="true">
-                {accessRestricted ? <ShieldCheck size={22} /> : <ShieldOff size={22} />}
-              </div>
-              <div>
-                <h2 id="privacy-heading">访问限制</h2>
-                <p>保护媒体库、缩略图与播放地址</p>
-              </div>
-            </div>
-
-            <label className="toggle-control" htmlFor="access-restricted">
-              <span>
-                <strong>要求访客口令</strong>
-                <small>{accessRestricted ? "未登录访客将无法查看媒体" : "任何能访问站点的人都可以浏览媒体"}</small>
-              </span>
-              <input
-                id="access-restricted"
-                type="checkbox"
-                checked={accessRestricted}
-                onChange={(event) => {
-                  setAccessRestricted(event.target.checked);
-                  setSettingsNotice("");
-                }}
-              />
-              <span className="toggle-track" aria-hidden="true"><span /></span>
-            </label>
-
-            <div className="form-field">
-              <label htmlFor="viewer-key">
-                访客口令
-                {settings.viewer_key_configured && !clearViewerKey && <span className="configured-badge">已设置</span>}
-              </label>
-              <div className="input-with-actions">
-                <LockKeyhole size={18} aria-hidden="true" />
-                <input
-                  id="viewer-key"
-                  type={viewerKeyVisible ? "text" : "password"}
-                  autoComplete="new-password"
-                  value={viewerKey}
-                  onChange={(event) => {
-                    setViewerKey(event.target.value);
-                    setClearViewerKey(false);
-                    setSettingsNotice("");
-                  }}
-                  placeholder={settings.viewer_key_configured ? "留空以保留当前口令" : "至少 8 个字符"}
-                  minLength={viewerKey ? 8 : undefined}
-                />
-                <button
-                  className="field-icon-button"
-                  type="button"
-                  onClick={() => setViewerKeyVisible((visible) => !visible)}
-                  aria-label={viewerKeyVisible ? "隐藏访客口令" : "显示访客口令"}
-                  title={viewerKeyVisible ? "隐藏口令" : "显示口令"}
-                >
-                  {viewerKeyVisible ? <EyeOff size={18} /> : <Eye size={18} />}
-                </button>
-              </div>
-              <small className="field-help">新口令保存后，之前的访客登录会话将失效。</small>
-            </div>
-
-            {settings.viewer_key_configured && (
-              <label className="check-control" htmlFor="clear-viewer-key">
-                <input
-                  id="clear-viewer-key"
-                  type="checkbox"
-                  checked={clearViewerKey}
-                  onChange={(event) => {
-                    setClearViewerKey(event.target.checked);
-                    if (event.target.checked) setAccessRestricted(false);
-                    setSettingsNotice("");
-                  }}
-                />
-                <span>保存时移除现有访客口令</span>
-              </label>
-            )}
           </section>
 
           <div className="admin-form-actions">
@@ -760,6 +657,73 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
       </main>
     </div>
   );
+}
+
+function AccessUsersPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const pending = settings.access_users.filter((user) => user.status === "pending").length;
+
+  async function setUserStatus(telegramUserId: string, status: "approved" | "disabled" | "denied") {
+    setBusy(`${telegramUserId}-${status}`);
+    setError("");
+    try {
+      await api(`/api/admin/access-users/${encodeURIComponent(telegramUserId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ status }),
+      });
+      await onRefresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <section className="admin-section access-users-section" aria-labelledby="access-users-heading">
+      <div className="admin-section-heading">
+        <div className={`section-icon ${pending ? "warning" : "success"}`} aria-hidden="true"><Users size={22} /></div>
+        <div><h2 id="access-users-heading">媒体访问用户</h2><p>Telegram 身份绑定与管理员审批</p></div>
+        <span className="metric-value">{pending ? `${pending} 个待审批` : `${settings.access_users.length} 个用户`}</span>
+      </div>
+      {error && <p className="form-error" role="alert"><CircleAlert size={17} />{error}</p>}
+      {settings.access_users.length === 0 ? (
+        <div className="admin-empty-state compact">
+          <Users size={28} />
+          <p>用户通过辅助 Bot 的 <code>/web</code> 登录后会出现在这里。</p>
+        </div>
+      ) : (
+        <div className="access-users-list">
+          {settings.access_users.map((user) => (
+            <div className="coordination-row access-user-row" key={user.telegram_user_id}>
+              <span>
+                <strong>{user.display_name}{user.username ? ` · @${user.username}` : ""}</strong>
+                <small>Telegram {user.telegram_user_id} · {user.account_id} · {accessUserStatusLabel(user.status)}</small>
+              </span>
+              <div className="access-user-actions">
+                {user.status !== "approved" && (
+                  <button className="button secondary" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "approved")} type="button">
+                    {busy === `${user.telegram_user_id}-approved` ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}批准
+                  </button>
+                )}
+                {user.status === "pending" && (
+                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "denied")} type="button">拒绝</button>
+                )}
+                {user.status === "approved" && (
+                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "disabled")} type="button">禁用</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function accessUserStatusLabel(status: "pending" | "approved" | "disabled" | "denied") {
+  return { pending: "待审批", approved: "已批准", disabled: "已禁用", denied: "已拒绝" }[status];
 }
 
 function CoordinationPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {

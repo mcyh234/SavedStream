@@ -38,10 +38,12 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === "INVALID_ADMIN_KEY") return "管理员密钥不正确";
-    if (error.code === "INVALID_VIEWER_KEY") return "访问口令不正确";
+    if (error.code === "INVALID_TELEGRAM_LOGIN_CODE") return "登录码无效、已过期或已被使用";
+    if (error.code === "ACCOUNT_ACCESS_DENIED") return "你没有访问该托管账号的权限";
+    if (error.code === "ACCESS_DISABLED") return "该账号的媒体访问已被禁用";
+    if (error.code === "ACCESS_DENIED") return "管理员未批准该账号访问媒体库";
     if (error.code === "TELEGRAM_UNAVAILABLE") return error.message;
     return error.message;
   }
   return error instanceof Error ? error.message : "操作失败，请重试";
 }
-

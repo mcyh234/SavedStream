@@ -9,6 +9,9 @@ export interface PublicStatus {
   viewer_authenticated: boolean;
   admin_authenticated: boolean;
   media_authenticated: boolean;
+  access_status: "unauthenticated" | "pending" | "approved" | "disabled" | "denied" | "admin";
+  access_account_id: string | null;
+  helper_bot_username: string | null;
 }
 
 export interface MediaItem {
@@ -61,6 +64,17 @@ export interface IngestJob {
   created_at: number;
 }
 
+export interface AccessUser {
+  telegram_user_id: string;
+  account_id: string;
+  username: string | null;
+  display_name: string;
+  status: "pending" | "approved" | "disabled" | "denied";
+  requested_at: string;
+  approved_at: string | null;
+  last_login_at: string;
+}
+
 export interface MediaPage {
   items: MediaItem[];
   next_cursor: number | null;
@@ -86,4 +100,5 @@ export interface AdminSettings {
   helper_bot: HelperBotStatus;
   bindings: BindingItem[];
   ingest_jobs: IngestJob[];
+  access_users: AccessUser[];
 }

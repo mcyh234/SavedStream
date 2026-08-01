@@ -19,6 +19,10 @@ class MediaNotFound(LookupError):
     pass
 
 
+class InvalidWebLoginCode(ValueError):
+    pass
+
+
 class TeleBoxClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -126,6 +130,23 @@ class TeleBoxClient:
 
     async def set_helper_bot(self, token: str) -> dict[str, Any]:
         return (await self._request("PUT", "/v1/helper-bot", json={"token": token})).json()
+
+    async def consume_web_login_code(self, code: str) -> dict[str, Any]:
+        if not self.client:
+            raise TelegramUnavailable("TeleBox client is not initialized")
+        try:
+            response = await self.client.post("/v1/web-login/consume", json={"code": code})
+        except httpx.HTTPError as exc:
+            raise TelegramUnavailable(f"TeleBox unavailable: {exc}") from exc
+        if response.status_code == 401:
+            raise InvalidWebLoginCode("The Telegram login code is invalid, expired, or already used")
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise TelegramUnavailable(f"TeleBox request failed: {detail}")
+        return response.json()
 
     async def create_invite(self, account_id: str) -> dict[str, Any]:
         return (await self._request("POST", f"/v1/accounts/{quote(account_id)}/invites")).json()

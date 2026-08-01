@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, LoaderCircle, ServerCog } from "lucide-react";
 import { api, errorMessage } from "./api";
-import { AdminKeyGate, CenterShell, ViewerGate } from "./AuthPanels";
+import { AdminKeyGate, CenterShell, TelegramAccessGate } from "./AuthPanels";
 import GalleryPage from "./GalleryPage";
 import { MediaEncryptionGate } from "./MediaCrypto";
 import AdminPage from "./AdminPage";
@@ -63,8 +63,14 @@ export default function App() {
     );
   }
 
-  if (status.access_restricted && !status.viewer_authenticated) {
-    return <ViewerGate onAuthenticated={refreshStatus} />;
+  if (!status.media_authenticated) {
+    return (
+      <TelegramAccessGate
+        botUsername={status.helper_bot_username}
+        initialStatus={status.access_status}
+        onAuthenticated={refreshStatus}
+      />
+    );
   }
 
   if (!status.telegram_authenticated) {
@@ -77,10 +83,6 @@ export default function App() {
         <a className="button primary wide" href="/admin">打开管理页配置</a>
       </CenterShell>
     );
-  }
-
-  if (!status.media_authenticated) {
-    return <AdminKeyGate onAuthenticated={refreshStatus} />;
   }
 
   return <MediaEncryptionGate><GalleryPage /></MediaEncryptionGate>;
