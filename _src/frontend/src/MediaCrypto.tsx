@@ -17,7 +17,7 @@ interface MediaCryptoContextValue {
   hasStoredKey: boolean;
   unlock: (password: string) => Promise<void>;
   reset: () => Promise<void>;
-  fetchAndDecrypt: (url: string) => Promise<{ data: ArrayBuffer; headers: Headers }>;
+  fetchAndDecrypt: (url: string, signal?: AbortSignal) => Promise<{ data: ArrayBuffer; headers: Headers }>;
 }
 const MediaCryptoContext = createContext<MediaCryptoContextValue | null>(null);
 
@@ -47,9 +47,9 @@ export function MediaCryptoProvider({ children }: { children: ReactNode }) {
     await deleteStoredDevice(); setPrivateKey(null); setFingerprint(""); setHasStoredKey(false); setStatus("locked");
   }, [fingerprint]);
 
-  const fetchAndDecrypt = useCallback(async (url: string) => {
+  const fetchAndDecrypt = useCallback(async (url: string, signal?: AbortSignal) => {
     if (!privateKey || !fingerprint) throw new Error("Media key is locked");
-    const response = await fetch(url, { credentials: "same-origin", headers: { "X-SavedStream-Device-Key": fingerprint } });
+    const response = await fetch(url, { credentials: "same-origin", headers: { "X-SavedStream-Device-Key": fingerprint }, signal });
     if (!response.ok) throw new Error(`Encrypted media request failed (${response.status})`);
     const data = await decryptMediaResponse(privateKey, response);
     return { data, headers: response.headers };

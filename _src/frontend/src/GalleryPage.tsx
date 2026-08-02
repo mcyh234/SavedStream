@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownAZ,
   ArrowUpAZ,
@@ -354,15 +354,102 @@ export function ThumbnailImage({
   );
 }
 
-async function loadEncryptedBlob(item: MediaItem, mediaCrypto: ReturnType<typeof useMediaCrypto>) {
-  const chunks: ArrayBuffer[] = [];
-  const chunkSize = 512 * 1024;
-  for (let offset = 0; offset < item.size; offset += chunkSize) {
-    const length = Math.min(chunkSize, item.size - offset);
-    const url = `/api/media/${item.id}/encrypted-chunk?account=${encodeURIComponent(item.account_id)}&offset=${offset}&length=${length}`;
-    const result = await mediaCrypto.fetchAndDecrypt(url);
-    chunks.push(result.data);
+const DOWNLOAD_CHUNK_SIZE = 512 * 1024;
+
+interface DownloadProgress {
+  phase: "preparing" | "downloading" | "finalizing";
+  loaded: number;
+  total: number;
+  percent: number;
+  speed: number;
+  etaSeconds: number | null;
+  chunkIndex: number;
+  chunkCount: number;
+  waiting: boolean;
+}
+
+interface TransferSample { at: number; loaded: number; }
+
+export async function readEncryptedChunks(
+  item: MediaItem,
+  mediaCrypto: ReturnType<typeof useMediaCrypto>,
+  consume: (data: ArrayBuffer) => Promise<void> | void,
+  signal?: AbortSignal,
+  onProgress?: (progress: DownloadProgress) => void,
+) {
+  const chunkCount = Math.ceil(item.size / DOWNLOAD_CHUNK_SIZE);
+  const samples: TransferSample[] = [{ at: performance.now(), loaded: 0 }];
+  let loaded = 0;
+  for (let offset = 0, chunkIndex = 1; offset < item.size; offset += DOWNLOAD_CHUNK_SIZE, chunkIndex += 1) {
+    signal?.throwIfAborted();
+    const length = Math.min(DOWNLOAD_CHUNK_SIZE, item.size - offset);
+    const before = transferProgress(item.size, loaded, chunkIndex, chunkCount, samples, true);
+    onProgress?.(before);
+    const waitingTimer = onProgress ? window.setInterval(() => {
+      onProgress(transferProgress(item.size, loaded, chunkIndex, chunkCount, samples, true, performance.now()));
+    }, 1_000) : undefined;
+    let result: Awaited<ReturnType<typeof mediaCrypto.fetchAndDecrypt>>;
+    try {
+      result = await mediaCrypto.fetchAndDecrypt(encryptedChunkUrl(item, offset, length), signal);
+    } finally {
+      if (waitingTimer !== undefined) window.clearInterval(waitingTimer);
+    }
+    signal?.throwIfAborted();
+    await consume(result.data);
+    loaded += result.data.byteLength;
+    samples.push({ at: performance.now(), loaded });
+    trimTransferSamples(samples);
+    onProgress?.(transferProgress(item.size, loaded, chunkIndex, chunkCount, samples, false));
   }
+}
+
+function transferProgress(
+  total: number,
+  loaded: number,
+  chunkIndex: number,
+  chunkCount: number,
+  samples: TransferSample[],
+  waiting: boolean,
+  measuredAt?: number,
+): DownloadProgress {
+  const last = samples[samples.length - 1];
+  const first = samples[0];
+  const metrics = calculateTransferMetrics(total, loaded, last.loaded - first.loaded, (measuredAt ?? last.at) - first.at);
+  return {
+    phase: "downloading",
+    loaded,
+    total,
+    percent: metrics.percent,
+    speed: metrics.speed,
+    etaSeconds: metrics.etaSeconds,
+    chunkIndex,
+    chunkCount,
+    waiting,
+  };
+}
+
+export function calculateTransferMetrics(total: number, loaded: number, sampledBytes: number, elapsedMs: number) {
+  const speed = elapsedMs > 0 ? Math.max(0, sampledBytes / (elapsedMs / 1000)) : 0;
+  return {
+    percent: total > 0 ? Math.min(100, Math.max(0, (loaded / total) * 100)) : 100,
+    speed,
+    etaSeconds: speed > 0 ? Math.max(0, (total - loaded) / speed) : null,
+  };
+}
+
+function trimTransferSamples(samples: TransferSample[]) {
+  const cutoff = performance.now() - 15_000;
+  while (samples.length > 2 && samples[1].at < cutoff) samples.shift();
+}
+
+async function loadEncryptedBlob(
+  item: MediaItem,
+  mediaCrypto: ReturnType<typeof useMediaCrypto>,
+  signal?: AbortSignal,
+  onProgress?: (progress: DownloadProgress) => void,
+) {
+  const chunks: ArrayBuffer[] = [];
+  await readEncryptedChunks(item, mediaCrypto, (data) => { chunks.push(data); }, signal, onProgress);
   return new Blob(chunks, { type: item.mime_type });
 }
 
@@ -382,17 +469,22 @@ function encryptedChunkUrl(item: MediaItem, offset: number, length: number) {
   return `/api/media/${item.id}/encrypted-chunk?account=${encodeURIComponent(item.account_id)}&offset=${offset}&length=${length}`;
 }
 
-async function downloadEncryptedMedia(item: MediaItem, mediaCrypto: ReturnType<typeof useMediaCrypto>) {
+async function downloadEncryptedMedia(
+  item: MediaItem,
+  mediaCrypto: ReturnType<typeof useMediaCrypto>,
+  signal: AbortSignal,
+  onProgress: (progress: DownloadProgress) => void,
+) {
   const picker = (window as FilePickerWindow).showSaveFilePicker;
+  const initial: DownloadProgress = { phase: "preparing", loaded: 0, total: item.size, percent: 0, speed: 0, etaSeconds: null, chunkIndex: 0, chunkCount: Math.ceil(item.size / DOWNLOAD_CHUNK_SIZE), waiting: false };
+  onProgress(initial);
   if (picker) {
     const handle = await picker({ suggestedName: item.filename });
+    signal.throwIfAborted();
     const writable = await handle.createWritable();
     try {
-      const chunkSize = 512 * 1024;
-      for (let offset = 0; offset < item.size; offset += chunkSize) {
-        const result = await mediaCrypto.fetchAndDecrypt(encryptedChunkUrl(item, offset, Math.min(chunkSize, item.size - offset)));
-        await writable.write(new Uint8Array(result.data));
-      }
+      await readEncryptedChunks(item, mediaCrypto, (data) => writable.write(new Uint8Array(data)), signal, onProgress);
+      onProgress({ ...initial, phase: "finalizing", loaded: item.size, percent: 100 });
       await writable.close();
     } catch (reason) {
       await writable.abort().catch(() => undefined);
@@ -401,7 +493,9 @@ async function downloadEncryptedMedia(item: MediaItem, mediaCrypto: ReturnType<t
     return;
   }
 
-  const blob = await loadEncryptedBlob(item, mediaCrypto);
+  const blob = await loadEncryptedBlob(item, mediaCrypto, signal, onProgress);
+  signal.throwIfAborted();
+  onProgress({ ...initial, phase: "finalizing", loaded: item.size, percent: 100 });
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = objectUrl;
@@ -412,28 +506,83 @@ async function downloadEncryptedMedia(item: MediaItem, mediaCrypto: ReturnType<t
 
 function EncryptedDownloadButton({ item, iconOnly = false }: { item: MediaItem; iconOnly?: boolean }) {
   const mediaCrypto = useMediaCrypto();
-  const [busy, setBusy] = useState(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [canceling, setCanceling] = useState(false);
   const [error, setError] = useState("");
   const download = useCallback(async () => {
-    setBusy(true);
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setCanceling(false);
+    setProgress({ phase: "preparing", loaded: 0, total: item.size, percent: 0, speed: 0, etaSeconds: null, chunkIndex: 0, chunkCount: Math.ceil(item.size / DOWNLOAD_CHUNK_SIZE), waiting: false });
     setError("");
     try {
-      await downloadEncryptedMedia(item, mediaCrypto);
+      await downloadEncryptedMedia(item, mediaCrypto, controller.signal, setProgress);
     } catch (reason) {
       if ((reason as DOMException)?.name !== "AbortError") setError(errorMessage(reason));
     } finally {
-      setBusy(false);
+      controllerRef.current = null;
+      setCanceling(false);
+      setProgress(null);
     }
   }, [item, mediaCrypto]);
+  const cancel = useCallback(() => {
+    setCanceling(true);
+    controllerRef.current?.abort();
+  }, []);
+  const busy = progress !== null;
   return (
     <>
-      <button className={iconOnly ? "icon-button" : "button primary"} disabled={busy} onClick={() => void download()} aria-label="Encrypted download" title="Encrypted download" type="button">
+      <button className={iconOnly ? "icon-button" : "button primary"} disabled={busy} onClick={() => void download()} aria-label="下载" title="下载" type="button">
         {busy ? <LoaderCircle className="spin" size={iconOnly ? 20 : 18} /> : <Download size={iconOnly ? 20 : 18} />}
-        {!iconOnly && "Encrypted download"}
+        {!iconOnly && "下载文件"}
       </button>
+      {progress && <DownloadProgressDialog item={item} progress={progress} canceling={canceling} onCancel={cancel} />}
       {error && <span className="form-error" role="alert">{error}</span>}
     </>
   );
+}
+
+function DownloadProgressDialog({ item, progress, canceling, onCancel }: { item: MediaItem; progress: DownloadProgress; canceling: boolean; onCancel: () => void }) {
+  const status = canceling
+    ? "正在取消下载"
+    : progress.phase === "preparing"
+      ? "正在准备保存位置"
+      : progress.phase === "finalizing"
+        ? "正在完成文件写入"
+        : progress.waiting
+          ? `正在获取分块 ${progress.chunkIndex} / ${progress.chunkCount}`
+          : `已解密分块 ${progress.chunkIndex} / ${progress.chunkCount}`;
+  return (
+    <div className="download-progress-backdrop" role="presentation">
+      <section className="download-progress-dialog" role="dialog" aria-modal="true" aria-labelledby="download-progress-title" aria-live="polite">
+        <div className="download-progress-heading">
+          <span className="download-progress-icon"><Download size={22} /></span>
+          <span><strong id="download-progress-title">{item.filename}</strong><small>{status}</small></span>
+          {(progress.phase === "preparing" || progress.waiting) && <LoaderCircle className="spin" size={20} />}
+        </div>
+        <div className="download-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress.percent)}>
+          <span style={{ width: `${progress.percent}%` }} />
+        </div>
+        <div className="download-progress-stats">
+          <strong>{progress.percent.toFixed(progress.percent < 10 ? 1 : 0)}%</strong>
+          <span>{formatBytes(progress.loaded)} / {formatBytes(progress.total)}</span>
+          <span>{progress.phase === "finalizing" ? "下载完成" : progress.speed > 0 ? `${formatBytes(Math.round(progress.speed))}/s` : "正在计算速度"}</span>
+          <span>{progress.phase === "finalizing" ? "正在写入磁盘" : formatRemainingTime(progress.etaSeconds)}</span>
+        </div>
+        <button className="button secondary wide" disabled={canceling || progress.phase === "finalizing"} onClick={onCancel} type="button">
+          {canceling ? <LoaderCircle className="spin" size={18} /> : <X size={18} />}{canceling ? "正在取消" : "取消下载"}
+        </button>
+      </section>
+    </div>
+  );
+}
+
+export function formatRemainingTime(seconds: number | null): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "剩余时间计算中";
+  if (seconds < 60) return `约剩余 ${Math.max(1, Math.ceil(seconds))} 秒`;
+  if (seconds < 3600) return `约剩余 ${Math.ceil(seconds / 60)} 分钟`;
+  return `约剩余 ${Math.floor(seconds / 3600)} 小时 ${Math.ceil((seconds % 3600) / 60)} 分钟`;
 }
 
 function ViewerAudio({ item }: { item: MediaItem }) {
