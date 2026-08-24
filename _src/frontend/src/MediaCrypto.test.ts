@@ -1,10 +1,23 @@
 import "fake-indexeddb/auto";
-import { beforeEach, describe, expect, it } from "vitest";
-import { createDevice, decryptMediaResponse, deleteStoredDevice, readStoredDevice, unlockExistingDevice, writeStoredDevice } from "./MediaCrypto";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createDevice,
+  createSessionDevice,
+  decryptMediaResponse,
+  deleteSessionDevice,
+  deleteStoredDevice,
+  readSessionDevice,
+  readStoredDevice,
+  unlockExistingDevice,
+  unlockSessionDevice,
+  writeSessionDevice,
+  writeStoredDevice,
+} from "./MediaCrypto";
 
 const password = "a-long-local-password";
 
 beforeEach(async () => { await deleteStoredDevice(); });
+afterEach(() => vi.unstubAllGlobals());
 
 describe("device key storage", () => {
   it("encrypts the private key and restores it from IndexedDB", async () => {
@@ -15,6 +28,32 @@ describe("device key storage", () => {
     await expect(unlockExistingDevice(created.stored, "wrong-password")).rejects.toThrow();
     const unlocked = await unlockExistingDevice(created.stored, password);
     expect(unlocked.privateKey.algorithm.name).toBe("RSA-OAEP");
+  });
+
+  it("keeps a passwordless public-user key encrypted and bound to one login session", async () => {
+    const created = await createSessionDevice("login-session-a");
+    expect(created.stored.sessionId).toBe("login-session-a");
+    expect(created.stored.encryptedPrivateKey).not.toContain("PRIVATE KEY");
+    const restored = await unlockSessionDevice(created.stored);
+    expect(restored.privateKey.algorithm.name).toBe("RSA-OAEP");
+    expect(restored.privateKey.extractable).toBe(false);
+  });
+
+  it("stores public-user keys only in sessionStorage", async () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("window", {
+      sessionStorage: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+        removeItem: (key: string) => values.delete(key),
+      },
+    });
+    const created = await createSessionDevice("login-session-b");
+    writeSessionDevice(created.stored);
+    expect(readSessionDevice()?.sessionId).toBe("login-session-b");
+    expect(await readStoredDevice()).toBeNull();
+    deleteSessionDevice();
+    expect(readSessionDevice()).toBeNull();
   });
 });
 

@@ -3,6 +3,7 @@ param(
     [string]$Server,
     [string]$SshUser = "root",
     [string]$Domain,
+    [int]$KeepBackups = 3,
     [switch]$PackageOnly,
     [switch]$ResetConfig
 )
@@ -348,6 +349,10 @@ command -v curl >/dev/null || { echo 'curl is not installed.'; exit 1; }
 command -v base64 >/dev/null || { echo 'base64 is not installed.'; exit 1; }
 
 mkdir -p "$BASE/backups"
+# The SavedStream container (UID 10001) needs write access to remove old
+# backups from the admin console; keep other host users out of the backups.
+chown 10001:10001 "$BASE/backups" 2>/dev/null || true
+chmod 700 "$BASE/backups" 2>/dev/null || true
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 tar xzf "$ARCHIVE" -C "$STAGING"
@@ -522,6 +527,21 @@ if [ "$healthy" != 1 ]; then
   rollback
 fi
 
+# Keep only the newest __KEEP_BACKUPS__ deployment backups.  Each backup is
+# a code-<stamp> + volumes-<stamp> pair; both are removed together.  The
+# admin console can also manage these backups manually.
+KEEP_BACKUPS='__KEEP_BACKUPS__'
+if [ "$KEEP_BACKUPS" -gt 0 ] 2>/dev/null; then
+  ls -1dt "$BASE"/backups/code-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r dir; do
+    stamp="${dir##*/}"
+    stamp="${stamp#code-}"
+    if [ -n "$stamp" ] && [ "$stamp" != "code-*" ]; then
+      echo "Pruning old backup: $stamp"
+      rm -rf "$BASE/backups/code-$stamp" "$BASE/backups/volumes-$stamp"
+    fi
+  done
+fi
+
 if [ "$MANAGE_CADDY" = 1 ] && command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
   ufw allow 80/tcp >/dev/null
   ufw allow 443/tcp >/dev/null
@@ -548,7 +568,8 @@ docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-direct
         Replace('__SECRET_KEY_CANDIDATE__', $secretKeyCandidate).
         Replace('__MEDIA_CACHE_KEY_CANDIDATE__', $mediaCacheKeyCandidate).
         Replace('__SAVEDSTREAM_IMAGE__', $savedStreamImage).
-        Replace('__TELEBOX_IMAGE__', $teleBoxImage)
+        Replace('__TELEBOX_IMAGE__', $teleBoxImage).
+        Replace('__KEEP_BACKUPS__', $KeepBackups)
 
     $remoteScript = $remoteScript.Replace("`r`n", "`n")
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteScript))

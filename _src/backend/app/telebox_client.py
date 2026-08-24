@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+from collections.abc import Awaitable, Callable, AsyncIterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -101,12 +104,28 @@ class TeleBoxClient:
     async def logout(self, clear_session: bool = False) -> None:
         raise TelegramUnavailable("Account lifecycle is managed by TeleBox")
 
-    async def list_saved_media(self, *, account_id: str, limit: int, cursor: int | None, order: str, kind: str, query: str) -> tuple[list[dict[str, Any]], int | None, bool]:
+    async def list_saved_media(self, *, account_id: str, limit: int, cursor: str | int | None, order: str, kind: str, query: str) -> tuple[list[dict[str, Any]], str | int | None, bool]:
         params = {"limit": limit, "order": order, "kind": kind, "q": query}
         if cursor:
             params["cursor"] = cursor
         payload = (await self._request("GET", f"/v1/accounts/{quote(account_id)}/media", params=params)).json()
         return payload["items"], payload.get("next_cursor"), bool(payload.get("has_more"))
+
+    async def sync_saved_media(
+        self,
+        *,
+        account_id: str,
+        mode: str,
+        cursor: int | None = None,
+        after_id: int | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"mode": mode, "limit": max(1, min(500, int(limit)))}
+        if cursor:
+            params["cursor"] = cursor
+        if after_id:
+            params["after_id"] = after_id
+        return (await self._request("GET", f"/v1/accounts/{quote(account_id)}/media/sync", params=params)).json()
 
     async def get_media_message(self, account_id: str, message_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
         item = (await self._request("GET", f"/v1/accounts/{quote(account_id)}/media/{message_id}")).json()
@@ -157,11 +176,155 @@ class TeleBoxClient:
     async def delete_binding(self, telegram_user_id: str) -> dict[str, Any]:
         return (await self._request("DELETE", "/v1/bindings", json={"telegram_user_id": telegram_user_id})).json()
 
-    async def jobs(self) -> dict[str, Any]:
-        return (await self._request("GET", "/v1/ingest/jobs")).json()
+    async def set_binding_status(
+        self,
+        telegram_user_id: str,
+        *,
+        enabled: bool,
+        banned: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                "PUT",
+                f"/v1/bindings/{quote(str(telegram_user_id))}",
+                json={"enabled": bool(enabled), "banned": bool(banned), "reason": reason},
+            )
+        ).json()
+
+    async def jobs(
+        self,
+        *,
+        status: str | None = None,
+        updated_after: int | None = None,
+        after_job_id: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if updated_after is not None:
+            params["updated_after"] = max(0, int(updated_after))
+        if after_job_id is not None:
+            params["after_job_id"] = max(0, int(after_job_id))
+        if limit is not None:
+            params["limit"] = max(1, min(500, int(limit)))
+        return (await self._request("GET", "/v1/ingest/jobs", params=params or None)).json()
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return (await self._request("POST", f"/v1/ingest/jobs/{job_id}/retry")).json()
+
+    async def update_ingest_job_review(
+        self,
+        job_id: int,
+        *,
+        decision: str,
+        reason: str | None = None,
+        reviewed_by: str = "admin",
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                "PATCH",
+                f"/v1/ingest/jobs/{int(job_id)}/review",
+                json={
+                    "decision": decision,
+                    "reason": reason,
+                    "reviewed_by": reviewed_by,
+                },
+            )
+        ).json()
+
+    async def delete_ingest_job(
+        self,
+        job_id: int,
+        *,
+        reason: str | None = None,
+        deleted_by: str = "admin",
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                "DELETE",
+                f"/v1/ingest/jobs/{int(job_id)}",
+                json={"reason": reason, "deleted_by": deleted_by},
+            )
+        ).json()
+
+    async def delete_media(
+        self,
+        account_id: str,
+        message_id: int,
+        *,
+        reason: str | None = None,
+        deleted_by: str = "admin",
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                "DELETE",
+                f"/v1/accounts/{quote(account_id)}/media/{int(message_id)}",
+                json={"reason": reason, "deleted_by": deleted_by},
+            )
+        ).json()
+
+    async def helper_bot_rate_limit(self) -> dict[str, Any]:
+        return (await self._request("GET", "/v1/helper-bot/rate-limit")).json()
+
+    async def set_helper_bot_rate_limit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return (await self._request("PUT", "/v1/helper-bot/rate-limit", json=payload)).json()
+
+    async def upload_file(
+        self,
+        *,
+        account_id: str,
+        file_path: Path,
+        filename: str,
+        mime_type: str,
+        caption: str = "",
+        progress_callback: Callable[[int, int], Awaitable[None] | None] | None = None,
+    ) -> dict[str, Any]:
+        if not self.client:
+            raise TelegramUnavailable("TeleBox client is not initialized")
+        total = file_path.stat().st_size
+        encoded_name = base64.urlsafe_b64encode(filename.encode("utf-8")).decode("ascii").rstrip("=")
+        encoded_caption = base64.urlsafe_b64encode(caption.encode("utf-8")).decode("ascii").rstrip("=")
+
+        async def body() -> AsyncIterator[bytes]:
+            sent = 0
+            with file_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    if progress_callback:
+                        result = progress_callback(sent, total)
+                        if result is not None:
+                            await result
+                    yield chunk
+
+        try:
+            response = await self.client.post(
+                f"/v1/accounts/{quote(account_id)}/upload",
+                content=body(),
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(total),
+                    "X-Upload-Filename": encoded_name,
+                    "X-Upload-Mime": mime_type[:200],
+                    "X-Upload-Caption": encoded_caption,
+                },
+                timeout=None,
+            )
+        except httpx.HTTPError as exc:
+            raise TelegramUnavailable(f"TeleBox unavailable: {exc}") from exc
+        if response.status_code == 404:
+            raise MediaNotFound("Uploaded media was not found")
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise TelegramUnavailable(f"TeleBox request failed: {detail}")
+        return response.json()
 
 
 def guess_image_content_type(data: bytes) -> str:

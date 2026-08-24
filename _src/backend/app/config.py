@@ -45,6 +45,8 @@ class Settings:
     telebox_api_token: str = ""
     telebox_default_account: str = "default"
     media_cache_key: str = ""
+    savedstream_internal_token: str = ""
+    backups_dir: Path = Path("/backups")
 
     @property
     def database_path(self) -> Path:
@@ -83,6 +85,8 @@ class Settings:
             telebox_api_token=os.getenv("TELEBOX_API_TOKEN", "").strip(),
             telebox_default_account=os.getenv("TELEBOX_DEFAULT_ACCOUNT", "default").strip() or "default",
             media_cache_key=os.getenv("MEDIA_CACHE_KEY", "").strip(),
+            savedstream_internal_token=os.getenv("SAVEDSTREAM_INTERNAL_TOKEN", "").strip(),
+            backups_dir=Path(os.getenv("BACKUPS_DIR", "/backups")).expanduser().resolve(),
         )
 
 

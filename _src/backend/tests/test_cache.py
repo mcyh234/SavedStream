@@ -105,5 +105,21 @@ async def test_cached_thumbnail_can_be_read_without_loader(tmp_path):
     assert await cache.get_cached_thumbnail("media-v1") == b"image"
 
 
+@pytest.mark.asyncio
+async def test_delete_media_removes_chunks_and_thumbnail(tmp_path):
+    async def limit():
+        return 1024 * 1024
+
+    cache = DiskCache(tmp_path, limit, TEST_CACHE_KEY)
+    await cache.initialize()
+    await cache.get_chunk("media-v1", 0, 4, lambda: _value(b"abcd"))
+    await cache.get_thumbnail("media-v1", lambda: _value(b"image"))
+
+    await cache.delete_media("media-v1")
+
+    assert await cache.get_cached_thumbnail("media-v1") is None
+    assert await cache.stats() == {"bytes": 0, "files": 0}
+
+
 async def _value(value):
     return value

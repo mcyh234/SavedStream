@@ -11,6 +11,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { api, errorMessage } from "./api";
+import { LanguageSelector, translateNow, useI18n } from "./I18n";
 import type { TelegramAuthStatus } from "./types";
 
 interface GateProps {
@@ -18,6 +19,7 @@ interface GateProps {
 }
 
 export function AdminKeyGate({ onAuthenticated }: GateProps) {
+  const { tr } = useI18n();
   const [key, setKey] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -41,9 +43,9 @@ export function AdminKeyGate({ onAuthenticated }: GateProps) {
   }
 
   return (
-    <CenterShell icon={<ShieldCheck size={30} />} title="管理员验证">
+    <CenterShell icon={<ShieldCheck size={30} />} title={tr("管理员验证", "Administrator verification")}>
       <form className="auth-form" onSubmit={submit}>
-        <label htmlFor="admin-key">管理员密钥</label>
+        <label htmlFor="admin-key">{tr("管理员密钥", "Administrator key")}</label>
         <div className="input-with-icon">
           <KeyRound size={18} aria-hidden="true" />
           <input
@@ -59,7 +61,7 @@ export function AdminKeyGate({ onAuthenticated }: GateProps) {
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button primary wide" disabled={loading} type="submit">
           {loading ? <LoaderCircle className="spin" size={18} /> : <LockKeyhole size={18} />}
-          验证
+          {tr("验证", "Verify")}
         </button>
       </form>
     </CenterShell>
@@ -80,13 +82,14 @@ interface TelegramAccessResponse {
 }
 
 export function accessStatusMessage(status: AccessStatus): string {
-  if (status === "pending") return "身份已确认，正在等待管理员批准访问。";
-  if (status === "disabled") return "该账号的媒体访问已被禁用。";
-  if (status === "denied") return "管理员未批准该账号访问媒体库。";
+  if (status === "pending") return translateNow("身份已确认，正在等待管理员批准访问。", "Identity confirmed. Waiting for administrator approval.");
+  if (status === "disabled") return translateNow("该账号的媒体访问已被禁用。", "Media access for this account has been disabled.");
+  if (status === "denied") return translateNow("管理员未批准该账号访问媒体库。", "The administrator did not approve this account.");
   return "";
 }
 
 export function TelegramAccessGate({ botUsername, initialStatus, onAuthenticated }: TelegramAccessGateProps) {
+  const { language, tr } = useI18n();
   const [code, setCode] = useState("");
   const [accessStatus, setAccessStatus] = useState<AccessStatus>(initialStatus);
   const [activeBot, setActiveBot] = useState(botUsername);
@@ -131,22 +134,26 @@ export function TelegramAccessGate({ botUsername, initialStatus, onAuthenticated
   }
 
   return (
-    <CenterShell icon={<Bot size={30} />} title="Telegram 身份验证">
+    <CenterShell icon={<Bot size={30} />} title={tr("Telegram 身份验证", "Telegram verification")}>
       {accessStatus === "pending" ? (
         <div className="telegram-access-state">
           <LoaderCircle className="spin" size={28} />
           <p>{accessStatusMessage(accessStatus)}</p>
-          <small>本页会在审批通过后自动进入媒体库。</small>
+          <small>{tr("本页会在审批通过后自动进入媒体库。", "This page will open the media library automatically after approval.")}</small>
         </div>
       ) : (
       <form className="auth-form" onSubmit={submit}>
         {accessStatusMessage(accessStatus) && <p className="form-error" role="alert">{accessStatusMessage(accessStatus)}</p>}
         {activeBot ? (
-          <p className="gate-message">在 <a href={`https://t.me/${activeBot}`} target="_blank" rel="noreferrer">@{activeBot}</a> 私聊发送 <code>/web</code>，然后输入一次性登录码。</p>
+          language === "zh-CN" ? (
+            <p className="gate-message">在 <a href={`https://t.me/${activeBot}`} target="_blank" rel="noreferrer">@{activeBot}</a> 私聊发送 <code>/web</code>，然后输入一次性登录码。</p>
+          ) : (
+            <p className="gate-message">Send <code>/web</code> in a private chat with <a href={`https://t.me/${activeBot}`} target="_blank" rel="noreferrer">@{activeBot}</a>, then enter the one-time login code.</p>
+          )
         ) : (
-          <p className="gate-message">辅助 Bot 尚未配置，请联系管理员。</p>
+          <p className="gate-message">{tr("辅助 Bot 尚未配置，请联系管理员。", "The helper bot is not configured. Contact the administrator.")}</p>
         )}
-        <label htmlFor="telegram-login-code">一次性登录码</label>
+        <label htmlFor="telegram-login-code">{tr("一次性登录码", "One-time login code")}</label>
         <div className="input-with-icon">
           <KeyRound size={18} aria-hidden="true" />
           <input
@@ -164,7 +171,7 @@ export function TelegramAccessGate({ botUsername, initialStatus, onAuthenticated
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button primary wide" disabled={loading} type="submit">
           {loading ? <LoaderCircle className="spin" size={18} /> : <ShieldCheck size={18} />}
-          验证 Telegram 身份
+          {tr("验证 Telegram 身份", "Verify Telegram identity")}
         </button>
       </form>
       )}
@@ -172,7 +179,59 @@ export function TelegramAccessGate({ botUsername, initialStatus, onAuthenticated
   );
 }
 
+export function PublicKeyGate({ onAuthenticated }: GateProps) {
+  const { tr } = useI18n();
+  const [key, setKey] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      await api("/api/public/login", {
+        method: "POST",
+        body: JSON.stringify({ key: key.trim() }),
+      });
+      setKey("");
+      onAuthenticated();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <CenterShell icon={<KeyRound size={30} />} title={tr("公开相册密钥", "Public album key")}>
+      <form className="auth-form" onSubmit={submit}>
+        <p className="gate-message">{tr("Telegram 身份已通过审批。请输入管理员提供的公开相册访问密钥。", "Your Telegram identity is approved. Enter the public album key provided by the administrator.")}</p>
+        <label htmlFor="public-album-key">{tr("公开相册访问密钥", "Public album access key")}</label>
+        <div className="input-with-icon">
+          <KeyRound size={18} aria-hidden="true" />
+          <input
+            id="public-album-key"
+            type="password"
+            autoComplete="current-password"
+            value={key}
+            onChange={(event) => setKey(event.target.value)}
+            required
+            autoFocus
+          />
+        </div>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <button className="button primary wide" disabled={loading} type="submit">
+          {loading ? <LoaderCircle className="spin" size={18} /> : <ShieldCheck size={18} />}
+          {tr("进入公开相册", "Open public album")}
+        </button>
+      </form>
+    </CenterShell>
+  );
+}
+
 export function TelegramLogin({ onAuthenticated }: GateProps) {
+  const { tr } = useI18n();
   const [auth, setAuth] = useState<TelegramAuthStatus>({
     state: "unauthenticated",
     authenticated: false,
@@ -251,16 +310,16 @@ export function TelegramLogin({ onAuthenticated }: GateProps) {
   const needsPassword = auth.state === "password_required";
 
   return (
-    <CenterShell icon={<QrCode size={30} />} title="连接 Telegram">
+    <CenterShell icon={<QrCode size={30} />} title={tr("连接 Telegram", "Connect Telegram")}>
       <div className="telegram-login">
         {waiting && qrUrl ? (
           <div className="qr-frame">
-            <canvas ref={canvasRef} aria-label="Telegram 登录二维码" />
-            <span className="status-line waiting"><span />等待扫码确认</span>
+            <canvas ref={canvasRef} aria-label={tr("Telegram 登录二维码", "Telegram login QR code")} />
+            <span className="status-line waiting"><span />{tr("等待扫码确认", "Waiting for scan confirmation")}</span>
           </div>
         ) : needsPassword ? (
           <form className="auth-form" onSubmit={submitPassword}>
-            <label htmlFor="telegram-password">Telegram 两步验证密码</label>
+            <label htmlFor="telegram-password">{tr("Telegram 两步验证密码", "Telegram two-step verification password")}</label>
             <div className="input-with-icon">
               <LockKeyhole size={18} aria-hidden="true" />
               <input
@@ -275,13 +334,13 @@ export function TelegramLogin({ onAuthenticated }: GateProps) {
             </div>
             <button className="button primary wide" disabled={loading} type="submit">
               {loading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
-              登录
+              {tr("登录", "Sign in")}
             </button>
           </form>
         ) : (
           <button className="button primary wide" disabled={loading} onClick={startQr} type="button">
             {loading ? <LoaderCircle className="spin" size={18} /> : expired ? <RefreshCw size={18} /> : <QrCode size={18} />}
-            {expired ? "刷新二维码" : "生成登录二维码"}
+            {expired ? tr("刷新二维码", "Refresh QR code") : tr("生成登录二维码", "Generate login QR code")}
           </button>
         )}
         {(error || auth.error) && <p className="form-error" role="alert">{error || auth.error}</p>}
@@ -297,12 +356,14 @@ interface CenterShellProps {
 }
 
 export function CenterShell({ icon, title, children }: CenterShellProps) {
+  const { tr } = useI18n();
   return (
     <main className="gate-page">
-      <a className="brand gate-brand" href="/" aria-label="SavedStream 首页">
+      <a className="brand gate-brand" href="/" aria-label={tr("SavedStream 首页", "SavedStream home")}>
         <span className="brand-mark">S</span>
         <span>SavedStream</span>
       </a>
+      <div className="gate-language"><LanguageSelector compact /></div>
       <section className="gate-panel" aria-labelledby="gate-title">
         <div className="gate-icon" aria-hidden="true">{icon}</div>
         <h1 id="gate-title">{title}</h1>

@@ -118,6 +118,17 @@ class DiskCache:
             self._generation += 1
             await asyncio.to_thread(self._clear_sync)
 
+    async def delete_media(self, media_key: str) -> None:
+        """Remove every cached representation for one media cache key.
+
+        A media key is shared by the encrypted Telegram chunks and the
+        thumbnail.  Deletion is deliberately performed under the eviction
+        lock so an in-flight eviction cannot race with the tombstone path.
+        """
+        async with self._eviction_lock:
+            self._generation += 1
+            await asyncio.to_thread(self._delete_media_sync, media_key)
+
     async def evict_if_needed(self) -> None:
         async with self._eviction_lock:
             limit = await self._limit_provider()
@@ -206,3 +217,11 @@ class DiskCache:
         if self.root.exists():
             shutil.rmtree(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def _delete_media_sync(self, media_key: str) -> None:
+        digest = self._key_digest(media_key)
+        chunk_dir = self.root / "chunks" / digest
+        thumbnail = self.root / "thumbnails" / f"{digest}.img"
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+        thumbnail.unlink(missing_ok=True)

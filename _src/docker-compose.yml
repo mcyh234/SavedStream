@@ -54,6 +54,9 @@ services:
         condition: service_healthy
     volumes:
       - savedstream-data:/data
+      # Deployment backups created by deploy.ps1 (host /opt/tube/backups).
+      # Read-write so the admin console can list and delete old backups.
+      - ../backups:/backups:rw
     security_opt:
       - no-new-privileges:true
     cap_drop:

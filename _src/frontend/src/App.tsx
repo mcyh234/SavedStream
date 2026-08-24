@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, LoaderCircle, ServerCog } from "lucide-react";
 import { api, errorMessage } from "./api";
-import { AdminKeyGate, CenterShell, TelegramAccessGate } from "./AuthPanels";
+import { AdminKeyGate, CenterShell, PublicKeyGate, TelegramAccessGate } from "./AuthPanels";
 import GalleryPage from "./GalleryPage";
-import { MediaEncryptionGate } from "./MediaCrypto";
+import { MediaEncryptionGate, useMediaCrypto } from "./MediaCrypto";
 import AdminPage from "./AdminPage";
+import { useI18n } from "./I18n";
+import { useTheme } from "./ThemeSelector";
 import type { PublicStatus } from "./types";
 
 export default function App() {
+  useTheme();
+  const { tr } = useI18n();
+  const mediaCrypto = useMediaCrypto();
+  const cryptoMode = mediaCrypto.mode;
+  const resetMediaCrypto = mediaCrypto.reset;
   const isAdminPage = window.location.pathname === "/admin" || window.location.pathname.startsWith("/admin/");
   const [status, setStatus] = useState<PublicStatus | null>(null);
   const [error, setError] = useState("");
@@ -32,13 +39,19 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [isAdminPage, refreshStatus]);
 
+  useEffect(() => {
+    if (status && !status.media_authenticated && cryptoMode === "session") {
+      void resetMediaCrypto(false);
+    }
+  }, [cryptoMode, resetMediaCrypto, status]);
+
   if (isAdminPage) {
     return <AdminPage onSessionChanged={refreshStatus} />;
   }
 
   if (!status && !error) {
     return (
-      <main className="app-loading" aria-label="正在加载">
+      <main className="app-loading" aria-label={tr("正在加载", "Loading")}>
         <LoaderCircle className="spin" size={30} />
       </main>
     );
@@ -46,31 +59,41 @@ export default function App() {
 
   if (error && !status) {
     return (
-      <CenterShell icon={<AlertTriangle size={30} />} title="服务连接失败">
+      <CenterShell icon={<AlertTriangle size={30} />} title={tr("服务连接失败", "Service connection failed")}>
         <p className="gate-message" role="alert">{error}</p>
-        <button className="button secondary wide" onClick={refreshStatus} type="button">重新连接</button>
+        <button className="button secondary wide" onClick={refreshStatus} type="button">{tr("重新连接", "Reconnect")}</button>
       </CenterShell>
     );
   }
 
   if (!status?.configuration_ok) {
     return (
-      <CenterShell icon={<ServerCog size={30} />} title="等待服务器配置">
+      <CenterShell icon={<ServerCog size={30} />} title={tr("等待服务器配置", "Server configuration required")}>
         <p className="gate-message">
-          请配置 TELEGRAM_API_ID、TELEGRAM_API_HASH 和 ADMIN_KEY 后重启容器。
+          {tr("请配置 TELEGRAM_API_ID、TELEGRAM_API_HASH 和 ADMIN_KEY 后重启容器。", "Configure TELEGRAM_API_ID, TELEGRAM_API_HASH, and ADMIN_KEY, then restart the containers.")}
         </p>
       </CenterShell>
     );
   }
 
   if (!status.media_authenticated) {
-    return (
-      <TelegramAccessGate
-        botUsername={status.helper_bot_username}
-        initialStatus={status.access_status}
-        onAuthenticated={refreshStatus}
-      />
-    );
+    if (status.access_status !== "approved") {
+      return (
+        <TelegramAccessGate
+          botUsername={status.helper_bot_username}
+          initialStatus={status.access_status}
+          onAuthenticated={refreshStatus}
+        />
+      );
+    }
+    if (!status.public_album_enabled) {
+      return (
+        <CenterShell icon={<ServerCog size={30} />} title={tr("公开相册暂未开放", "Public album is not available")}>
+          <p className="gate-message">{tr("管理员尚未开启公开相册访问，请联系管理员。", "The administrator has not enabled public album access.")}</p>
+        </CenterShell>
+      );
+    }
+    return <PublicKeyGate onAuthenticated={refreshStatus} />;
   }
 
   if (!status.telegram_authenticated) {
@@ -78,12 +101,19 @@ export default function App() {
       return <AdminKeyGate onAuthenticated={refreshStatus} />;
     }
     return (
-      <CenterShell icon={<ServerCog size={30} />} title="尚未连接托管账号">
-        <p className="gate-message">请打开管理页，在“多账号协调”中填写 Telegram API ID、API Hash，然后扫码连接账号。</p>
-        <a className="button primary wide" href="/admin">打开管理页配置</a>
+      <CenterShell icon={<ServerCog size={30} />} title={tr("尚未连接托管账号", "No managed account connected")}>
+        <p className="gate-message">{tr("请打开管理页，在“多账号协调”中填写 Telegram API ID、API Hash，然后扫码连接账号。", "Open the admin page, configure the Telegram API credentials under multi-account coordination, then connect an account by QR code.")}</p>
+        <a className="button primary wide" href="/admin">{tr("打开管理页配置", "Open admin settings")}</a>
       </CenterShell>
     );
   }
 
-  return <MediaEncryptionGate><GalleryPage /></MediaEncryptionGate>;
+  return (
+    <MediaEncryptionGate
+      mode={status.admin_authenticated ? "persistent" : "session"}
+      sessionId={status.media_session_id || ""}
+    >
+      <GalleryPage isAdmin={status.admin_authenticated} />
+    </MediaEncryptionGate>
+  );
 }
