@@ -846,6 +846,9 @@ class Database:
             await db.execute(
                 "UPDATE media_index SET account_group_id=(SELECT group_id FROM telegram_account_group_members m WHERE m.account_id=media_index.account_id) WHERE account_group_id IS NULL"
             )
+            await db.execute(
+                "UPDATE upload_jobs SET account_group_id=(SELECT group_id FROM telegram_account_group_members m WHERE m.account_id=upload_jobs.account_id) WHERE account_group_id IS NULL"
+            )
             # Old one-time web sessions are intentionally invalidated on the
             # first upgraded startup.  The legacy claim flow replaces them.
             await db.execute("DELETE FROM access_sessions")
