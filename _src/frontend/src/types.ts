@@ -18,6 +18,9 @@ export interface PublicStatus {
   public_key_configured: boolean;
   public_authenticated: boolean;
   media_session_id: string | null;
+  registration_enabled: boolean;
+  registration_requires_approval: boolean;
+  binding_sync_status: "pending" | "ready" | "error" | "not_required" | null;
 }
 
 export interface MediaItem {
@@ -48,6 +51,12 @@ export interface MediaItem {
   review_batch_id?: string | null;
   source_ingest_job_id?: number | null;
   submitter_telegram_user_id?: string | null;
+  owner_user_id?: number | null;
+  upload_source?: string;
+  upload_batch_id?: string | null;
+  like_count?: number;
+  liked_by_me?: boolean;
+  owned_by_me?: boolean;
   deleted?: boolean;
 }
 
@@ -106,6 +115,7 @@ export interface MediaPage {
   next_cursor: string | number | null;
   has_more: boolean;
   scope?: "public" | "private" | "all";
+  view?: "private" | "square" | "my_public" | "liked" | null;
   index?: MediaSyncState;
 }
 
@@ -131,6 +141,7 @@ export interface TimelineYear {
 export interface TimelineResponse {
   account_id: string | null;
   scope: "public" | "private" | "all";
+  view?: "private" | "square" | "my_public" | "liked" | null;
   years: TimelineYear[];
   index: MediaSyncState | null;
 }
@@ -159,6 +170,10 @@ export interface UploadJob {
   bytes_sent: number;
   message_id: number | null;
   error: string | null;
+  owner_user_id?: number | null;
+  requested_visibility?: "public" | "private";
+  review_status?: "not_required" | "pending" | "approved" | "rejected" | "revoked";
+  batch_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -282,6 +297,48 @@ export interface BackupListResponse {
   items: BackupEntry[];
 }
 
+export interface SystemBackupSettings {
+  enabled: boolean;
+  cron_expr: string;
+  timezone: string;
+  account_id: string | null;
+  passphrase_configured: boolean;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status: string;
+  last_error: string | null;
+  updated_at?: string | null;
+}
+
+export interface SystemBackupRecord {
+  id: string;
+  filename: string;
+  source: "scheduled" | "manual" | "upload" | "telegram" | string;
+  status: string;
+  created_at: string;
+  size_bytes: number;
+  sha256: string;
+  account_id?: string | null;
+  message_id?: number | null;
+  manifest_json?: string;
+  error?: string | null;
+  imported_at?: string | null;
+}
+
+export interface SystemBackupJob {
+  id: string;
+  backup_id?: string | null;
+  trigger: string;
+  status: string;
+  phase: string;
+  progress: number;
+  attempts: number;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+}
+
 export interface AuthUser {
   id: number;
   username: string | null;
@@ -291,7 +348,58 @@ export interface AuthUser {
   telegram_username?: string | null;
   display_name?: string | null;
   account_id?: string | null;
+  binding_sync_status?: "pending" | "ready" | "error" | "not_required";
+  ban_reason?: string | null;
   created_at?: string;
+  sanctions?: UserSanction[];
+}
+
+export interface UserSanction {
+  id: number;
+  user_id: number;
+  sanction_type: "upload_mute" | "login_ban" | "report_mute";
+  reason: string;
+  starts_at: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface ContentDeletionJob {
+  id: string;
+  target_user_id: number;
+  reason: string;
+  status: "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
+  total_items: number;
+  processed_items: number;
+  failed_items: number;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MediaReportItem {
+  id: number;
+  reporter_user_id: number;
+  reporter_name: string;
+  reason_code: string;
+  details: string | null;
+  status: string;
+  resolution_reason?: string | null;
+  created_at: string;
+}
+
+export interface MediaReportGroup {
+  account_id: string;
+  message_id: number;
+  media_title: string;
+  owner_user_id: number | null;
+  owner_name: string;
+  visibility: MediaVisibility;
+  deleted: boolean;
+  review_status: string;
+  report_count: number;
+  reports: MediaReportItem[];
 }
 
 export interface HelperRateLimit {
@@ -328,6 +436,11 @@ export interface AdminSettings {
   public_album_enabled: boolean;
   public_key_configured: boolean;
   public_key_version: number;
+  registration_enabled: boolean;
+  registration_key_configured: boolean;
+  registration_key_version: number;
+  registration_key_fingerprint: string;
+  registration_requires_approval: boolean;
   media_sync: MediaSyncState[];
   upload_jobs: UploadJob[];
   traffic: TrafficSummary;

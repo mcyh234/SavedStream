@@ -3,7 +3,10 @@ param(
     [string]$Server,
     [string]$SshUser = "root",
     [string]$Domain,
-    [int]$KeepBackups = 3,
+    [ValidateRange(1, 2)]
+    [int]$KeepBackups = 2,
+    [string]$PrebuiltImageArchive,
+    [switch]$AllowServerBuild,
     [switch]$PackageOnly,
     [switch]$ResetConfig
 )
@@ -108,6 +111,7 @@ function New-DeploymentArchive {
     Push-Location $Root
     try {
         $tarArgs = @(
+            "--options", "gzip:compression-level=3",
             "-czf", $Archive,
             "--exclude=_src/.env",
             "--exclude=_src/frontend/node_modules",
@@ -144,6 +148,138 @@ function Assert-LocalDocker {
     }
 }
 
+function Get-ImageTarMember {
+    param([string]$Archive)
+
+    if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
+        throw "Prebuilt image archive not found: $Archive"
+    }
+
+    $entries = @(& tar.exe -tzf $Archive 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Prebuilt image archive is not a valid gzip-compressed tar file: $Archive"
+    }
+
+    $member = $entries |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_ -and $_ -notmatch '/$' -and $_ -match '\.tar$' } |
+        Select-Object -First 1
+    if (-not $member) {
+        throw "Prebuilt image archive must contain a Docker image tar member (*.tar)."
+    }
+    if ($member -notmatch '^[A-Za-z0-9._/-]+$' -or $member -match '(^|/)\.\.(?:/|$)') {
+        throw "Prebuilt image archive contains an unsafe member name: $member"
+    }
+    return $member
+}
+
+function Get-PrebuiltImageTags {
+    param(
+        [string]$Archive,
+        [string]$ImageTarMember
+    )
+
+    $inspectRoot = Join-Path $env:TEMP ("tube-image-inspect-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $inspectRoot -Force | Out-Null
+    try {
+        & tar.exe -xzf $Archive -C $inspectRoot $ImageTarMember
+        if ($LASTEXITCODE -ne 0) {
+            throw "Prebuilt image archive does not contain a readable Docker image tar member."
+        }
+        $innerTarPath = Join-Path $inspectRoot ($ImageTarMember -replace '/', [IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $innerTarPath -PathType Leaf)) {
+            throw "Extracted Docker image tar member was not found."
+        }
+        $manifestText = @(& tar.exe -xOf $innerTarPath manifest.json 2>$null) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or -not $manifestText) {
+            throw "Prebuilt image archive does not contain a readable Docker manifest.json."
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $inspectRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        $manifest = @($manifestText | ConvertFrom-Json)
+    }
+    catch {
+        throw "Prebuilt image archive contains invalid Docker manifest.json."
+    }
+
+    $tags = @($manifest | ForEach-Object { @($_.RepoTags) } | Where-Object { $_ })
+    $savedTag = $tags | Where-Object { $_ -match '(?i)savedstream' } | Select-Object -First 1
+    $teleBoxTag = $tags | Where-Object { $_ -match '(?i)telebox' } | Select-Object -First 1
+    if (-not $savedTag -or -not $teleBoxTag) {
+        throw "Prebuilt image archive must contain RepoTags matching savedstream and telebox."
+    }
+    foreach ($tag in @($savedTag, $teleBoxTag)) {
+        if ($tag -notmatch '^[A-Za-z0-9._:/-]+$' -or $tag -notmatch ':') {
+            throw "Prebuilt image archive contains an unsafe image tag: $tag"
+        }
+    }
+    return [pscustomobject]@{
+        SavedStream = [string]$savedTag
+        TeleBox = [string]$teleBoxTag
+    }
+}
+
+function Invoke-RemoteDeployment {
+    param(
+        [int]$SessionId,
+        [string]$Command,
+        [int]$TimeoutSeconds = 3600
+    )
+
+    $remoteStatus = $null
+    $lines = New-Object System.Collections.Generic.List[string]
+    $streamCommand = Get-Command Invoke-SSHCommandStream -ErrorAction SilentlyContinue
+    $supportsExitStatus = $streamCommand -and $streamCommand.Parameters.ContainsKey('ExitStatusVariable')
+
+    if ($supportsExitStatus) {
+        Write-Progress -Id 1 -Activity "Deploying to server" -Status "Connected; waiting for remote deployment output..." -PercentComplete 0
+        @(& Invoke-SSHCommandStream -SessionId $SessionId -Command $Command -TimeOut $TimeoutSeconds -ExitStatusVariable remoteStatus |
+            ForEach-Object {
+                $line = [string]$_
+                [void]$lines.Add($line)
+                if ($line -match '^__PROGRESS__\|(\d{1,3})\|(.*)$') {
+                    $percent = [Math]::Min(100, [Math]::Max(0, [int]$Matches[1]))
+                    $status = $Matches[2]
+                    Write-Progress -Id 1 -Activity "Deploying to server" -Status $status -PercentComplete $percent
+                    Write-Host $status -ForegroundColor DarkCyan
+                }
+                elseif ($line) {
+                    Write-Host $line
+                }
+                $line
+            }) | Out-Null
+        Write-Progress -Id 1 -Activity "Deploying to server" -Completed
+    }
+    else {
+        Write-Warning "Installed Posh-SSH does not provide Invoke-SSHCommandStream; remote output will be shown after completion."
+        Write-Progress -Id 1 -Activity "Deploying to server" -Status "Remote deployment is running..." -PercentComplete 0
+        $fallback = Invoke-SSHCommand -SessionId $SessionId -Command $Command -TimeOut ($TimeoutSeconds * 1000)
+        foreach ($line in @($fallback.Output)) {
+            $text = [string]$line
+            [void]$lines.Add($text)
+            if ($text -match '^__PROGRESS__\|(\d{1,3})\|(.*)$') {
+                $percent = [Math]::Min(100, [Math]::Max(0, [int]$Matches[1]))
+                Write-Progress -Id 1 -Activity "Deploying to server" -Status $Matches[2] -PercentComplete $percent
+                Write-Host $Matches[2] -ForegroundColor DarkCyan
+            }
+            elseif ($text) {
+                Write-Host $text
+            }
+        }
+        Write-Progress -Id 1 -Activity "Deploying to server" -Completed
+        $remoteStatus = $fallback
+    }
+
+    return [pscustomobject]@{
+        Output = @($lines)
+        ExitStatus = [int]$remoteStatus.ExitStatus
+        Error = @($remoteStatus.Error)
+    }
+}
+
 function New-DeploymentImages {
     param(
         [string]$SavedStreamPath,
@@ -156,17 +292,20 @@ function New-DeploymentImages {
     )
 
     Write-Host "Building Linux images locally for $Platform..." -ForegroundColor Cyan
+    Write-Progress -Id 0 -Activity "Building Linux images" -Status "SavedStream image" -PercentComplete 10
     & docker build --platform $Platform --tag $SavedStreamImage $SavedStreamPath
     if ($LASTEXITCODE -ne 0) {
         throw "SavedStream image build failed with exit code $LASTEXITCODE."
     }
 
+    Write-Progress -Id 0 -Activity "Building Linux images" -Status "TeleBox image" -PercentComplete 45
     & docker build --platform $Platform --file (Join-Path $TeleBoxPath "Dockerfile.bridge") --tag $TeleBoxImage $TeleBoxPath
     if ($LASTEXITCODE -ne 0) {
         throw "TeleBox image build failed with exit code $LASTEXITCODE."
     }
 
     Write-Host "Exporting and compressing deployment images..." -ForegroundColor Cyan
+    Write-Progress -Id 0 -Activity "Building Linux images" -Status "Exporting and compressing images" -PercentComplete 80
     & docker image save --output $ImageTar $SavedStreamImage $TeleBoxImage
     if ($LASTEXITCODE -ne 0) {
         throw "Docker image export failed with exit code $LASTEXITCODE."
@@ -174,7 +313,7 @@ function New-DeploymentImages {
 
     Push-Location (Split-Path -Parent $ImageTar)
     try {
-        & tar.exe -czf $ImageArchive (Split-Path -Leaf $ImageTar)
+        & tar.exe --options gzip:compression-level=3 -czf $ImageArchive (Split-Path -Leaf $ImageTar)
         if ($LASTEXITCODE -ne 0) {
             throw "Image compression failed with exit code $LASTEXITCODE."
         }
@@ -182,6 +321,7 @@ function New-DeploymentImages {
     finally {
         Pop-Location
     }
+    Write-Progress -Id 0 -Activity "Building Linux images" -Completed
 }
 
 $root = $PSScriptRoot
@@ -232,16 +372,38 @@ if (-not $domainWasProvided -and -not $savedConfig) {
 }
 
 Assert-Inputs
-Ensure-PoshSsh
 
-$buildLocally = $true
-try {
-    Assert-LocalDocker
+$buildLocally = $false
+$usePrebuiltImages = $false
+$imageArchiveIsTemporary = $true
+$imageArchive = $null
+$imageTarMember = $null
+$prebuiltSavedStreamImage = $null
+$prebuiltTeleBoxImage = $null
+if ($PrebuiltImageArchive) {
+    $imageArchive = (Resolve-Path -LiteralPath $PrebuiltImageArchive -ErrorAction Stop).Path
+    $imageTarMember = Get-ImageTarMember -Archive $imageArchive
+    $prebuiltTags = Get-PrebuiltImageTags -Archive $imageArchive -ImageTarMember $imageTarMember
+    $prebuiltSavedStreamImage = $prebuiltTags.SavedStream
+    $prebuiltTeleBoxImage = $prebuiltTags.TeleBox
+    $usePrebuiltImages = $true
+    $imageArchiveIsTemporary = $false
+    Write-Host "Using prebuilt image archive: $imageArchive" -ForegroundColor Cyan
 }
-catch {
-    $buildLocally = $false
-    Write-Warning "Local Docker Desktop is unavailable. Falling back to a server-side Docker build; this uses server CPU and memory."
+else {
+    try {
+        Assert-LocalDocker
+        $buildLocally = $true
+        $usePrebuiltImages = $true
+    }
+    catch {
+        # Keep one-command deployment working when Docker Desktop is unavailable.
+        # A prebuilt archive is faster, but server-side build remains the automatic
+        # fallback for users who simply run deploy.ps1 without extra switches.
+        Write-Warning "Local Docker Desktop is unavailable. Falling back to a server-side Docker build; this may take longer."
+    }
 }
+Ensure-PoshSsh
 
 $password = $null
 if (
@@ -258,8 +420,13 @@ if (-not $password) {
 $credential = New-Object System.Management.Automation.PSCredential($SshUser, $password)
 $remoteArchive = "/tmp/tube-deploy-$stamp.tgz"
 $imageTar = Join-Path $env:TEMP "tube-images-$stamp.tar"
-$imageArchive = Join-Path $env:TEMP "tube-images-$stamp.tgz"
-$remoteImageArchive = "/tmp/tube-images-$stamp.tgz"
+if (-not $imageArchive) {
+    $imageArchive = Join-Path $env:TEMP "tube-images-$stamp.tgz"
+}
+$remoteImageArchive = "/tmp/$([IO.Path]::GetFileName($imageArchive))"
+if ($remoteImageArchive -notmatch '^/tmp/[A-Za-z0-9._-]+$') {
+    throw "Image archive file name must contain only letters, digits, dots, underscores, or hyphens."
+}
 $savedStreamImage = "savedstream:deploy-$stamp"
 $teleBoxImage = "telebox-bridge:deploy-$stamp"
 $adminCandidate = New-HexSecret
@@ -303,17 +470,23 @@ try {
             -TeleBoxImage $teleBoxImage `
             -ImageTar $imageTar `
             -ImageArchive $imageArchive
+        $imageTarMember = Split-Path -Leaf $imageTar
+        $prebuiltSavedStreamImage = $savedStreamImage
+        $prebuiltTeleBoxImage = $teleBoxImage
     }
-    else {
-        Write-Host "Local Docker unavailable; source will be built on the server." -ForegroundColor Yellow
+    elseif (-not $usePrebuiltImages) {
+        Write-Host "No local/prebuilt images; source will be built on the server." -ForegroundColor Yellow
     }
 
     $sftp = New-SFTPSession -ComputerName $Server -Credential $credential -AcceptKey -ConnectionTimeout 30
     Write-Host "Uploading source and prebuilt images..." -ForegroundColor Cyan
+    Write-Progress -Id 0 -Activity "Uploading deployment artifacts" -Status "Uploading source archive" -PercentComplete 10
     Set-SFTPItem -SessionId $sftp.SessionId -Path $archive -Destination "/tmp" -Force
-    if ($buildLocally) {
+    if ($usePrebuiltImages) {
+        Write-Progress -Id 0 -Activity "Uploading deployment artifacts" -Status "Uploading image archive" -PercentComplete 55
         Set-SFTPItem -SessionId $sftp.SessionId -Path $imageArchive -Destination "/tmp" -Force
     }
+    Write-Progress -Id 0 -Activity "Uploading deployment artifacts" -Completed
 
     $remoteTemplate = @'
 set -Eeuo pipefail
@@ -335,6 +508,8 @@ SECRET_KEY_CANDIDATE='__SECRET_KEY_CANDIDATE__'
 MEDIA_CACHE_KEY_CANDIDATE='__MEDIA_CACHE_KEY_CANDIDATE__'
 SAVEDSTREAM_IMAGE='__SAVEDSTREAM_IMAGE__'
 TELEBOX_IMAGE='__TELEBOX_IMAGE__'
+PREBUILT_SAVEDSTREAM_IMAGE='__PREBUILT_SAVEDSTREAM_IMAGE__'
+PREBUILT_TELEBOX_IMAGE='__PREBUILT_TELEBOX_IMAGE__'
 
 cleanup() {
   rm -f "$ARCHIVE"
@@ -342,6 +517,10 @@ cleanup() {
   rm -rf "$STAGING"
 }
 trap cleanup EXIT
+
+progress() {
+  printf '__PROGRESS__|%s|%s\n' "$1" "$2"
+}
 
 command -v docker >/dev/null || { echo 'Docker is not installed.'; exit 1; }
 docker compose version >/dev/null || { echo 'Docker Compose v2 is not available.'; exit 1; }
@@ -358,6 +537,7 @@ mkdir -p "$STAGING"
 tar xzf "$ARCHIVE" -C "$STAGING"
 test -f "$STAGING/_src/docker-compose.yml"
 test -f "$STAGING/TeleBox/Dockerfile.bridge"
+progress 15 'Source archive extracted'
 if [ "$BUILD_MODE" = local ]; then
   tar tzf "$IMAGE_ARCHIVE" | grep -Fxq "$IMAGE_TAR_NAME"
 fi
@@ -405,6 +585,7 @@ set_env CADDY_SITE "$SITE"
 set_env SAVEDSTREAM_IMAGE "$SAVEDSTREAM_IMAGE"
 set_env TELEBOX_IMAGE "$TELEBOX_IMAGE"
 chmod 600 "$ENV_FILE"
+progress 20 'Deployment environment prepared'
 
 cat > "$STAGING/_src/Caddyfile" <<EOF
 $SITE {
@@ -439,33 +620,62 @@ if [ "$PORTS_BUSY" = 1 ] && [ -z "$OWN_CADDY" ]; then
 fi
 
 echo "Compose project: $PROJECT"
+progress 25 'Preparing application images'
 docker image inspect alpine:3.20 >/dev/null 2>&1 || docker pull alpine:3.20
 if [ "$BUILD_MODE" = local ]; then
   echo 'Loading locally built application images...'
   tar -xOzf "$IMAGE_ARCHIVE" "$IMAGE_TAR_NAME" | docker load
+  if [ -n "$PREBUILT_SAVEDSTREAM_IMAGE" ] && [ "$PREBUILT_SAVEDSTREAM_IMAGE" != "$SAVEDSTREAM_IMAGE" ]; then
+    docker image tag "$PREBUILT_SAVEDSTREAM_IMAGE" "$SAVEDSTREAM_IMAGE"
+  fi
+  if [ -n "$PREBUILT_TELEBOX_IMAGE" ] && [ "$PREBUILT_TELEBOX_IMAGE" != "$TELEBOX_IMAGE" ]; then
+    docker image tag "$PREBUILT_TELEBOX_IMAGE" "$TELEBOX_IMAGE"
+  fi
+  progress 45 'Prebuilt application images loaded'
 else
   echo 'Building application images on the server...'
   docker compose -p "$PROJECT" -f "$STAGING/_src/docker-compose.yml" --project-directory "$STAGING/_src" build
+  progress 45 'Application images built on server'
 fi
 docker compose -p "$PROJECT" -f "$STAGING/_src/docker-compose.yml" --project-directory "$STAGING/_src" config >/dev/null
+progress 50 'Compose configuration validated'
 if [ "$MANAGE_CADDY" = 1 ]; then
   docker compose -p "$PROJECT" -f "$STAGING/_src/docker-compose.yml" --project-directory "$STAGING/_src" pull caddy
 fi
+progress 55 'Service images ready'
 
 OLD_COMPOSE="$BASE/_src/docker-compose.yml"
 if [ -f "$OLD_COMPOSE" ]; then
   docker compose -p "$PROJECT" -f "$OLD_COMPOSE" --project-directory "$BASE/_src" stop || true
 fi
+progress 58 'Previous deployment stopped; backing up persistent data'
 
 mkdir -p "$VOLUME_BACKUP"
-for suffix in savedstream-data telebox-data caddy-data caddy-config; do
-  volume="${PROJECT}_${suffix}"
+backup_volume() {
+  suffix="$1"
+  volume="$2"
+  percent="$3"
   if docker volume inspect "$volume" >/dev/null 2>&1; then
     echo "Backing up volume $volume"
-    docker run --rm -v "$volume:/data:ro" -v "$VOLUME_BACKUP:/backup" alpine:3.20 \
-      sh -c "tar czf /backup/$suffix.tgz -C /data ."
+    docker run --rm -v "$volume:/data:ro" -v "$VOLUME_BACKUP:/backup" alpine:3.20 sh -c "tar czf /backup/$suffix.tgz -C /data ."
+    progress "$percent" "Volume $volume backed up"
   fi
+}
+
+backup_pids=()
+backup_index=0
+for suffix in savedstream-data telebox-data caddy-data caddy-config; do
+  volume="${PROJECT}_${suffix}"
+  backup_index=$((backup_index + 1))
+  backup_volume "$suffix" "$volume" $((60 + backup_index * 4)) &
+  backup_pids+=("$!")
 done
+backup_failed=0
+for pid in "${backup_pids[@]}"; do
+  if ! wait "$pid"; then backup_failed=1; fi
+done
+[ "$backup_failed" = 0 ] || { echo 'Volume backup failed.'; exit 1; }
+progress 76 'Persistent data backups completed'
 
 mkdir -p "$CODE_BACKUP"
 if [ -d "$BASE/_src" ]; then mv "$BASE/_src" "$CODE_BACKUP/_src"; fi
@@ -473,6 +683,7 @@ if [ -d "$BASE/TeleBox" ]; then mv "$BASE/TeleBox" "$CODE_BACKUP/TeleBox"; fi
 mv "$STAGING/_src" "$BASE/_src"
 mv "$STAGING/TeleBox" "$BASE/TeleBox"
 rmdir "$STAGING" 2>/dev/null || true
+progress 80 'Code backup created and new release activated'
 
 rollback() {
   echo 'New version failed health checks. Rolling code back...'
@@ -502,11 +713,13 @@ rollback() {
 }
 
 if [ "$MANAGE_CADDY" = 1 ]; then
+  progress 84 'Starting updated containers'
   if ! docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" up -d --remove-orphans; then
     docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" logs --tail=200 || true
     rollback
   fi
 else
+  progress 84 'Starting updated containers'
   if ! docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" up -d --remove-orphans savedstream; then
     docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" logs --tail=200 || true
     rollback
@@ -515,6 +728,9 @@ fi
 
 healthy=0
 for ((attempt=1; attempt<=60; attempt++)); do
+  if (( attempt == 1 || attempt % 5 == 0 )); then
+    progress $((86 + attempt / 10)) "Waiting for health check ($attempt/60)"
+  fi
   if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
     healthy=1
     break
@@ -526,6 +742,7 @@ if [ "$healthy" != 1 ]; then
   docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" logs --tail=120 || true
   rollback
 fi
+progress 96 'Health check passed; pruning old backups'
 
 # Keep only the newest __KEEP_BACKUPS__ deployment backups.  Each backup is
 # a code-<stamp> + volumes-<stamp> pair; both are removed together.  The
@@ -540,7 +757,15 @@ if [ "$KEEP_BACKUPS" -gt 0 ] 2>/dev/null; then
       rm -rf "$BASE/backups/code-$stamp" "$BASE/backups/volumes-$stamp"
     fi
   done
+  # Remove orphaned volume backups left by interrupted deployments.
+  for dir in "$BASE"/backups/volumes-*; do
+    [ -d "$dir" ] || continue
+    stamp="${dir##*/}"
+    stamp="${stamp#volumes-}"
+    [ -d "$BASE/backups/code-$stamp" ] || rm -rf "$dir"
+  done
 fi
+progress 99 'Old backups pruned (retaining at most __KEEP_BACKUPS__)'
 
 if [ "$MANAGE_CADDY" = 1 ] && command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
   ufw allow 80/tcp >/dev/null
@@ -552,6 +777,7 @@ echo "__ADMIN_KEY__=$ADMIN_KEY"
 echo "__SITE__=$SITE"
 echo "__EXTERNAL_CADDY__=$((1 - MANAGE_CADDY))"
 echo '__DEPLOY_OK__=1'
+progress 100 'Deployment completed successfully'
 docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-directory "$BASE/_src" ps
 '@
 
@@ -559,8 +785,8 @@ docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-direct
         Replace('__STAMP__', $stamp).
         Replace('__ARCHIVE__', $remoteArchive).
         Replace('__IMAGE_ARCHIVE__', $remoteImageArchive).
-        Replace('__IMAGE_TAR_NAME__', (Split-Path -Leaf $imageTar)).
-        Replace('__BUILD_MODE__', $(if ($buildLocally) { 'local' } else { 'server' })).
+        Replace('__IMAGE_TAR_NAME__', [string]$imageTarMember).
+        Replace('__BUILD_MODE__', $(if ($usePrebuiltImages) { 'local' } else { 'server' })).
         Replace('__SITE__', $site).
         Replace('__COOKIE_SECURE__', $cookieSecure).
         Replace('__ADMIN_CANDIDATE__', $adminCandidate).
@@ -569,14 +795,15 @@ docker compose -p "$PROJECT" -f "$BASE/_src/docker-compose.yml" --project-direct
         Replace('__MEDIA_CACHE_KEY_CANDIDATE__', $mediaCacheKeyCandidate).
         Replace('__SAVEDSTREAM_IMAGE__', $savedStreamImage).
         Replace('__TELEBOX_IMAGE__', $teleBoxImage).
+        Replace('__PREBUILT_SAVEDSTREAM_IMAGE__', [string]$prebuiltSavedStreamImage).
+        Replace('__PREBUILT_TELEBOX_IMAGE__', [string]$prebuiltTeleBoxImage).
         Replace('__KEEP_BACKUPS__', $KeepBackups)
 
     $remoteScript = $remoteScript.Replace("`r`n", "`n")
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteScript))
     Write-Host "Building, backing up, and deploying..." -ForegroundColor Cyan
-    $result = Invoke-SSHCommand -SessionId $ssh.SessionId -Command "echo '$encoded' | base64 -d | bash" -TimeOut 3600000
+    $result = Invoke-RemoteDeployment -SessionId $ssh.SessionId -Command "echo '$encoded' | base64 -d | bash" -TimeoutSeconds 3600
     $output = @($result.Output)
-    $output | ForEach-Object { Write-Host $_ }
     if ($result.ExitStatus -ne 0) {
         if ($result.Error) {
             $result.Error | ForEach-Object { Write-Host $_ -ForegroundColor Red }
@@ -624,7 +851,7 @@ finally {
     if (Test-Path $imageTar) {
         Remove-Item -LiteralPath $imageTar -Force
     }
-    if (Test-Path $imageArchive) {
+    if ($imageArchiveIsTemporary -and (Test-Path $imageArchive)) {
         Remove-Item -LiteralPath $imageArchive -Force
     }
 }

@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   ArrowDownToLine,
   Bot,
+  Ban,
   Check,
   ChevronDown,
   CircleAlert,
@@ -28,6 +29,7 @@ import {
   Send,
   Server,
   Shield,
+  Siren,
   Trash2,
   Upload,
   UserPlus,
@@ -44,8 +46,12 @@ import { MediaEncryptionGate, useMediaCrypto } from "./MediaCrypto";
 import { LanguageSelector, translateNow, useI18n } from "./I18n";
 import type {
   AdminSettings,
+  AuthUser,
   BackupEntry,
   BackupListResponse,
+  SystemBackupSettings,
+  SystemBackupRecord,
+  SystemBackupJob,
   MediaItem,
   MediaPage,
   MediaVisibility,
@@ -59,17 +65,21 @@ import type {
   TrafficSeriesPoint,
   TrafficSummary,
   HelperRateLimit,
+  MediaReportGroup,
+  UserSanction,
+  ContentDeletionJob,
 } from "./types";
 import ThemeSelector from "./ThemeSelector";
 
 type AdminPhase = "checking" | "guest" | "ready" | "error";
 
-type AdminTab = "dashboard" | "telegram" | "review" | "users" | "album" | "media" | "upload" | "traffic" | "cache" | "rate" | "mailbox" | "backups" | "storage";
+type AdminTab = "dashboard" | "telegram" | "review" | "reports" | "users" | "album" | "media" | "upload" | "traffic" | "cache" | "rate" | "mailbox" | "backups" | "storage";
 
 const ADMIN_TABS: Array<{ id: AdminTab; zh: string; en: string; icon: typeof Gauge }> = [
   { id: "dashboard", zh: "仪表盘", en: "Dashboard", icon: Gauge },
   { id: "telegram", zh: "Telegram 与多账号", en: "Telegram & accounts", icon: Wifi },
   { id: "review", zh: "审核队列", en: "Review queue", icon: Shield },
+  { id: "reports", zh: "举报受理", en: "Reports", icon: Siren },
   { id: "users", zh: "用户管理", en: "Users", icon: Users },
   { id: "album", zh: "公开相册", en: "Public album", icon: Globe2 },
   { id: "media", zh: "媒体库", en: "Media library", icon: Database },
@@ -418,6 +428,7 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
 
         {tab === "telegram" && <CoordinationPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "review" && <ReviewQueuePanel settings={settings} onRefresh={refreshSettings} />}
+        {tab === "reports" && <ReportModerationPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "rate" && <HelperRateLimitPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "users" && <AccessUsersPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "album" && <PublicAlbumPanel settings={settings} onRefresh={refreshSettings} />}
@@ -426,7 +437,7 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
         {tab === "traffic" && <TrafficSettingsPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "cache" && <CacheSettingsPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "mailbox" && <MailboxAdminPanel settings={settings} onRefresh={refreshSettings} />}
-        {tab === "backups" && <BackupAdminPanel />}
+        {tab === "backups" && <><BackupAdminPanel /><SystemBackupAdminPanel settings={settings} /></>}
         {tab === "storage" && <StorageAdminPanel onGoToBackups={() => setTab("backups")} />}
 
         {tab === "media" && <MediaLibraryPanel settings={settings} onRefresh={refreshSettings} />}
@@ -1600,6 +1611,128 @@ function BackupAdminPanel() {
   );
 }
 
+function SystemBackupAdminPanel({ settings }: { settings: AdminSettings | null }) {
+  const { tr } = useI18n();
+  const [config, setConfig] = useState<SystemBackupSettings | null>(null);
+  const [items, setItems] = useState<SystemBackupRecord[]>([]);
+  const [job, setJob] = useState<SystemBackupJob | null>(null);
+  const [draft, setDraft] = useState({ enabled: false, cron_expr: "0 3 * * *", timezone: "UTC", account_id: "", passphrase: "" });
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+
+  const load = useCallback(async () => {
+    setError("");
+    try {
+      const [nextConfig, nextItems] = await Promise.all([
+        api<SystemBackupSettings>("/api/admin/system-backups/settings"),
+        api<{ items: SystemBackupRecord[] }>("/api/admin/system-backups"),
+      ]);
+      setConfig(nextConfig);
+      setDraft((current) => ({ ...current, enabled: nextConfig.enabled, cron_expr: nextConfig.cron_expr, timezone: nextConfig.timezone, account_id: nextConfig.account_id || "" }));
+      setItems(nextItems.items || []);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (!job || ["completed", "failed", "rolled_back"].includes(job.status)) return;
+    const timer = window.setInterval(() => {
+      void api<SystemBackupJob>(`/api/admin/system-backups/jobs/${encodeURIComponent(job.id)}`)
+        .then(setJob)
+        .catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [job]);
+
+  async function saveSettings() {
+    setBusy("settings"); setError(""); setNotice("");
+    try {
+      const next = await api<SystemBackupSettings>("/api/admin/system-backups/settings", { method: "PUT", body: JSON.stringify({ ...draft, account_id: draft.account_id || null, passphrase: draft.passphrase || null }) });
+      setConfig(next); setDraft((current) => ({ ...current, passphrase: "" }));
+      setNotice(tr("服务端配置备份设置已保存。", "System backup settings saved."));
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
+  }
+
+  async function runNow() {
+    setBusy("run"); setError(""); setNotice("");
+    try {
+      const next = await api<{ job_id: string }>("/api/admin/system-backups/run", { method: "POST" });
+      setJob({ id: next.job_id, trigger: "manual", status: "queued", phase: "queued", progress: 0, attempts: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+      setNotice(tr("备份任务已加入队列。", "Backup job queued."));
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
+  }
+
+  async function scanTelegram() {
+    setBusy("scan"); setError(""); setNotice("");
+    try {
+      const result = await api<{ discovered: number; items: SystemBackupRecord[] }>("/api/admin/system-backups/scan-telegram?account_id=" + encodeURIComponent(draft.account_id || ""), { method: "POST" });
+      setItems(result.items || []); setNotice(tr(`已发现 ${result.discovered} 份 Telegram 备份。`, `Discovered ${result.discovered} Telegram backup(s).`));
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
+  }
+
+  async function uploadImport() {
+    if (!file) return;
+    setBusy("import"); setError(""); setNotice("");
+    try {
+      const form = new FormData(); form.append("file", file);
+      const result = await api<{ job_id: string }>(`/api/admin/system-backups/import${draft.passphrase ? `?passphrase=${encodeURIComponent(draft.passphrase)}` : ""}`, { method: "POST", body: form });
+      setJob({ id: result.job_id, trigger: "upload", status: "queued", phase: "queued", progress: 0, attempts: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+      setFile(null); setNotice(tr("备份已上传，正在验证并恢复。", "Backup uploaded; validation and restore started."));
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
+  }
+
+  async function restoreTelegram(item: SystemBackupRecord) {
+    if (!item.account_id || !item.message_id) return;
+    if (!window.confirm(tr(`确认从 ${item.filename} 恢复服务端配置？当前数据会先生成回滚快照。`, `Restore ${item.filename}? A rollback snapshot will be created first.`))) return;
+    setBusy(`restore-${item.id}`); setError(""); setNotice("");
+    try {
+      const result = await api<{ job_id: string }>(`/api/admin/system-backups/${encodeURIComponent(item.id)}/restore${draft.passphrase ? `?passphrase=${encodeURIComponent(draft.passphrase)}` : ""}`, { method: "POST" });
+      setJob({ id: result.job_id, trigger: "telegram", status: "queued", phase: "queued", progress: 0, attempts: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+      setNotice(tr("已开始从 Telegram 下载并恢复。", "Telegram download and restore started."));
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
+  }
+
+  const accounts = settings?.accounts?.filter((item) => item.state === "authenticated") || [];
+  return (
+    <section className="admin-section backup-section" aria-labelledby="system-backup-heading">
+      <div className="admin-section-heading">
+        <div className="section-icon success" aria-hidden="true"><Archive size={22} /></div>
+        <div><h2 id="system-backup-heading">{tr("服务端配置备份", "System configuration backups")}</h2><p>{tr("加密保存用户、索引与 TeleBox 配置到 Telegram 收藏夹，支持 cron 定时和灾备恢复。", "Encrypt SavedStream and TeleBox state into Telegram Saved Messages for scheduled backup and disaster recovery.")}</p></div>
+      </div>
+      {error && <p className="form-error" role="alert"><CircleAlert size={17} />{error}</p>}
+      {notice && <p className="form-success" role="status"><Check size={17} />{notice}</p>}
+      <div className="settings-grid">
+        <label><span>{tr("启用自动备份", "Enable automatic backups")}</span><input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /></label>
+        <label><span>cron</span><input value={draft.cron_expr} onChange={(event) => setDraft({ ...draft, cron_expr: event.target.value })} placeholder="0 3 * * *" /></label>
+        <label><span>{tr("时区", "Timezone")}</span><input value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.target.value })} placeholder="UTC" /></label>
+        <label><span>{tr("Telegram 账号", "Telegram account")}</span><select value={draft.account_id} onChange={(event) => setDraft({ ...draft, account_id: event.target.value })}><option value="">{tr("系统默认账号", "System default")}</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.label || account.id}</option>)}</select></label>
+        <label><span>{tr("备份密码（设置或更换）", "Backup passphrase")}</span><input type="password" value={draft.passphrase} onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })} placeholder={config?.passphrase_configured ? tr("已配置，留空保持不变", "Configured; leave blank to keep") : tr("至少 8 个字符", "At least 8 characters")} /></label>
+      </div>
+      <div className="button-row">
+        <button className="button primary" disabled={busy === "settings"} onClick={() => void saveSettings()} type="button"><Save size={16} />{tr("保存设置", "Save settings")}</button>
+        <button className="button secondary" disabled={Boolean(busy)} onClick={() => void runNow()} type="button"><Upload size={16} />{tr("立即备份", "Run now")}</button>
+        <button className="button secondary" disabled={Boolean(busy)} onClick={() => void scanTelegram()} type="button"><RefreshCw size={16} />{tr("扫描 Telegram", "Scan Telegram")}</button>
+      </div>
+      {config && <p className="muted">{tr("状态", "Status")}: {config.last_status} · {config.next_run_at ? `${tr("下一次", "Next")}: ${formatBackupTime(config.next_run_at)}` : tr("尚未计划", "Not scheduled")} · {config.passphrase_configured ? tr("密码已配置", "Passphrase configured") : tr("未配置密码", "Passphrase not configured")}</p>}
+      <div className="backup-upload-row"><input type="file" accept=".ssbak,application/x-savedstream-backup" onChange={(event) => setFile(event.target.files?.[0] || null)} /><button className="button secondary" disabled={!file || Boolean(busy)} onClick={() => void uploadImport()} type="button"><ArrowDownToLine size={16} />{tr("上传并恢复", "Upload and restore")}</button></div>
+      {job && <div className="backup-preview" role="status"><strong>{tr("当前任务", "Current job")}</strong> · {job.phase} · {job.status} · {Math.round(job.progress)}%{job.error ? ` · ${job.error}` : ""}</div>}
+      <div className="backup-list">
+        {items.length === 0 ? <p className="muted">{tr("尚未发现服务端配置备份。", "No system backups discovered yet.")}</p> : items.map((item) => <div className="backup-row" key={item.id}><div className="backup-row-main"><span className="backup-identity"><strong>{item.filename}</strong><small>{formatBackupTime(item.created_at)} · {item.source} · {formatBytes(item.size_bytes)}{item.account_id ? ` · ${item.account_id}:${item.message_id || ""}` : ""}</small></span><span className="backup-meta"><small>{item.status}</small></span></div>{item.account_id && item.message_id && <div className="backup-row-actions"><button className="button secondary" disabled={Boolean(busy)} onClick={() => void restoreTelegram(item)} type="button"><RotateCcw size={16} />{tr("恢复", "Restore")}</button></div>}</div>)}
+      </div>
+    </section>
+  );
+}
+
 function formatBackupTime(value: string): string {
   try {
     const date = new Date(value);
@@ -1811,6 +1944,126 @@ function ReviewQueuePanel({ settings, onRefresh }: { settings: AdminSettings; on
   );
 }
 
+export type ReportSanctionDraft = {
+  sanction_type: "upload_mute" | "login_ban" | "report_mute";
+  enabled: boolean;
+  reason: string;
+  duration: "1h" | "24h" | "7d" | "30d" | "permanent" | "custom";
+  customExpiry: string;
+};
+
+export function sanctionExpiry(draft: ReportSanctionDraft, now = Date.now()): string | null {
+  if (draft.duration === "permanent") return null;
+  if (draft.duration === "custom") {
+    if (!draft.customExpiry) throw new Error("请选择自定义处罚解除时间");
+    const parsed = new Date(draft.customExpiry);
+    if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= now) {
+      throw new Error("自定义处罚解除时间必须晚于当前时间");
+    }
+    return parsed.toISOString();
+  }
+  const milliseconds = { "1h": 3_600_000, "24h": 86_400_000, "7d": 7 * 86_400_000, "30d": 30 * 86_400_000 }[draft.duration];
+  return new Date(now + milliseconds).toISOString();
+}
+
+function ReportModerationPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {
+  const { tr } = useI18n();
+  const [groups, setGroups] = useState<MediaReportGroup[]>([]);
+  const [selected, setSelected] = useState<MediaReportGroup | null>(null);
+  const [mediaAction, setMediaAction] = useState<"none" | "private" | "hidden" | "delete">("private");
+  const [reason, setReason] = useState("");
+  const [targetUserId, setTargetUserId] = useState<number | null>(null);
+  const [deleteAll, setDeleteAll] = useState(false);
+  const [sanctions, setSanctions] = useState<ReportSanctionDraft[]>([
+    { sanction_type: "upload_mute", enabled: false, reason: "", duration: "24h", customExpiry: "" },
+    { sanction_type: "login_ban", enabled: false, reason: "", duration: "7d", customExpiry: "" },
+    { sanction_type: "report_mute", enabled: false, reason: "", duration: "7d", customExpiry: "" },
+  ]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load() {
+    try {
+      const result = await api<{ items: MediaReportGroup[] }>("/api/admin/reports?status=actionable&limit=500");
+      setGroups(result.items);
+    } catch (value) {
+      setError(errorMessage(value));
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 8_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  function openGroup(group: MediaReportGroup) {
+    setSelected(group);
+    setMediaAction("private");
+    setReason("");
+    setTargetUserId(group.owner_user_id || null);
+    setDeleteAll(false);
+    setSanctions((current) => current.map((item) => ({ ...item, enabled: false, reason: "", customExpiry: "" })));
+  }
+
+  async function resolve(resolution: "actioned" | "ignored") {
+    if (!selected || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const targets = targetUserId && resolution === "actioned"
+        ? [{
+            user_id: targetUserId,
+            sanctions: sanctions.filter((item) => item.enabled).map((item) => ({
+              sanction_type: item.sanction_type,
+              reason: item.reason.trim() || reason.trim() || tr("违反平台规则", "Platform rule violation"),
+              expires_at: sanctionExpiry(item),
+            })),
+            delete_all_content: deleteAll,
+          }]
+        : [];
+      await api(`/api/admin/reports/${selected.reports[0].id}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({
+          resolution,
+          media_action: resolution === "ignored" ? "none" : mediaAction,
+          reason: reason.trim() || null,
+          targets,
+        }),
+      });
+      setSelected(null);
+      await load();
+      await onRefresh();
+    } catch (value) {
+      setError(errorMessage(value));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const targetOptions = selected ? Array.from(new Set([
+    ...(selected.owner_user_id ? [selected.owner_user_id] : []),
+    ...selected.reports.map((item) => item.reporter_user_id),
+  ])).map((id) => settings.auth_users.find((user) => user.id === id)).filter(Boolean) : [];
+
+  return (
+    <section className="admin-section reports-section" aria-labelledby="reports-heading">
+      <div className="admin-section-heading"><div className={`section-icon ${groups.length ? "warning" : "success"}`}><Siren size={22} /></div><div><h2 id="reports-heading">{tr("举报受理", "Report moderation")}</h2><p>{tr("核查广场举报、快速下架或隐藏资源，并对上传者或恶意举报者实施组合处罚。", "Review square reports, remove or hide media, and apply combined sanctions to uploaders or abusive reporters.")}</p></div><span className="metric-value">{groups.length} {tr("项待处理", "open")}</span></div>
+      {error && <p className="form-error" role="alert"><CircleAlert size={17} />{error}</p>}
+      {!groups.length ? <div className="admin-empty-state compact"><Check size={28} /><p>{tr("当前没有待处理举报。", "There are no open reports.")}</p></div> : <div className="report-admin-list">{groups.map((group) => { const failed = group.reports.some((item) => item.status === "failed"); return <button className={`report-admin-row${failed ? " failed" : ""}`} key={`${group.account_id}:${group.message_id}`} onClick={() => openGroup(group)} type="button"><span><strong>{group.media_title}</strong><small>{group.account_id} · #{group.message_id} · {tr("上传者", "Uploader")}: {group.owner_name || tr("未知", "Unknown")}</small>{failed && <small className="report-failed-reason">{tr("上次处置失败，可重新受理", "Previous action failed and can be retried")} · {group.reports.find((item) => item.status === "failed")?.resolution_reason}</small>}</span><span className="report-count"><Siren size={16} />{group.report_count}</span></button>; })}</div>}
+      {selected && <div className="viewer-backdrop" role="presentation"><section className="report-resolution-dialog" role="dialog" aria-modal="true" aria-labelledby="resolve-report-title"><div className="viewer-topbar"><h2 id="resolve-report-title">{tr("受理举报", "Resolve reports")} · {selected.media_title}</h2><button className="icon-button" disabled={busy} onClick={() => setSelected(null)} type="button"><X size={20} /></button></div>
+        <div className="report-evidence-list">{selected.reports.map((item) => <div key={item.id}><strong>{item.reporter_name}</strong><span>{item.reason_code}</span><p>{item.details || tr("没有补充说明", "No additional details")}</p><small>{formatBackupTime(item.created_at)}</small></div>)}</div>
+        <label><span>{tr("媒体处置", "Media action")}</span><select value={mediaAction} onChange={(event) => setMediaAction(event.target.value as typeof mediaAction)}><option value="none">{tr("不改媒体状态", "No media change")}</option><option value="private">{tr("下架：转为私人", "Remove: make private")}</option><option value="hidden">{tr("隐藏：仅管理员可见", "Hide: administrators only")}</option><option value="delete">{tr("删除 Telegram 原文件", "Delete Telegram media")}</option></select></label>
+        <label><span>{tr("处置理由", "Resolution reason")}</span><textarea value={reason} maxLength={1000} rows={3} onChange={(event) => setReason(event.target.value)} /></label>
+        <label><span>{tr("处罚对象（可选）", "Sanction target (optional)")}</span><select value={targetUserId || ""} onChange={(event) => setTargetUserId(event.target.value ? Number(event.target.value) : null)}><option value="">{tr("不处罚用户", "No user sanction")}</option>{targetOptions.map((user) => user && <option key={user.id} value={user.id}>{user.display_name || user.username || `#${user.id}`} · {user.id === selected.owner_user_id ? tr("上传者", "Uploader") : tr("举报者", "Reporter")}</option>)}</select></label>
+        {targetUserId && <div className="sanction-draft-list">{sanctions.map((draft, index) => <div className="sanction-draft-row" key={draft.sanction_type}><label className="review-ban-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => setSanctions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item))} />{draft.sanction_type === "upload_mute" ? tr("Mute：禁止上传", "Mute uploads") : draft.sanction_type === "login_ban" ? tr("Ban：禁止登录", "Ban sign-in") : tr("禁用举报功能", "Mute reports")}</label>{draft.enabled && <><input value={draft.reason} maxLength={1000} placeholder={tr("该项处罚理由", "Reason for this sanction")} onChange={(event) => setSanctions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, reason: event.target.value } : item))} /><select value={draft.duration} onChange={(event) => setSanctions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value as ReportSanctionDraft["duration"] } : item))}><option value="1h">1 {tr("小时", "hour")}</option><option value="24h">24 {tr("小时", "hours")}</option><option value="7d">7 {tr("天", "days")}</option><option value="30d">30 {tr("天", "days")}</option><option value="permanent">{tr("永久", "Permanent")}</option><option value="custom">{tr("自定义", "Custom")}</option></select>{draft.duration === "custom" && <input type="datetime-local" value={draft.customExpiry} onChange={(event) => setSanctions((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, customExpiry: event.target.value } : item))} />}</>}</div>)}</div>}
+        {targetUserId && <label className="review-ban-toggle dangerous"><input type="checkbox" checked={deleteAll} onChange={(event) => setDeleteAll(event.target.checked)} />{tr("删除该用户全部可确认归属的 WebUI / Helper Bot 内容", "Delete all attributable WebUI / Helper Bot content from this user")}</label>}
+        <div className="report-resolution-actions"><button className="button ghost" disabled={busy} onClick={() => void resolve("ignored")} type="button">{tr("忽略并完结", "Ignore and close")}</button><button className="button primary" disabled={busy} onClick={() => void resolve("actioned")} type="button">{busy ? <LoaderCircle className="spin" size={17} /> : <Shield size={17} />}{tr("执行处置并完结", "Apply action and close")}</button></div>
+      </section></div>}
+    </section>
+  );
+}
+
 function HelperRateLimitPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {
   const { tr } = useI18n();
   const defaults: HelperRateLimit = {
@@ -1882,6 +2135,9 @@ function PublicAlbumPanel({ settings, onRefresh }: { settings: AdminSettings; on
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [generatedKey, setGeneratedKey] = useState("");
+  const [generatedRegistrationKey, setGeneratedRegistrationKey] = useState("");
+  const [registrationKeyMode, setRegistrationKeyMode] = useState<"random" | "custom">("random");
+  const [customRegistrationKey, setCustomRegistrationKey] = useState("");
 
   async function toggle(enabled: boolean) {
     setBusy(true);
@@ -1914,10 +2170,68 @@ function PublicAlbumPanel({ settings, onRefresh }: { settings: AdminSettings; on
     }
   }
 
+  async function updateRegistrationPolicy(
+    patch: { registration_enabled?: boolean; registration_requires_approval?: boolean },
+    success: string,
+  ) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api("/api/admin/public-album", { method: "PUT", body: JSON.stringify(patch) });
+      await onRefresh();
+      setNotice(success);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rotateRegistrationKey() {
+    const customKey = customRegistrationKey.trim();
+    if (registrationKeyMode === "custom" && !customKey) {
+      setError(tr("请输入自定义注册密钥。", "Enter a custom registration key."));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setGeneratedRegistrationKey("");
+    try {
+      const result = await api<{ key: string; generated: boolean }>("/api/admin/public-album/registration-key", {
+        method: "POST",
+        body: JSON.stringify(
+          registrationKeyMode === "random"
+            ? { generate: true }
+            : { generate: false, key: customKey },
+        ),
+      });
+      setGeneratedRegistrationKey(result.key);
+      setCustomRegistrationKey("");
+      setNotice(
+        result.generated
+          ? tr("已随机生成并轮换注册密钥；新密钥只在此处显示一次，用户注册已自动关闭。", "A random registration key was generated and rotated. It is shown only once, and registration was disabled automatically.")
+          : tr("已应用管理员自定义注册密钥；用户注册已自动关闭，请确认后再重新开放。", "The administrator-defined registration key was applied. Registration was disabled automatically; re-enable it after confirming the key."),
+      );
+      await onRefresh();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function copyKey() {
     if (!generatedKey) return;
     await navigator.clipboard?.writeText(generatedKey);
     setNotice(tr("公开访问密钥已复制。", "Public access key copied."));
+  }
+
+  async function copyRegistrationKey() {
+    if (!generatedRegistrationKey) return;
+    await navigator.clipboard?.writeText(generatedRegistrationKey);
+    setNotice(tr("注册密钥已复制。", "Registration key copied."));
   }
 
   return (
@@ -1951,6 +2265,101 @@ function PublicAlbumPanel({ settings, onRefresh }: { settings: AdminSettings; on
           <button className="button secondary" onClick={() => void copyKey()} type="button"><Copy size={17} />{tr("复制", "Copy")}</button>
         </div>
       )}
+      <div className="registration-settings-card">
+        <div className="status-detail">
+          <strong>{tr("新用户注册与访问审批", "New-user registration and approval")}</strong>
+          <p>
+            {settings.registration_key_configured
+              ? `${tr("注册密钥已配置", "Registration key configured")} · ${tr("版本", "version")} ${settings.registration_key_version}${settings.registration_key_fingerprint ? ` · ${settings.registration_key_fingerprint}` : ""}`
+              : tr("尚未配置注册密钥。生成密钥后才可开放注册。", "No registration key is configured. Generate one before enabling registration.")}
+          </p>
+        </div>
+        <label className="toggle-control">
+          <span>
+            <strong>{tr("开放新用户注册", "Allow new-user registration")}</strong>
+            <small>{tr("关闭后已有账号仍可登录，但不会接受新的注册申请。", "Existing accounts can still sign in, but new registrations are rejected.")}</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.registration_enabled}
+            disabled={busy || !settings.registration_key_configured}
+            onChange={(event) => void updateRegistrationPolicy(
+              { registration_enabled: event.target.checked },
+              event.target.checked ? tr("新用户注册已开放。", "New-user registration enabled.") : tr("新用户注册已关闭。", "New-user registration disabled."),
+            )}
+          />
+          <span className="toggle-track"><span /></span>
+        </label>
+        <label className="toggle-control">
+          <span>
+            <strong>{tr("新用户需要管理员审批", "Require administrator approval for new users")}</strong>
+            <small>
+              {settings.registration_requires_approval
+                ? tr("开启时，新用户完成 Telegram 身份确认和 /bind 后仍需管理员批准。", "When enabled, new users still require administrator approval after Telegram confirmation and /bind.")
+                : tr("关闭时，新用户完成 Telegram 身份确认并通过 /bind 绑定有效账号后自动获批。", "When disabled, new users are approved automatically after Telegram confirmation and a valid /bind account link.")}
+            </small>
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.registration_requires_approval}
+            disabled={busy}
+            onChange={(event) => void updateRegistrationPolicy(
+              { registration_requires_approval: event.target.checked },
+              event.target.checked ? tr("新用户审批已开启。", "New-user approval enabled.") : tr("新用户审批已关闭；具有有效账号绑定的待审批用户会自动获批。", "New-user approval disabled. Pending users with a valid account link are approved automatically."),
+            )}
+          />
+          <span className="toggle-track"><span /></span>
+        </label>
+        <div className="registration-key-rotation">
+          <div className="registration-key-mode" role="group" aria-label={tr("注册密钥来源", "Registration key source")}>
+            <button
+              className={registrationKeyMode === "random" ? "active" : ""}
+              disabled={busy}
+              onClick={() => { setRegistrationKeyMode("random"); setError(""); }}
+              type="button"
+            >
+              {tr("随机生成", "Generate randomly")}
+            </button>
+            <button
+              className={registrationKeyMode === "custom" ? "active" : ""}
+              disabled={busy}
+              onClick={() => { setRegistrationKeyMode("custom"); setError(""); }}
+              type="button"
+            >
+              {tr("管理员自定义", "Administrator-defined")}
+            </button>
+          </div>
+          {registrationKeyMode === "custom" && (
+            <label className="form-field registration-key-custom-field" htmlFor="custom-registration-key">
+              <span>{tr("自定义注册密钥", "Custom registration key")}</span>
+              <input
+                id="custom-registration-key"
+                type="password"
+                autoComplete="new-password"
+                maxLength={512}
+                value={customRegistrationKey}
+                onChange={(event) => setCustomRegistrationKey(event.target.value)}
+                placeholder={tr("输入管理员指定的注册密钥", "Enter the administrator-defined registration key")}
+              />
+              <small>{tr("数据库只保存哈希；轮换后旧密钥立即失效。", "Only a hash is stored; the previous key becomes invalid immediately after rotation.")}</small>
+            </label>
+          )}
+          <div className="button-row">
+            <button className="button secondary" disabled={busy} onClick={() => void rotateRegistrationKey()} type="button">
+              {busy ? <LoaderCircle className="spin" size={18} /> : registrationKeyMode === "random" ? <RotateCcw size={18} /> : <KeyRound size={18} />}
+              {registrationKeyMode === "random"
+                ? settings.registration_key_configured ? tr("随机轮换注册密钥", "Rotate with random key") : tr("随机生成注册密钥", "Generate random key")
+                : settings.registration_key_configured ? tr("应用并轮换密钥", "Apply and rotate key") : tr("应用自定义密钥", "Apply custom key")}
+            </button>
+          </div>
+        </div>
+        {generatedRegistrationKey && (
+          <div className="generated-secret" role="status">
+            <code>{generatedRegistrationKey}</code>
+            <button className="button secondary" onClick={() => void copyRegistrationKey()} type="button"><Copy size={17} />{tr("复制", "Copy")}</button>
+          </div>
+        )}
+      </div>
     </section>
   );
 }
@@ -2123,13 +2532,14 @@ function AccessUsersPanel({ settings, onRefresh }: { settings: AdminSettings; on
   const { tr } = useI18n();
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const pending = settings.access_users.filter((user) => user.status === "pending").length;
+  const [sanctionUser, setSanctionUser] = useState<AuthUser | null>(null);
+  const pending = settings.auth_users.filter((user) => user.status === "pending").length;
 
-  async function setUserStatus(telegramUserId: string, status: "approved" | "disabled" | "denied") {
-    setBusy(`${telegramUserId}-${status}`);
+  async function setUserStatus(userId: number, status: "approved" | "disabled" | "denied") {
+    setBusy(`${userId}-${status}`);
     setError("");
     try {
-      await api(`/api/admin/access-users/${encodeURIComponent(telegramUserId)}`, {
+      await api(`/api/admin/users/${userId}`, {
         method: "PUT",
         body: JSON.stringify({ status }),
       });
@@ -2145,42 +2555,111 @@ function AccessUsersPanel({ settings, onRefresh }: { settings: AdminSettings; on
     <section className="admin-section access-users-section" aria-labelledby="access-users-heading">
       <div className="admin-section-heading">
         <div className={`section-icon ${pending ? "warning" : "success"}`} aria-hidden="true"><Users size={22} /></div>
-        <div><h2 id="access-users-heading">{tr("媒体访问用户", "Media access users")}</h2><p>{tr("Telegram 身份绑定与管理员审批", "Telegram identity binding and administrator approval")}</p></div>
-        <span className="metric-value">{pending ? `${pending} ${tr("个待审批", "pending")}` : `${settings.access_users.length} ${tr("个用户", "users")}`}</span>
+        <div><h2 id="access-users-heading">{tr("账号与媒体访问用户", "Accounts and media access users")}</h2><p>{tr("管理 SavedStream 账号、Telegram 身份绑定与媒体库访问状态", "Manage SavedStream accounts, Telegram identity links, and media-library access")}</p></div>
+        <span className="metric-value">{pending ? `${pending} ${tr("个待处理", "pending")}` : `${settings.auth_users.length} ${tr("个用户", "users")}`}</span>
       </div>
       {error && <p className="form-error" role="alert"><CircleAlert size={17} />{error}</p>}
-      {settings.access_users.length === 0 ? (
+      {settings.auth_users.length === 0 ? (
         <div className="admin-empty-state compact">
           <Users size={28} />
-          <p>{tr("用户通过辅助 Bot 的", "Users appear here after signing in through the helper bot's")} <code>/web</code> {tr("登录后会出现在这里。", "command.")}</p>
+          <p>{tr("用户完成 SavedStream 注册和 Telegram 身份确认后会显示在这里。", "Users appear here after completing SavedStream registration and Telegram identity confirmation.")}</p>
         </div>
       ) : (
         <div className="access-users-list">
-          {settings.access_users.map((user) => (
-            <div className="coordination-row access-user-row" key={user.telegram_user_id}>
+          {settings.auth_users.map((user) => (
+            <div className="coordination-row access-user-row" key={user.id}>
               <span>
-                <strong>{user.display_name}{user.username ? ` · @${user.username}` : ""}</strong>
-                <small>Telegram {user.telegram_user_id} · {user.account_id} · {accessUserStatusLabel(user.status)}</small>
+                <strong>{user.display_name || user.username || `${tr("用户", "User")} #${user.id}`}{user.username ? ` · ${user.username}` : ""}</strong>
+                <small>
+                  {user.role} · {accessUserStatusLabel(user.status as "pending" | "approved" | "disabled" | "denied")}
+                  {user.telegram_user_id ? ` · Telegram ${user.telegram_user_id}` : ""}
+                  {user.account_id ? ` · ${user.account_id}` : ` · ${tr("未绑定托管账号", "No managed account linked")}`}
+                  {user.binding_sync_status ? ` · ${bindingSyncStatusLabel(user.binding_sync_status)}` : ""}
+                </small>
               </span>
               <div className="access-user-actions">
+                <button className="button ghost" disabled={Boolean(busy)} onClick={() => setSanctionUser(user)} type="button"><Ban size={15} />{tr("处罚", "Sanctions")}</button>
                 {user.status !== "approved" && (
-                  <button className="button secondary" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "approved")} type="button">
-                    {busy === `${user.telegram_user_id}-approved` ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{tr("批准", "Approve")}
+                  <button className="button secondary" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.id, "approved")} type="button">
+                    {busy === `${user.id}-approved` ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{tr("批准", "Approve")}
                   </button>
                 )}
                 {user.status === "pending" && (
-                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "denied")} type="button">{tr("拒绝", "Deny")}</button>
+                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.id, "denied")} type="button">{tr("拒绝", "Deny")}</button>
                 )}
                 {user.status === "approved" && (
-                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.telegram_user_id, "disabled")} type="button">{tr("禁用", "Disable")}</button>
+                  <button className="button danger-ghost" disabled={Boolean(busy)} onClick={() => void setUserStatus(user.id, "disabled")} type="button">{tr("禁用", "Disable")}</button>
                 )}
               </div>
             </div>
           ))}
         </div>
       )}
+      {sanctionUser && <UserSanctionDialog user={sanctionUser} onClose={() => setSanctionUser(null)} onChanged={async () => { await onRefresh(); }} />}
     </section>
   );
+}
+
+function UserSanctionDialog({ user, onClose, onChanged }: { user: AuthUser; onClose: () => void; onChanged: () => Promise<void> }) {
+  const { tr } = useI18n();
+  const [sanctions, setSanctions] = useState<UserSanction[]>([]);
+  const [deletions, setDeletions] = useState<ContentDeletionJob[]>([]);
+  const [drafts, setDrafts] = useState<ReportSanctionDraft[]>([
+    { sanction_type: "upload_mute", enabled: false, reason: "", duration: "24h", customExpiry: "" },
+    { sanction_type: "login_ban", enabled: false, reason: "", duration: "7d", customExpiry: "" },
+    { sanction_type: "report_mute", enabled: false, reason: "", duration: "7d", customExpiry: "" },
+  ]);
+  const [deleteAll, setDeleteAll] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load() {
+    try {
+      const result = await api<{ items: UserSanction[]; content_deletion_jobs: ContentDeletionJob[] }>(`/api/admin/users/${user.id}/sanctions`);
+      setSanctions(result.items);
+      setDeletions(result.content_deletion_jobs);
+    } catch (value) {
+      setError(errorMessage(value));
+    }
+  }
+  useEffect(() => { void load(); }, [user.id]);
+
+  async function apply() {
+    setBusy(true); setError("");
+    try {
+      await api(`/api/admin/users/${user.id}/sanctions`, {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: user.id,
+          sanctions: drafts.filter((draft) => draft.enabled).map((draft) => ({ sanction_type: draft.sanction_type, reason: draft.reason.trim() || tr("违反平台规则", "Platform rule violation"), expires_at: sanctionExpiry(draft) })),
+          delete_all_content: deleteAll,
+        }),
+      });
+      setDrafts((current) => current.map((item) => ({ ...item, enabled: false, reason: "", customExpiry: "" })));
+      setDeleteAll(false);
+      await load(); await onChanged();
+    } catch (value) { setError(errorMessage(value)); } finally { setBusy(false); }
+  }
+
+  async function revoke(sanction: UserSanction) {
+    setBusy(true); setError("");
+    try { await api(`/api/admin/users/${user.id}/sanctions/${sanction.id}`, { method: "DELETE" }); await load(); await onChanged(); }
+    catch (value) { setError(errorMessage(value)); } finally { setBusy(false); }
+  }
+
+  async function retryDeletion(job: ContentDeletionJob) {
+    setBusy(true); setError("");
+    try { await api(`/api/admin/content-deletion-jobs/${job.id}/retry`, { method: "POST" }); await load(); }
+    catch (value) { setError(errorMessage(value)); } finally { setBusy(false); }
+  }
+
+  return <div className="viewer-backdrop" role="presentation"><section className="user-sanction-dialog" role="dialog" aria-modal="true"><div className="viewer-topbar"><h2>{tr("用户处罚", "User sanctions")} · {user.display_name || user.username || `#${user.id}`}</h2><button className="icon-button" disabled={busy} onClick={onClose} type="button"><X size={20} /></button></div>
+    {error && <p className="form-error"><CircleAlert size={17} />{error}</p>}
+    <h3>{tr("新增组合处罚", "Apply combined sanctions")}</h3><div className="sanction-draft-list">{drafts.map((draft, index) => <div className="sanction-draft-row" key={draft.sanction_type}><label className="review-ban-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => setDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, enabled: event.target.checked } : item))} />{draft.sanction_type}</label>{draft.enabled && <><input value={draft.reason} placeholder={tr("处罚理由", "Sanction reason")} onChange={(event) => setDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, reason: event.target.value } : item))} /><select value={draft.duration} onChange={(event) => setDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value as ReportSanctionDraft["duration"] } : item))}><option value="1h">1h</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option><option value="permanent">{tr("永久", "Permanent")}</option><option value="custom">{tr("自定义", "Custom")}</option></select>{draft.duration === "custom" && <input type="datetime-local" value={draft.customExpiry} onChange={(event) => setDrafts((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, customExpiry: event.target.value } : item))} />}</>}</div>)}</div>
+    <label className="review-ban-toggle dangerous"><input type="checkbox" checked={deleteAll} onChange={(event) => setDeleteAll(event.target.checked)} />{tr("同时创建全部归属内容删除任务", "Also create a deletion job for all attributable content")}</label><button className="button danger" disabled={busy || (!drafts.some((item) => item.enabled) && !deleteAll)} onClick={() => void apply()} type="button">{busy ? <LoaderCircle className="spin" size={17} /> : <Ban size={17} />}{tr("应用处罚", "Apply sanctions")}</button>
+    <h3>{tr("处罚历史", "Sanction history")}</h3><div className="sanction-history">{!sanctions.length ? <p className="muted">{tr("暂无处罚记录", "No sanction history")}</p> : sanctions.map((item) => { const active = !item.revoked_at && (!item.expires_at || new Date(item.expires_at).getTime() > Date.now()); return <div className="coordination-row" key={item.id}><span><strong>{item.sanction_type} · {active ? tr("生效中", "Active") : tr("已结束", "Ended")}</strong><small>{item.reason} · {item.expires_at ? `${tr("解除", "Expires")}: ${formatBackupTime(item.expires_at)}` : tr("永久", "Permanent")}</small></span>{active && <button className="button secondary" disabled={busy} onClick={() => void revoke(item)} type="button">{tr("提前解除", "Revoke")}</button>}</div>; })}</div>
+    <h3>{tr("内容删除任务", "Content deletion jobs")}</h3><div>{!deletions.length ? <p className="muted">{tr("暂无删除任务", "No deletion jobs")}</p> : deletions.map((job) => <div className="coordination-row" key={job.id}><span><strong>{job.status} · {job.processed_items}/{job.total_items}</strong><small>{job.reason}{job.error ? ` · ${job.error}` : ""}</small></span>{["partial", "failed"].includes(job.status) && <button className="button secondary" disabled={busy} onClick={() => void retryDeletion(job)} type="button"><RotateCcw size={15} />{tr("重试失败项", "Retry failed")}</button>}</div>)}</div>
+  </section></div>;
 }
 
 function accessUserStatusLabel(status: "pending" | "approved" | "disabled" | "denied") {
@@ -2189,6 +2668,15 @@ function accessUserStatusLabel(status: "pending" | "approved" | "disabled" | "de
     approved: translateNow("已批准", "Approved"),
     disabled: translateNow("已禁用", "Disabled"),
     denied: translateNow("已拒绝", "Denied"),
+  }[status];
+}
+
+function bindingSyncStatusLabel(status: "pending" | "ready" | "error" | "not_required") {
+  return {
+    pending: translateNow("等待账号绑定", "Binding pending"),
+    ready: translateNow("账号绑定就绪", "Binding ready"),
+    error: translateNow("绑定同步失败", "Binding sync failed"),
+    not_required: translateNow("无需绑定", "Binding not required"),
   }[status];
 }
 

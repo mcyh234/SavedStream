@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateTransferMetrics, encryptedThumbnailUrl, formatRemainingTime, mediaDay, normalizeMediaItem, readEncryptedChunks, visibilityLabel } from "./GalleryPage";
+import { calculateTransferMetrics, encodeUtf8Base64Url, encryptedThumbnailUrl, formatRemainingTime, mediaDay, normalizeMediaItem, readEncryptedChunks, visibilityLabel } from "./GalleryPage";
 import type { MediaItem } from "./types";
 
 describe("download progress", () => {
@@ -64,5 +64,14 @@ describe("media date compatibility", () => {
   it("groups malformed dates into a safe unknown bucket", () => {
     expect(mediaDay(undefined)).toBe("unknown");
     expect(mediaDay("not-a-date")).toBe("unknown");
+  });
+});
+
+describe("web upload filename transport", () => {
+  it("encodes Unicode filenames without changing the browser-provided name", () => {
+    const filename = "示例 文件 (1).bin";
+    const encoded = encodeUtf8Base64Url(filename);
+    const decoded = new TextDecoder().decode(Uint8Array.from(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0)));
+    expect(decoded).toBe(filename);
   });
 });

@@ -11,8 +11,15 @@ import { CustomFile } from "teleproto/client/uploads";
 import { NewMessage } from "teleproto/events";
 import { Telegraf } from "telegraf";
 import Database from "better-sqlite3";
-import { boundWebLoginIdentity, consumeWebLoginCode, issueWebLoginCode } from "./web-login";
-import { decodeBase64UrlHeader, syncPaginationCursor, uploadBodyMatchesLength } from "./bridge-media";
+import { boundWebLoginIdentity, consumeWebLoginCode } from "./web-login";
+import {
+  decodeBase64UrlHeader,
+  distributeUploadBytes,
+  moderationMessage,
+  SavedStreamModeration,
+  syncPaginationCursor,
+  uploadBodyMatchesLength,
+} from "./bridge-media";
 
 type AccountConfig = {
   id: string;
@@ -68,11 +75,14 @@ const DATA = path.resolve(process.env.TELEBOX_DATA_DIR || "/data");
 const TOKEN = process.env.TELEBOX_API_TOKEN || "";
 const PORT = Number(process.env.TELEBOX_PORT || 9000);
 const DEFAULT_ACCOUNT = process.env.TELEBOX_DEFAULT_ACCOUNT || "default";
+const SAVEDSTREAM_INTERNAL_URL = String(process.env.SAVEDSTREAM_INTERNAL_URL || "").replace(/\/$/, "");
+const SAVEDSTREAM_INTERNAL_TOKEN = process.env.SAVEDSTREAM_INTERNAL_TOKEN || TOKEN;
 const ACCOUNTS_FILE = path.join(DATA, "accounts.json");
 const DB_FILE = path.join(DATA, "bridge.db");
 const BOT_FILE = path.join(DATA, "helper-bot.enc");
 const MEDIA_CACHE = path.join(DATA, "media-cache");
 const UPLOAD_SPOOL = path.join(DATA, "upload-spool");
+const BACKUP_MARKER = "#savedstream-system-backup:v1";
 const mediaDownloads = new Map<string, Promise<void>>();
 if (!TOKEN || !process.env["TELEBOX_" + "SECRET_KEY"]) {
   throw new Error("TeleBox bridge credentials are required");
@@ -88,7 +98,7 @@ const SECRET = process.env["TELEBOX_" + "SECRET_KEY"] || "change-me";
 fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(MEDIA_CACHE, { recursive: true });
 fs.mkdirSync(UPLOAD_SPOOL, { recursive: true, mode: 0o700 });
-const db = new Database(DB_FILE);
+let db = new Database(DB_FILE);
 db.exec(`CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, account_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
 CREATE TABLE IF NOT EXISTS bindings (telegram_user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, created_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, source_chat_id TEXT NOT NULL, source_message_id INTEGER NOT NULL, relay_message_id INTEGER, saved_message_id INTEGER, status TEXT NOT NULL, status_message_id INTEGER, error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, requested_visibility TEXT NOT NULL DEFAULT 'private', review_status TEXT NOT NULL DEFAULT 'not_required', review_reason TEXT, reviewed_at INTEGER, reviewed_by TEXT, review_batch_id TEXT, source_file_size INTEGER NOT NULL DEFAULT 0, source_filename TEXT, source_mime_type TEXT, file_count INTEGER NOT NULL DEFAULT 1, choice_expires_at INTEGER, rate_reservation_key TEXT, UNIQUE(account_id, source_chat_id, source_message_id));
@@ -100,6 +110,66 @@ let jobColumns = new Set(
     (column) => column.name,
   ),
 );
+
+async function claimSavedStreamChallenge(challengeToken: string, ctx: any): Promise<any> {
+  if (!SAVEDSTREAM_INTERNAL_URL || !SAVEDSTREAM_INTERNAL_TOKEN) {
+    throw new Error("SavedStream 身份确认服务尚未配置");
+  }
+  const displayName = [ctx.from?.first_name, ctx.from?.last_name]
+    .filter(Boolean)
+    .join(" ") || `Telegram ${ctx.from?.id || ""}`;
+  const response = await fetch(`${SAVEDSTREAM_INTERNAL_URL}/api/internal/auth/telegram-challenge/claim`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${SAVEDSTREAM_INTERNAL_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      challenge_token: challengeToken,
+      telegram_user_id: String(ctx.from?.id || ""),
+      telegram_username: ctx.from?.username || null,
+      display_name: displayName,
+      chat_type: String(ctx.chat?.type || ""),
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = payload?.detail;
+    throw new Error(String(detail?.message || detail?.code || payload?.message || `HTTP ${response.status}`));
+  }
+  return payload;
+}
+
+async function getSavedStreamModeration(telegramUserId: string): Promise<SavedStreamModeration> {
+  if (!SAVEDSTREAM_INTERNAL_URL || !SAVEDSTREAM_INTERNAL_TOKEN) {
+    const legacy = db.prepare("SELECT reason FROM helper_bans WHERE telegram_user_id=?").get(telegramUserId) as any;
+    return {
+      known: Boolean(legacy),
+      allowed_auth: !legacy,
+      allowed_upload: !legacy,
+      sanctions: legacy ? [{ sanction_type: "login_ban", reason: legacy.reason, expires_at: null }] : [],
+    };
+  }
+  const response = await fetch(
+    `${SAVEDSTREAM_INTERNAL_URL}/api/internal/moderation/users/${encodeURIComponent(telegramUserId)}`,
+    {
+      headers: { Authorization: `Bearer ${SAVEDSTREAM_INTERNAL_TOKEN}` },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail?.code || `HTTP ${response.status}`));
+  return payload as SavedStreamModeration;
+}
+
+async function requireSavedStreamAction(telegramUserId: string, action: "auth" | "upload"): Promise<SavedStreamModeration> {
+  const moderation = await getSavedStreamModeration(telegramUserId);
+  if ((action === "auth" && !moderation.allowed_auth) || (action === "upload" && !moderation.allowed_upload)) {
+    throw new Error(moderationMessage(moderation, action));
+  }
+  return moderation;
+}
 if (!jobColumns.has("submitter_telegram_user_id")) {
   db.exec("ALTER TABLE jobs ADD COLUMN submitter_telegram_user_id TEXT");
 }
@@ -190,6 +260,85 @@ function jsonFile<T>(file: string, fallback: T): T {
 function saveJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(value, null, 2));
+}
+
+function systemBackupExport(): { files: Array<{ name: string; data: string }>; exported_at: string } {
+  try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch {}
+  const names = ["accounts.json", "bridge.db", "helper-bot.enc"];
+  const files = names
+    .map((name) => {
+      const file = path.join(DATA, name);
+      if (!fs.existsSync(file)) return null;
+      return { name, data: fs.readFileSync(file).toString("base64") };
+    })
+    .filter(Boolean) as Array<{ name: string; data: string }>;
+  return { files, exported_at: new Date().toISOString() };
+}
+
+async function systemBackupImport(payload: any): Promise<Record<string, unknown>> {
+  const files = Array.isArray(payload?.files) ? payload.files : [];
+  const allowed = new Set(["accounts.json", "bridge.db", "helper-bot.enc"]);
+  const staged = path.join(DATA, `.system-backup-import-${crypto.randomBytes(12).toString("hex")}`);
+  fs.mkdirSync(staged, { recursive: true, mode: 0o700 });
+  const previous = new Map<string, Buffer | null>();
+  try {
+    for (const item of files) {
+      const name = String(item?.name || "");
+      if (!allowed.has(name)) continue;
+      const value = Buffer.from(String(item?.data || ""), "base64");
+      fs.writeFileSync(path.join(staged, name), value, { mode: 0o600 });
+    }
+    const stagedAccounts = path.join(staged, "accounts.json");
+    if (fs.existsSync(stagedAccounts)) {
+      const parsed = JSON.parse(fs.readFileSync(stagedAccounts, "utf8"));
+      if (!Array.isArray(parsed)) throw new Error("accounts.json must contain an array");
+    }
+    const stagedDb = path.join(staged, "bridge.db");
+    if (fs.existsSync(stagedDb)) {
+      const check = new Database(stagedDb, { readonly: true });
+      try {
+        const result = check.pragma("integrity_check", { simple: true });
+        if (String(result) !== "ok") throw new Error("bridge.db integrity check failed");
+      } finally {
+        check.close();
+      }
+    }
+    for (const name of allowed) {
+      const target = path.join(DATA, name);
+      previous.set(name, fs.existsSync(target) ? fs.readFileSync(target) : null);
+    }
+    // Stop SQLite writes while replacing the bridge database.  All call sites
+    // use the mutable db handle, so a new connection becomes effective here.
+    const restoredDb = path.join(staged, "bridge.db");
+    if (fs.existsSync(restoredDb)) {
+      db.close();
+      fs.renameSync(restoredDb, DB_FILE);
+      db = new Database(DB_FILE);
+    }
+    for (const name of ["accounts.json", "helper-bot.enc"]) {
+      const source = path.join(staged, name);
+      if (!fs.existsSync(source)) continue;
+      fs.renameSync(source, path.join(DATA, name));
+    }
+    await manager.reloadFromDisk();
+    return { ok: true, restored_files: files.map((item: any) => String(item?.name || "")).filter(Boolean) };
+  } catch (error) {
+    try {
+      if (db.open) db.close();
+    } catch {}
+    for (const name of allowed) {
+      const target = path.join(DATA, name);
+      const old = previous.get(name);
+      try {
+        if (old == null) fs.rmSync(target, { force: true });
+        else fs.writeFileSync(target, old, { mode: 0o600 });
+      } catch {}
+    }
+    try { db = new Database(DB_FILE); } catch {}
+    throw error;
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
+  }
 }
 function mask(value: string): string {
   return value ? `${value.slice(0, 5)}...${value.slice(-4)}` : "";
@@ -334,7 +483,8 @@ function reserveHelperRate(
       "FROM helper_rate_events WHERE user_id=? AND created_at>=?",
     ).get(userId, dayStart) as any;
     const activeUser = db.prepare(
-      "SELECT COUNT(*) AS tasks FROM helper_rate_reservations WHERE user_id=? AND status='reserved'",
+      "SELECT COUNT(*) AS tasks,COALESCE(SUM(file_count),0) AS files,COALESCE(SUM(total_bytes),0) AS bytes " +
+      "FROM helper_rate_reservations WHERE user_id=? AND status='reserved'",
     ).get(userId) as any;
     const globalEvents = db.prepare(
       "SELECT COALESCE(SUM(file_count),0) AS files FROM helper_rate_events WHERE created_at>=?",
@@ -344,9 +494,9 @@ function reserveHelperRate(
     ).get(minuteStart) as any;
     if (Number(activeUser?.tasks || 0) >= settings.per_user_concurrent)
       throw new HelperRateLimitError("你的并发入库任务已达到上限", 60);
-    if (Number(usage?.files || 0) + fileCount > settings.per_user_files_24h)
+    if (Number(usage?.files || 0) + Number(activeUser?.files || 0) + fileCount > settings.per_user_files_24h)
       throw new HelperRateLimitError("你在 24 小时内的文件数量已达到上限", 3600);
-    if (Number(usage?.bytes || 0) + totalBytes > settings.per_user_bytes_24h)
+    if (Number(usage?.bytes || 0) + Number(activeUser?.bytes || 0) + totalBytes > settings.per_user_bytes_24h)
       throw new HelperRateLimitError("你在 24 小时内的累计大小已达到上限", 3600);
     if (Number(globalEvents?.files || 0) + Number(globalReserved?.files || 0) + fileCount > settings.global_files_per_minute)
       throw new HelperRateLimitError("辅助 Bot 当前请求较多，请稍后再试", 60);
@@ -354,9 +504,12 @@ function reserveHelperRate(
       "INSERT INTO helper_rate_reservations(reservation_key,batch_id,user_id,file_count,total_bytes,status,reserved_at,expires_at) " +
       "VALUES(?,?,?,?,?,'reserved',?,?)",
     ).run(reservationKey, batchId, userId, fileCount, totalBytes, now, now + 30 * 60 * 1000);
-    db.prepare(
-      `UPDATE jobs SET rate_reservation_key=?,status='routing',updated_at=? WHERE id IN (${jobs.map(() => "?").join(",")})`,
-    ).run(reservationKey, now, ...jobs.map((item) => item.id));
+    const positiveJobIds = jobs.map((item) => item.id).filter((id) => Number(id) > 0);
+    if (positiveJobIds.length) {
+      db.prepare(
+        `UPDATE jobs SET rate_reservation_key=?,status='routing',updated_at=? WHERE id IN (${positiveJobIds.map(() => "?").join(",")})`,
+      ).run(reservationKey, now, ...positiveJobIds);
+    }
   });
   reserve();
   return { reservationKey, fileCount, totalBytes };
@@ -373,6 +526,18 @@ function completeHelperRateIfFinished(reservationKey: string): void {
     "SELECT COUNT(*) AS count FROM jobs WHERE rate_reservation_key=? AND status NOT IN ('completed','failed','deleted')",
   ).get(reservationKey) as any;
   if (Number(pending?.count || 0) > 0) return;
+  const finish = db.transaction(() => {
+    db.prepare("UPDATE helper_rate_reservations SET status='completed' WHERE reservation_key=? AND status='reserved'").run(reservationKey);
+    db.prepare(
+      "INSERT OR IGNORE INTO helper_rate_events(reservation_key,user_id,file_count,total_bytes,created_at) VALUES(?,?,?,?,?)",
+    ).run(reservationKey, reservation.user_id, reservation.file_count, reservation.total_bytes, Date.now());
+  });
+  finish();
+}
+
+function completeExternalRateReservation(reservationKey: string): void {
+  const reservation = db.prepare("SELECT * FROM helper_rate_reservations WHERE reservation_key=?").get(reservationKey) as any;
+  if (!reservation || reservation.status !== "reserved") return;
   const finish = db.transaction(() => {
     db.prepare("UPDATE helper_rate_reservations SET status='completed' WHERE reservation_key=? AND status='reserved'").run(reservationKey);
     db.prepare(
@@ -474,6 +639,26 @@ class AccountManager {
           .map((account) => this.resumeDeliveredJobs(account)),
       );
     }
+  }
+  async reloadFromDisk(): Promise<void> {
+    for (const account of this.accounts.values()) {
+      try { await account.client.disconnect(); } catch {}
+    }
+    this.accounts.clear();
+    const configs = jsonFile<AccountConfig[]>(ACCOUNTS_FILE, []);
+    for (const config of configs) {
+      this.accounts.set(config.id, {
+        config,
+        client: new TelegramClient(
+          new StringSession(config.session || ""),
+          config.api_id,
+          config.api_hash,
+          { connectionRetries: Infinity, reconnectRetries: Infinity, autoReconnect: true },
+        ),
+        state: config.session ? "starting" : "unauthenticated",
+      });
+    }
+    await this.start();
   }
   async startAccount(id: string): Promise<void> {
     const account = this.accounts.get(id);
@@ -825,6 +1010,12 @@ class AccountManager {
   private async createChoiceJob(ctx: any): Promise<void> {
     const m: any = ctx.message;
     if (!ctx.from || !ctx.chat || ctx.chat.type !== "private") return;
+    try {
+      await requireSavedStreamAction(String(ctx.from.id), "upload");
+    } catch (error) {
+      await ctx.reply(`❌ ${String((error as any)?.message || error)}`);
+      return;
+    }
     const binding = db
       .prepare("SELECT * FROM bindings WHERE telegram_user_id=? AND enabled=1")
       .get(String(ctx.from.id)) as any;
@@ -879,6 +1070,13 @@ class AccountManager {
 
   private async chooseVisibility(ctx: any, jobId: number, visibility: "public" | "private"): Promise<void> {
     const callerId = String(ctx.from?.id || "");
+    let moderation: SavedStreamModeration;
+    try {
+      moderation = await requireSavedStreamAction(callerId, "upload");
+    } catch (error) {
+      await ctx.answerCbQuery(String((error as any)?.message || error), { show_alert: true });
+      return;
+    }
     const job = db.prepare("SELECT * FROM jobs WHERE id=?").get(jobId) as Job | undefined;
     if (!job) {
       await ctx.answerCbQuery("任务不存在", { show_alert: true });
@@ -918,12 +1116,19 @@ class AccountManager {
     }
     const selected = db.prepare("SELECT * FROM jobs WHERE id=?").get(job.id) as Job;
     try {
-      const reservation = reserveHelperRate(
-        callerId,
-        batchId,
-        batchJobs.map((item) => ({ id: item.id, source_file_size: item.source_file_size })),
-      );
-      await this.routeChoiceBatch(selected, batchJobs.map((item) => item.id), reservation.reservationKey, ctx);
+      let reservationKey = "";
+      if (moderation.personal_quota_bypass) {
+        db.prepare(
+          `UPDATE jobs SET status='routing',rate_reservation_key=NULL,updated_at=? WHERE id IN (${batchJobs.map(() => "?").join(",")})`,
+        ).run(Date.now(), ...batchJobs.map((item) => item.id));
+      } else {
+        reservationKey = reserveHelperRate(
+          callerId,
+          batchId,
+          batchJobs.map((item) => ({ id: item.id, source_file_size: item.source_file_size })),
+        ).reservationKey;
+      }
+      await this.routeChoiceBatch(selected, batchJobs.map((item) => item.id), reservationKey, ctx);
       await ctx.answerCbQuery(visibility === "public" ? "已选择公开，等待管理员审核" : "已选择仅自己可见");
     } catch (error) {
       const message = error instanceof HelperRateLimitError
@@ -1013,6 +1218,28 @@ class AccountManager {
     this.botUsername = me.username || undefined;
     bot.start(async (ctx) => {
       const telegramUserId = String(ctx.from?.id || "");
+      const startPayload = String(
+        (ctx as any).startPayload || String((ctx.message as any)?.text || "").split(/\s+/, 2)[1] || "",
+      ).trim();
+      if (startPayload && ctx.chat?.type === "private" && ctx.from) {
+        try {
+          await requireSavedStreamAction(telegramUserId, "auth");
+          const claimed = await claimSavedStreamChallenge(startPayload, ctx);
+          if (claimed.kind === "device_verify") {
+            return ctx.reply("✅ SavedStream 登录设备确认成功，请返回网页继续。");
+          }
+          if (claimed.user?.status === "approved" && claimed.user?.binding_sync_status === "ready") {
+            return ctx.reply("✅ SavedStream 身份确认成功，账号已自动获得媒体库访问权限，请返回网页继续。");
+          }
+          if (claimed.registration_requires_approval) {
+            return ctx.reply("✅ SavedStream 身份确认成功。请返回网页登录；媒体库访问将在管理员审批通过后开放。");
+          }
+          return ctx.reply("✅ SavedStream 身份确认成功。请使用管理员提供的邀请码执行 /bind；绑定托管账号后会自动获得媒体库访问权限。");
+        } catch (error) {
+          console.error("[HELPER_BOT] SavedStream challenge claim failed", error);
+          return ctx.reply(`❌ SavedStream 身份确认失败：${String((error as any)?.message || error)}。请返回网页重新发起确认。`);
+        }
+      }
       const managed = [...this.accounts.values()].find(
         (account) => account.me && String(account.me.id) === telegramUserId,
       );
@@ -1024,11 +1251,16 @@ class AccountManager {
         managed.relayReady = true;
         return ctx.reply(`账号 ${managed.config.label || managed.config.id} 已完成辅助 Bot 配对。`);
       }
-      return ctx.reply("已连接。请使用 /bind 邀请码绑定账号；绑定后发送 /web 获取网页登录码。");
+      return ctx.reply("已连接。SavedStream 网页现使用用户名和密码登录；如需绑定托管账号，请使用 /bind 邀请码。");
     });
     bot.command("bind", async (ctx) => {
       if (!ctx.chat || ctx.chat.type !== "private" || !ctx.from)
         return ctx.reply("请在 Bot 私聊中完成绑定");
+      try {
+        await requireSavedStreamAction(String(ctx.from.id), "auth");
+      } catch (error) {
+        return ctx.reply(`❌ ${String((error as any)?.message || error)}`);
+      }
       const banned = db
         .prepare("SELECT reason FROM helper_bans WHERE telegram_user_id=?")
         .get(String(ctx.from.id)) as { reason?: string } | undefined;
@@ -1047,7 +1279,7 @@ class AccountManager {
         Date.now(),
         code,
       );
-      return ctx.reply(`绑定成功：${invite.account_id}\n发送 /web 获取网页登录码。`);
+      return ctx.reply(`绑定成功：${invite.account_id}\n如网页正在等待账号绑定，稍后会自动获得访问权限。`);
     });
     bot.command("web", async (ctx) => {
       if (!ctx.chat || ctx.chat.type !== "private" || !ctx.from)
@@ -1055,17 +1287,8 @@ class AccountManager {
       const identity = boundWebLoginIdentity(db, ctx.from);
       if (!identity)
         return ctx.reply("你尚未绑定托管账号，请先使用 /bind 邀请码绑定");
-      const displayName = [ctx.from.first_name, ctx.from.last_name]
-        .filter(Boolean)
-        .join(" ") || `Telegram ${ctx.from.id}`;
-      const issued = issueWebLoginCode(db, {
-        telegram_user_id: String(ctx.from.id),
-        account_id: identity.account_id,
-        username: ctx.from.username || null,
-        display_name: displayName,
-      });
       return ctx.reply(
-        `SavedStream 网页登录码（10 分钟内有效，仅可使用一次）：\n\n${issued.code}\n\n登录后仍需管理员批准媒体库访问。`,
+        "SavedStream 一次性网页登录码已停用。请返回 SavedStream 网页，使用已注册的用户名和密码登录；新浏览器会通过 Bot 链接单独确认。",
       );
     });
     bot.on("callback_query", async (ctx: any) => {
@@ -1117,6 +1340,12 @@ class AccountManager {
       (a, b) => a.message.message_id - b.message.message_id,
     );
     const first = contexts[0];
+    try {
+      await requireSavedStreamAction(String(first.from.id), "upload");
+    } catch (error) {
+      await first.reply(`❌ ${String((error as any)?.message || error)}`);
+      return;
+    }
     const binding = db
       .prepare("SELECT * FROM bindings WHERE telegram_user_id=? AND enabled=1")
       .get(String(first.from.id)) as any;
@@ -1364,6 +1593,25 @@ class AccountManager {
     return row || { telegram_user_id: userId, enabled: false, banned };
   }
 
+  async cancelUserIngestJobs(telegramUserId: string, reason: string | null = null): Promise<Record<string, unknown>> {
+    const userId = String(telegramUserId);
+    const active = db
+      .prepare(
+        "SELECT id FROM jobs WHERE submitter_telegram_user_id=? AND status IN ('awaiting_choice','rate_checking','routing','delivered','importing','retry_wait') ORDER BY id",
+      )
+      .all(userId) as Array<{ id: number }>;
+    let cancelled = 0;
+    for (const job of active) {
+      try {
+        await this.deleteJob(Number(job.id), reason || "账号当前禁止上传", "savedstream-moderation");
+        cancelled += 1;
+      } catch (error) {
+        this.failJob(Number(job.id), error);
+      }
+    }
+    return { telegram_user_id: userId, cancelled };
+  }
+
   async updateJobReview(
     id: number,
     decision: "approved" | "rejected" | "revoked" | "deleted",
@@ -1391,12 +1639,24 @@ class AccountManager {
     const job = db.prepare("SELECT * FROM jobs WHERE id=?").get(id) as
       Job | undefined;
     if (!job || !this.bot) throw new Error("Job or helper bot is unavailable");
+    const userId = String(job.submitter_telegram_user_id || job.source_chat_id);
+    const moderation = await requireSavedStreamAction(userId, "upload");
     const account = this.get(job.account_id);
     if (account.state !== "authenticated" || !account.me)
       throw new Error("Target account is offline");
-    db.prepare(
-      "UPDATE jobs SET status='routing',error=NULL,updated_at=? WHERE id=?",
-    ).run(Date.now(), id);
+    let reservationKey = "";
+    if (moderation.personal_quota_bypass) {
+      db.prepare(
+        "UPDATE jobs SET status='routing',error=NULL,rate_reservation_key=NULL,updated_at=? WHERE id=?",
+      ).run(Date.now(), id);
+    } else {
+      reservationKey = reserveHelperRate(
+        userId,
+        `retry-${job.id}-${Date.now()}`,
+        [{ id: job.id, source_file_size: job.source_file_size }],
+      ).reservationKey;
+      db.prepare("UPDATE jobs SET error=NULL,updated_at=? WHERE id=?").run(Date.now(), id);
+    }
     try {
       const copied = await this.bot.telegram.copyMessage(
         String(account.me.id),
@@ -1410,6 +1670,7 @@ class AccountManager {
       console.log(`[RELAY] retry job=${id} delivered account=${account.config.id} bot_message=${copied.message_id}`);
       await this.updateBotStatus(job, "已重新投递");
     } catch (error) {
+      if (reservationKey) releaseHelperRate(reservationKey);
       this.failJob(id, error);
       throw error;
     }
@@ -1500,6 +1761,25 @@ async function listMedia(accountId: string, u: URL): Promise<any> {
       : null,
     has_more: hasMore,
   };
+}
+
+async function listSystemBackups(accountId: string, u: URL): Promise<any> {
+  const account = manager.get(accountId);
+  const limit = Math.max(1, Math.min(500, Number(u.searchParams.get("limit") || 200)));
+  const messages: any[] = await account.client.getMessages("me", {
+    limit: Math.min(500, limit * 4),
+    search: BACKUP_MARKER,
+  });
+  const items = messages
+    .filter((message: any) => String(message?.message || "").includes(BACKUP_MARKER))
+    .map((message: any) => {
+      const item = serializeMessage(message);
+      if (!item) return null;
+      return { ...item, account_id: accountId, backup_marker: BACKUP_MARKER };
+    })
+    .filter(Boolean)
+    .slice(0, limit);
+  return { items };
 }
 
 async function syncMedia(accountId: string, u: URL): Promise<any> {
@@ -1682,6 +1962,12 @@ const server = http.createServer(async (req, res) => {
     if (!auth(req)) return send(res, 401, { detail: "unauthorized" });
     if (u.pathname === "/v1/accounts" && req.method === "GET")
       return send(res, 200, { items: manager.list() });
+    if (u.pathname === "/v1/system-backups/export" && req.method === "GET")
+      return send(res, 200, systemBackupExport());
+    if (u.pathname === "/v1/system-backups/import" && req.method === "POST") {
+      const payload = await body(req);
+      return send(res, 200, await systemBackupImport(payload));
+    }
     /* Redaction-safe replacement of the legacy account-list branch.
     if (u.pathname === "/v1/accounts" && req.method === "GET")
       return send(res, 200, { items: manager.list(), default_account: [*** 账号 ***] });
@@ -1782,6 +2068,50 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         return send(res, 422, { detail: error instanceof Error ? error.message : String(error) });
       }
+    }
+    if (u.pathname === "/v1/upload-quota/reservations" && req.method === "POST") {
+      const p = await body(req);
+      const userId = String(p.telegram_user_id || "").trim();
+      const batchId = String(p.batch_id || crypto.randomUUID()).slice(0, 120);
+      const fileCount = Math.max(1, Math.min(1000, Math.trunc(Number(p.file_count || 1) || 1)));
+      const totalBytes = Math.max(0, Number(p.total_bytes || 0) || 0);
+      if (!userId || !Number.isSafeInteger(totalBytes) || totalBytes <= 0)
+        return send(res, 422, { detail: { message: "invalid upload quota reservation" } });
+      try {
+        const distributedBytes = distributeUploadBytes(totalBytes, fileCount);
+        const reservation = reserveHelperRate(
+          userId,
+          batchId,
+          distributedBytes.map((size, index) => ({
+            id: -(index + 1),
+            source_file_size: size,
+          })),
+        );
+        return send(res, 201, {
+          reservation_key: reservation.reservationKey,
+          file_count: reservation.fileCount,
+          total_bytes: reservation.totalBytes,
+        });
+      } catch (error) {
+        if (error instanceof HelperRateLimitError) {
+          return send(res, 429, {
+            detail: {
+              message: error.message,
+              retry_after_seconds: error.retryAfterSeconds,
+            },
+          });
+        }
+        throw error;
+      }
+    }
+    const quotaReservation = u.pathname.match(/^\/v1\/upload-quota\/reservations\/([^/]+)$/);
+    if (quotaReservation && req.method === "POST") {
+      completeExternalRateReservation(decodeURIComponent(quotaReservation[1]));
+      return send(res, 200, { ok: true });
+    }
+    if (quotaReservation && req.method === "DELETE") {
+      releaseHelperRate(decodeURIComponent(quotaReservation[1]));
+      return send(res, 200, { ok: true });
     }
     if (u.pathname === "/v1/web-login/consume" && req.method === "POST") {
       const p = await body(req);
@@ -1898,6 +2228,15 @@ const server = http.createServer(async (req, res) => {
       await manager.retryJob(Number(retry[1]));
       return send(res, 200, { ok: true });
     }
+    const cancelUserJobs = u.pathname.match(/^\/v1\/ingest\/users\/([^/]+)\/cancel$/);
+    if (cancelUserJobs && req.method === "POST") {
+      const p = await body(req);
+      const result = await manager.cancelUserIngestJobs(
+        decodeURIComponent(cancelUserJobs[1]),
+        p.reason == null ? null : String(p.reason),
+      );
+      return send(res, 200, result);
+    }
     const deleteJob = u.pathname.match(/^\/v1\/ingest\/jobs\/(\d+)$/);
     if (deleteJob && req.method === "DELETE") {
       const p = await body(req);
@@ -1925,6 +2264,9 @@ const server = http.createServer(async (req, res) => {
     const mediaList = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/media$/);
     if (mediaList && req.method === "GET")
       return send(res, 200, await listMedia(mediaList[1], u));
+    const systemBackupList = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/system-backups$/);
+    if (systemBackupList && req.method === "GET")
+      return send(res, 200, await listSystemBackups(systemBackupList[1], u));
     const mediaSync = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/media\/sync$/);
     if (mediaSync && req.method === "GET")
       return send(res, 200, await syncMedia(mediaSync[1], u));

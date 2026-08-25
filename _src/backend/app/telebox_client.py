@@ -26,6 +26,12 @@ class InvalidWebLoginCode(ValueError):
     pass
 
 
+class UploadQuotaExceeded(RuntimeError):
+    def __init__(self, detail: dict[str, Any] | str) -> None:
+        self.detail = detail
+        super().__init__(str(detail))
+
+
 class TeleBoxClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -214,6 +220,15 @@ class TeleBoxClient:
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return (await self._request("POST", f"/v1/ingest/jobs/{job_id}/retry")).json()
 
+    async def cancel_user_ingest_jobs(self, telegram_user_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        return (
+            await self._request(
+                "POST",
+                f"/v1/ingest/users/{quote(str(telegram_user_id))}/cancel",
+                json={"reason": reason},
+            )
+        ).json()
+
     async def update_ingest_job_review(
         self,
         job_id: int,
@@ -271,6 +286,52 @@ class TeleBoxClient:
     async def set_helper_bot_rate_limit(self, payload: dict[str, Any]) -> dict[str, Any]:
         return (await self._request("PUT", "/v1/helper-bot/rate-limit", json=payload)).json()
 
+    async def reserve_upload_quota(
+        self,
+        *,
+        telegram_user_id: str,
+        batch_id: str,
+        file_count: int,
+        total_bytes: int,
+    ) -> dict[str, Any]:
+        if not self.client:
+            raise TelegramUnavailable("TeleBox client is not initialized")
+        try:
+            response = await self.client.post(
+                "/v1/upload-quota/reservations",
+                json={
+                    "telegram_user_id": str(telegram_user_id),
+                    "batch_id": str(batch_id),
+                    "file_count": int(file_count),
+                    "total_bytes": int(total_bytes),
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise TelegramUnavailable(f"TeleBox unavailable: {exc}") from exc
+        if response.status_code == 429:
+            try:
+                detail = response.json().get("detail", response.json())
+            except ValueError:
+                detail = response.text
+            raise UploadQuotaExceeded(detail)
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise TelegramUnavailable(f"TeleBox request failed: {detail}")
+        return response.json()
+
+    async def complete_upload_quota(self, reservation_key: str) -> dict[str, Any]:
+        return (
+            await self._request("POST", f"/v1/upload-quota/reservations/{quote(str(reservation_key))}/complete")
+        ).json()
+
+    async def release_upload_quota(self, reservation_key: str) -> dict[str, Any]:
+        return (
+            await self._request("DELETE", f"/v1/upload-quota/reservations/{quote(str(reservation_key))}")
+        ).json()
+
     async def upload_file(
         self,
         *,
@@ -325,6 +386,17 @@ class TeleBoxClient:
                 detail = response.text
             raise TelegramUnavailable(f"TeleBox request failed: {detail}")
         return response.json()
+
+    async def export_system_backup(self) -> dict[str, Any]:
+        """Export TeleBox-owned state through its internal bridge API."""
+        return (await self._request("GET", "/v1/system-backups/export")).json()
+
+    async def import_system_backup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return (await self._request("POST", "/v1/system-backups/import", json=payload)).json()
+
+    async def list_system_backups(self, *, account_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        payload = (await self._request("GET", f"/v1/accounts/{quote(account_id)}/system-backups", params={"limit": max(1, min(500, limit))})).json()
+        return list(payload.get("items", []))
 
 
 def guess_image_content_type(data: bytes) -> str:

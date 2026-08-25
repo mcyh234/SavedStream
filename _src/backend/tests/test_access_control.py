@@ -10,31 +10,15 @@ import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from app.auth import AuthStore
 from app.database import Database
 from app.cache import DiskCache
-from app.main import ADMIN_COOKIE, DEVICE_COOKIE, VIEWER_COOKIE, app, get_cache, get_database, get_telegram, signer, _hash_public_key
-from app.telebox_client import InvalidWebLoginCode
-
-
+from app.main import ADMIN_COOKIE, AUTH_COOKIE, DEVICE_COOKIE, VIEWER_COOKIE, app, get_auth, get_cache, get_database, get_telegram, signer, _hash_public_key
 class FakeTeleBox:
     def __init__(self) -> None:
-        self.identities = {
-            "valid-code-alpha-123456": {
-                "telegram_user_id": "100",
-                "account_id": "alpha",
-                "username": "alice",
-                "display_name": "Alice",
-            }
-        }
         self.completed_jobs: list[dict] = []
         self.deleted_jobs: list[int] = []
         self.binding_updates: list[dict] = []
-
-    async def consume_web_login_code(self, code: str) -> dict:
-        identity = self.identities.pop(code, None)
-        if not identity:
-            raise InvalidWebLoginCode("invalid")
-        return identity
 
     async def helper_bot_status(self) -> dict:
         return {"configured": True, "username": "savedstream_bot", "token": "masked"}
@@ -101,12 +85,38 @@ class FakeTeleBox:
         return f"{message['account_id']}:{message['id']}:{item['size']}"
 
 
-async def enable_public_access(database: Database, client: httpx.AsyncClient, key: str = "public-key") -> None:
-    await database.set_setting("public_album_key_hash", _hash_public_key(key))
-    await database.set_setting("public_album_key_version", "2")
+async def enable_public_access(database: Database) -> None:
     await database.set_setting("public_album_enabled", "1")
-    response = await client.post("/api/public/login", json={"key": key})
-    assert response.status_code == 200
+
+
+async def register_and_login_user(
+    database: Database,
+    client: httpx.AsyncClient,
+    *,
+    status: str = "pending",
+    account_id: str = "alpha",
+) -> tuple[AuthStore, dict]:
+    auth = AuthStore(database.path)
+    challenge_id, _ = await auth.register_challenge("alice", "correct-horse-battery")
+    await auth.claim_challenge(challenge_id, "100", "alice", "Alice")
+    user = await auth.get_user_by_username("alice")
+    assert user
+    login = await client.post(
+        "/api/auth/login",
+        headers={"X-SavedStream-Browser-ID": "browser-alice"},
+        json={"username": "alice", "password": "correct-horse-battery", "trust_device": True},
+    )
+    assert login.status_code == 200
+    assert login.json()["requires_device"] is False
+    if status != "pending":
+        user = await auth.update_user(
+            int(user["id"]),
+            status=status,
+            account_id=account_id,
+            binding_sync_status="ready" if status == "approved" else "pending",
+        )
+        assert user
+    return auth, user
 
 
 @pytest_asyncio.fixture
@@ -118,7 +128,9 @@ async def access_client(tmp_path: Path):
         return 1024 * 1024 * 1024
     cache = DiskCache(tmp_path / "cache", cache_limit, "00" * 32)
     await cache.initialize()
+    auth = AuthStore(database.path)
     app.dependency_overrides[get_database] = lambda: database
+    app.dependency_overrides[get_auth] = lambda: auth
     app.dependency_overrides[get_telegram] = lambda: telegram
     app.dependency_overrides[get_cache] = lambda: cache
     transport = httpx.ASGITransport(app=app)
@@ -130,18 +142,16 @@ async def access_client(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_pending_user_cannot_access_and_approved_user_is_bound_to_one_account(access_client) -> None:
     client, database = access_client
-    response = await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    assert response.status_code == 200
-    assert response.json()["status"] == "pending"
-    assert (await client.get("/api/access/telegram/status")).json()["status"] == "pending"
+    auth, user = await register_and_login_user(database, client)
+    assert (await client.get("/api/auth/session")).json()["user"]["status"] == "pending"
 
     pending = await client.get("/api/media?account=alpha")
     assert pending.status_code == 403
     assert pending.json()["detail"]["code"] == "ACCESS_PENDING"
 
-    await database.set_media_user_status("100", "approved")
-    assert (await client.get("/api/access/telegram/status")).json()["status"] == "approved"
-    await enable_public_access(database, client)
+    await auth.update_user(int(user["id"]), status="approved", account_id="alpha", binding_sync_status="ready")
+    assert (await client.get("/api/auth/session")).json()["user"]["status"] == "approved"
+    await enable_public_access(database)
     accounts = await client.get("/api/accounts")
     assert [item["id"] for item in accounts.json()["items"]] == ["alpha", "beta"]
     allowed = await client.get("/api/media?account=alpha")
@@ -153,17 +163,16 @@ async def test_pending_user_cannot_access_and_approved_user_is_bound_to_one_acco
 
 
 @pytest.mark.asyncio
-async def test_login_code_cannot_be_reused_and_session_is_stored_hashed(access_client) -> None:
+async def test_account_session_is_stored_hashed_and_legacy_login_code_is_retired(access_client) -> None:
     client, database = access_client
-    first = await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    assert first.status_code == 200
-    raw_token = client.cookies.get("savedstream_access")
+    await register_and_login_user(database, client)
+    raw_token = client.cookies.get(AUTH_COOKIE)
     assert raw_token
     async with aiosqlite.connect(database.path) as connection:
-        row = await (await connection.execute("SELECT token_hash FROM access_sessions")).fetchone()
+        row = await (await connection.execute("SELECT token_hash FROM auth_sessions")).fetchone()
     assert row and row[0] != raw_token and raw_token not in row[0]
-    second = await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    assert second.status_code == 401
+    retired = await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
+    assert retired.status_code == 410
 
 
 @pytest.mark.asyncio
@@ -200,13 +209,14 @@ async def test_rebinding_to_a_different_account_requires_new_approval(access_cli
 @pytest.mark.asyncio
 async def test_disabling_user_revokes_existing_session(access_client) -> None:
     client, database = access_client
-    await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    await database.set_media_user_status("100", "approved")
-    await enable_public_access(database, client)
+    auth, user = await register_and_login_user(database, client, status="approved")
+    await enable_public_access(database)
     assert (await client.get("/api/media?account=alpha")).status_code == 200
 
-    await database.set_media_user_status("100", "disabled")
-    assert (await client.get("/api/media?account=alpha")).status_code == 403
+    await auth.update_user(int(user["id"]), status="disabled")
+    blocked = await client.get("/api/media?account=alpha")
+    assert blocked.status_code == 401
+    assert blocked.json()["detail"]["code"] == "MEDIA_AUTH_REQUIRED"
 
 
 @pytest.mark.asyncio
@@ -225,20 +235,18 @@ async def test_admin_can_see_all_accounts_and_viewer_password_is_not_authorized(
 
 
 @pytest.mark.asyncio
-async def test_public_key_requires_admin_toggle_and_telegram_approval(access_client) -> None:
+async def test_public_album_requires_account_login_and_admin_approval(access_client) -> None:
     client, database = access_client
     await database.set_setting("public_album_key_hash", _hash_public_key("public-key"))
     await database.set_setting("public_album_key_version", "3")
-    assert (await client.post("/api/public/login", json={"key": "public-key"})).status_code == 403
+    assert (await client.post("/api/public/login", json={"key": "public-key"})).status_code == 410
 
     await database.set_setting("public_album_enabled", "1")
-    assert (await client.post("/api/public/login", json={"key": "public-key"})).status_code == 200
-    # A valid public key alone is not enough; the Telegram identity must be
-    # bound and approved as the second factor.
-    assert (await client.get("/api/media?account=alpha")).status_code == 403
+    assert (await client.get("/api/media?account=alpha")).status_code == 401
 
-    await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    await database.set_media_user_status("100", "approved")
+    auth, user = await register_and_login_user(database, client)
+    assert (await client.get("/api/media?account=alpha")).status_code == 403
+    await auth.update_user(int(user["id"]), status="approved", account_id="alpha", binding_sync_status="ready")
     assert (await client.get("/api/media?account=alpha")).status_code == 200
     status = (await client.get("/api/status")).json()
     assert status["media_authenticated"] is True
@@ -248,9 +256,8 @@ async def test_public_key_requires_admin_toggle_and_telegram_approval(access_cli
 @pytest.mark.asyncio
 async def test_public_device_key_cookie_is_session_scoped_and_logout_clears_it(access_client) -> None:
     client, database = access_client
-    await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    await database.set_media_user_status("100", "approved")
-    await enable_public_access(database, client)
+    await register_and_login_user(database, client, status="approved")
+    await enable_public_access(database)
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()
     spki = key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
@@ -268,7 +275,7 @@ async def test_public_device_key_cookie_is_session_scoped_and_logout_clears_it(a
     assert "Max-Age=" not in device_cookie
     assert client.cookies.get(DEVICE_COOKIE)
 
-    logout = await client.post("/api/access/logout")
+    logout = await client.post("/api/auth/logout")
     assert logout.status_code == 200
     assert client.cookies.get(DEVICE_COOKIE) is None
     assert client.cookies.get("savedstream_public") is None
@@ -371,9 +378,8 @@ async def test_media_binary_endpoints_enforce_index_visibility_and_allow_admin_p
         "date": "2026-08-01T00:00:00+00:00",
         "has_thumbnail": True,
     }, visibility="private")
-    await client.post("/api/access/telegram", json={"code": "valid-code-alpha-123456"})
-    await database.set_media_user_status("100", "approved")
-    await enable_public_access(database, client)
+    await register_and_login_user(database, client, status="approved")
+    await enable_public_access(database)
 
     public_thumbnail = await client.get("/api/media/1/thumbnail?account=alpha&size=4")
     assert public_thumbnail.status_code == 200

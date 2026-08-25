@@ -17,6 +17,7 @@ import {
   FolderPlus,
   Globe2,
   HardDriveDownload,
+  Heart,
   Home,
   Image as ImageIcon,
   LayoutGrid,
@@ -27,12 +28,14 @@ import {
   Pencil,
   Play,
   Search,
+  SquareArrowUp,
   Settings,
   Shield,
+  Siren,
   Trash2,
   X,
 } from "lucide-react";
-import { api, errorMessage } from "./api";
+import { api, browserId, errorMessage } from "./api";
 import { useMediaCrypto } from "./MediaCrypto";
 import { LanguageSelector, translateNow, useI18n } from "./I18n";
 import ThemeSelector from "./ThemeSelector";
@@ -59,6 +62,18 @@ const filters: Array<{ value: MediaKind; zh: string; en: string; icon: typeof Ho
 
 const VIEW_MODE_KEY = "savedstream-view-mode";
 
+type UploadEntry = {
+  id: string;
+  file: File;
+  visibility: "public" | "private";
+  status: "ready" | "receiving" | "telegram_upload" | "indexing" | "pending_review" | "completed" | "failed" | "cancelled";
+  progress: number;
+  jobId?: string;
+  error?: string;
+};
+
+type ReportDraft = { item: MediaItem; reasonCode: string; details: string };
+
 export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) {
   const { tr } = useI18n();
   const mediaCrypto = useMediaCrypto();
@@ -66,6 +81,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
   const [account, setAccount] = useState("");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [scope, setScope] = useState<"public" | "private" | "hidden" | "all">(isAdmin ? "all" : "public");
+  const [view, setView] = useState<"private" | "square" | "my_public" | "liked">("private");
   const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
   const [dateRange, setDateRange] = useState<{ from: string; to: string } | null>(null);
   const [timelinePosition, setTimelinePosition] = useState(0);
@@ -93,8 +109,198 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [foldersVersion, setFoldersVersion] = useState(0);
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [uploadEntries, setUploadEntries] = useState<UploadEntry[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepthRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadRequestsRef = useRef<Map<string, XMLHttpRequest>>(new Map());
+  const [reportDraft, setReportDraft] = useState<ReportDraft | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
 
   useEffect(() => setScope(isAdmin ? "all" : "public"), [isAdmin]);
+
+  function queueUploadFiles(files: File[]) {
+    const accepted = files.filter((file) => file.size > 0);
+    if (!accepted.length) {
+      setError(tr("不能上传空文件。", "Empty files cannot be uploaded."));
+      return;
+    }
+    setUploadEntries(accepted.map((file) => ({
+      id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+      file,
+      visibility: "private",
+      status: "ready",
+      progress: 0,
+    })));
+    setUploadDialogOpen(true);
+    setError("");
+  }
+
+  function updateUploadEntry(id: string, patch: Partial<UploadEntry>) {
+    setUploadEntries((current) => current.map((entry) => entry.id === id ? { ...entry, ...patch } : entry));
+  }
+
+  async function pollUpload(entryId: string, jobId: string): Promise<void> {
+    for (let attempt = 0; attempt < 720; attempt += 1) {
+      const job = await api<import("./types").UploadJob>(`/api/uploads/${encodeURIComponent(jobId)}`);
+      const terminal = ["completed", "failed", "cancelled"].includes(job.status);
+      const status: UploadEntry["status"] = job.status === "completed"
+        ? job.requested_visibility === "public" && job.review_status === "pending" ? "pending_review" : "completed"
+        : job.status === "failed" ? "failed"
+          : job.status === "cancelled" ? "cancelled"
+            : job.phase === "indexing" ? "indexing" : "telegram_upload";
+      updateUploadEntry(entryId, { status, progress: Number(job.progress || 0), error: job.error || undefined });
+      if (terminal) return;
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    updateUploadEntry(entryId, { status: "failed", error: tr("等待 Telegram 入库超时", "Timed out waiting for Telegram ingestion") });
+  }
+
+  function uploadOne(entry: UploadEntry, batchId: string): Promise<void> {
+    return new Promise((resolve) => {
+      updateUploadEntry(entry.id, { status: "receiving", progress: 0, error: undefined });
+      const params = new URLSearchParams({ visibility: entry.visibility });
+      if (isAdmin && account && account !== "all") params.set("account", account);
+      const xhr = new XMLHttpRequest();
+      uploadRequestsRef.current.set(entry.id, xhr);
+      xhr.open("POST", `/api/uploads?${params}`);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("Content-Type", entry.file.type || "application/octet-stream");
+      xhr.setRequestHeader("X-SavedStream-Browser-ID", browserId());
+      xhr.setRequestHeader("X-Upload-Filename", encodeUtf8Base64Url(entry.file.name));
+      xhr.setRequestHeader("X-Upload-Mime", entry.file.type || "application/octet-stream");
+      xhr.setRequestHeader("X-Upload-Batch-ID", batchId);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) updateUploadEntry(entry.id, { progress: Math.min(98, (event.loaded / event.total) * 100) });
+      };
+      xhr.onerror = () => {
+        uploadRequestsRef.current.delete(entry.id);
+        updateUploadEntry(entry.id, { status: "failed", error: tr("上传请求失败", "Upload request failed") });
+        resolve();
+      };
+      xhr.onabort = () => {
+        uploadRequestsRef.current.delete(entry.id);
+        updateUploadEntry(entry.id, { status: "cancelled", error: tr("上传已取消", "Upload cancelled") });
+        resolve();
+      };
+      xhr.onload = () => {
+        uploadRequestsRef.current.delete(entry.id);
+        try {
+          const payload = JSON.parse(xhr.responseText || "{}");
+          if (xhr.status < 200 || xhr.status >= 300) {
+            throw new Error(payload?.detail?.message || payload?.detail?.code || payload?.code || tr("上传失败", "Upload failed"));
+          }
+          const jobId = String(payload.id);
+          updateUploadEntry(entry.id, { jobId, status: "telegram_upload", progress: Number(payload.progress || 0) });
+          void pollUpload(entry.id, jobId).then(resolve).catch((reason) => {
+            updateUploadEntry(entry.id, { status: "failed", error: errorMessage(reason) });
+            resolve();
+          });
+        } catch (reason) {
+          updateUploadEntry(entry.id, { status: "failed", error: reason instanceof Error ? reason.message : String(reason) });
+          resolve();
+        }
+      };
+      xhr.send(entry.file);
+    });
+  }
+
+  async function startUploadBatch() {
+    const batchId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    const pending = uploadEntries.filter((entry) => entry.status === "ready" || entry.status === "failed" || entry.status === "cancelled");
+    for (const entry of pending) await uploadOne(entry, batchId);
+    await loadMedia(null, true);
+    await loadTimeline();
+  }
+
+  async function cancelUploadEntry(entry: UploadEntry) {
+    const activeRequest = uploadRequestsRef.current.get(entry.id);
+    if (activeRequest) {
+      activeRequest.abort();
+      return;
+    }
+    if (!entry.jobId) {
+      updateUploadEntry(entry.id, { status: "cancelled" });
+      return;
+    }
+    try {
+      await api(`/api/uploads/${encodeURIComponent(entry.jobId)}`, { method: "DELETE" });
+      updateUploadEntry(entry.id, { status: "cancelled" });
+    } catch (reason) {
+      updateUploadEntry(entry.id, { error: errorMessage(reason) });
+    }
+  }
+
+  async function toggleLike(item: MediaItem) {
+    try {
+      const state = await api<{ like_count: number; liked_by_me: boolean }>(
+        `/api/media/${item.id}/like?account=${encodeURIComponent(item.account_id)}`,
+        { method: item.liked_by_me ? "DELETE" : "PUT" },
+      );
+      setItems((current) => current.map((candidate) => itemKey(candidate) === itemKey(item)
+        ? { ...candidate, ...state }
+        : candidate));
+      setSelected((current) => current && itemKey(current) === itemKey(item) ? { ...current, ...state } : current);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function submitReport() {
+    if (!reportDraft || reportBusy) return;
+    setReportBusy(true);
+    try {
+      await api(`/api/media/${reportDraft.item.id}/reports?account=${encodeURIComponent(reportDraft.item.account_id)}`, {
+        method: "POST",
+        body: JSON.stringify({ reason_code: reportDraft.reasonCode, details: reportDraft.details.trim() || null }),
+      });
+      setReportDraft(null);
+      setNotice(tr("举报已提交，管理员处理后会通过站内信反馈。", "Report submitted. You will receive a mailbox update after moderation."));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types || []).includes("Files");
+    const enter = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragDepthRef.current += 1;
+      setDragActive(true);
+    };
+    const over = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const leave = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+      if (dragDepthRef.current === 0) setDragActive(false);
+    };
+    const drop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragDepthRef.current = 0;
+      setDragActive(false);
+      queueUploadFiles(Array.from(event.dataTransfer?.files || []));
+    };
+    window.addEventListener("dragenter", enter);
+    window.addEventListener("dragover", over);
+    window.addEventListener("dragleave", leave);
+    window.addEventListener("drop", drop);
+    return () => {
+      window.removeEventListener("dragenter", enter);
+      window.removeEventListener("dragover", over);
+      window.removeEventListener("dragleave", leave);
+      window.removeEventListener("drop", drop);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -142,6 +348,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         q: debouncedQuery,
         scope: isAdmin ? scope : "public",
       });
+      if (!isAdmin) params.set("view", view);
       if (account && account !== "all") params.set("account", account);
       if (folderId !== null) params.set("folder_id", String(folderId));
       if (nextCursor !== null) params.set("cursor", String(nextCursor));
@@ -170,7 +377,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
       if (!silent) setLoading(false);
       setLoadingMore(false);
     }
-  }, [account, dateRange, debouncedQuery, folderId, isAdmin, kind, order, scope]);
+  }, [account, dateRange, debouncedQuery, folderId, isAdmin, kind, order, scope, view]);
 
   const loadTimeline = useCallback(async () => {
     if (!account) return;
@@ -180,13 +387,14 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         q: debouncedQuery,
         scope: isAdmin ? scope : "public",
       });
+      if (!isAdmin) params.set("view", view);
       if (account && account !== "all") params.set("account", account);
       const result = await api<TimelineResponse>(`/api/media/timeline?${params}`);
       setTimeline(result);
     } catch {
       setTimeline(null);
     }
-  }, [account, debouncedQuery, isAdmin, kind, scope]);
+  }, [account, debouncedQuery, isAdmin, kind, scope, view]);
 
   useEffect(() => {
     setCursor(null);
@@ -365,13 +573,16 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
     return selectedFilter ? tr(selectedFilter.zh, selectedFilter.en) : tr("全部", "All");
   }, [kind, tr]);
 
+  const viewHeading = view === "private" ? tr("我的相册", "My album")
+    : view === "square" ? tr("广场", "Square")
+      : view === "my_public" ? tr("我的公开", "My public") : tr("我的点赞", "My likes");
   const heading = folderPath && folderPath.length
     ? folderPath.map((folder) => folder.name).join(" / ")
     : dateRange
       ? `${dateRange.from.slice(0, 7)} ${tr("时间相册", "Timeline")}`
       : debouncedQuery
         ? `“${debouncedQuery}”`
-        : title;
+        : isAdmin ? title : `${viewHeading} · ${title}`;
 
   function chooseMonth(month: TimelineMonth, index?: number) {
     const from = `${month.month}-01`;
@@ -417,6 +628,19 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
           )}
         </label>
         <div className="topbar-actions">
+          <input
+            ref={fileInputRef}
+            className="sr-only"
+            type="file"
+            multiple
+            onChange={(event) => {
+              queueUploadFiles(Array.from(event.target.files || []));
+              event.target.value = "";
+            }}
+          />
+          <button className="icon-button" onClick={() => fileInputRef.current?.click()} aria-label={tr("选择文件上传", "Choose files to upload")} title={tr("上传文件", "Upload files")} type="button">
+            <SquareArrowUp size={20} />
+          </button>
           <ThemeSelector />
           <LanguageSelector compact />
           <MailboxBell />
@@ -432,6 +656,14 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
       </header>
 
       <aside className="sidebar" aria-label={tr("媒体分类", "Media categories")}>
+        {!isAdmin && (
+          <nav className="sidebar-view-nav" aria-label={tr("媒体空间", "Media spaces")}>
+            <button className={view === "private" ? "active" : ""} onClick={() => { setView("private"); setDateRange(null); setFolderId(null); }} type="button"><Shield size={20} /><span>{tr("我的相册", "My album")}</span></button>
+            <button className={view === "square" ? "active" : ""} onClick={() => { setView("square"); setDateRange(null); setFolderId(null); }} type="button"><Globe2 size={20} /><span>{tr("广场", "Square")}</span></button>
+            <button className={view === "my_public" ? "active" : ""} onClick={() => { setView("my_public"); setDateRange(null); setFolderId(null); }} type="button"><SquareArrowUp size={20} /><span>{tr("我的公开", "My public")}</span></button>
+            <button className={view === "liked" ? "active" : ""} onClick={() => { setView("liked"); setDateRange(null); setFolderId(null); }} type="button"><Heart size={20} /><span>{tr("我的点赞", "My likes")}</span></button>
+          </nav>
+        )}
         <nav>
           {filters.map((filter) => {
             const Icon = filter.icon;
@@ -535,14 +767,16 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         )}
         {notice && <p className="gallery-notice" role="status">{notice}</p>}
 
-        <FolderShelf
-          folders={folders}
-          activeFolderId={folderId}
-          admin={isAdmin}
-          onSelect={selectFolder}
-          onChanged={() => setFoldersVersion((value) => value + 1)}
-          viewMode={viewMode}
-        />
+        {(isAdmin || view === "private") && (
+          <FolderShelf
+            folders={folders}
+            activeFolderId={folderId}
+            admin={isAdmin}
+            onSelect={selectFolder}
+            onChanged={() => setFoldersVersion((value) => value + 1)}
+            viewMode={viewMode}
+          />
+        )}
 
         {loading ? (
           <MediaSkeleton />
@@ -575,6 +809,9 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
               onOpen={setSelected}
               onDelete={deleteItem}
               onVisibility={setItemVisibility}
+              onLike={toggleLike}
+              onReport={(item) => setReportDraft({ item, reasonCode: "illegal", details: "" })}
+              socialEnabled={!isAdmin && (view === "square" || view === "liked")}
               busy={bulkBusy}
             />
             {hasMore && cursor && (
@@ -604,6 +841,9 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
                           selectable={isAdmin}
                           selected={selectedKeys.has(key)}
                           onToggleSelect={() => toggleSelect(item)}
+                          onLike={() => void toggleLike(item)}
+                          onReport={() => setReportDraft({ item, reasonCode: "illegal", details: "" })}
+                          socialEnabled={!isAdmin && (view === "square" || view === "liked")}
                         />
                       );
                     })}
@@ -622,7 +862,118 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
           </>
         )}
       </main>
-      {selected && <MediaViewer item={selected} onClose={() => setSelected(null)} />}
+      {selected && <MediaViewer
+        item={selected}
+        onClose={() => setSelected(null)}
+        onLike={() => void toggleLike(selected)}
+        onReport={() => setReportDraft({ item: selected, reasonCode: "illegal", details: "" })}
+        socialEnabled={!isAdmin && (view === "square" || view === "liked")}
+      />}
+      {dragActive && <div className="upload-drop-overlay" role="status"><SquareArrowUp size={54} /><strong>{tr("松手即可添加文件", "Drop files to add them")}</strong><span>{tr("随后可为每个文件选择公开或私人", "Choose public or private for each file next")}</span></div>}
+      {uploadDialogOpen && <UploadDialog
+        entries={uploadEntries}
+        isAdmin={isAdmin}
+        account={account}
+        onClose={() => setUploadDialogOpen(false)}
+        onVisibility={(id, visibility) => updateUploadEntry(id, { visibility })}
+        onBulkVisibility={(visibility) => setUploadEntries((current) => current.map((entry) => entry.status === "ready" ? { ...entry, visibility } : entry))}
+        onStart={() => void startUploadBatch()}
+        onRetry={(entry) => void uploadOne(entry, typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()))}
+        onCancel={(entry) => void cancelUploadEntry(entry)}
+      />}
+      {reportDraft && <ReportDialog draft={reportDraft} busy={reportBusy} onChange={setReportDraft} onClose={() => setReportDraft(null)} onSubmit={() => void submitReport()} />}
+    </div>
+  );
+}
+
+export function encodeUtf8Base64Url(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function UploadDialog({
+  entries,
+  isAdmin,
+  account,
+  onClose,
+  onVisibility,
+  onBulkVisibility,
+  onStart,
+  onRetry,
+  onCancel,
+}: {
+  entries: UploadEntry[];
+  isAdmin: boolean;
+  account: string;
+  onClose: () => void;
+  onVisibility: (id: string, visibility: "public" | "private") => void;
+  onBulkVisibility: (visibility: "public" | "private") => void;
+  onStart: () => void;
+  onRetry: (entry: UploadEntry) => void;
+  onCancel: (entry: UploadEntry) => void;
+}) {
+  const { tr } = useI18n();
+  const running = entries.some((entry) => ["receiving", "telegram_upload", "indexing"].includes(entry.status));
+  const ready = entries.some((entry) => entry.status === "ready");
+  const statusLabel = (entry: UploadEntry) => ({
+    ready: tr("等待上传", "Ready"),
+    receiving: tr("正在接收", "Receiving"),
+    telegram_upload: tr("正在写入 Telegram 收藏夹", "Uploading to Telegram Saved Messages"),
+    indexing: tr("正在建立索引", "Indexing"),
+    pending_review: tr("已入库，等待公开审核", "Ingested, pending public review"),
+    completed: tr("上传并入库完成", "Upload and ingestion complete"),
+    failed: tr("失败", "Failed"),
+    cancelled: tr("已取消", "Cancelled"),
+  })[entry.status];
+  return (
+    <div className="viewer-backdrop upload-dialog-backdrop" role="presentation">
+      <section className="upload-dialog" role="dialog" aria-modal="true" aria-labelledby="web-upload-title">
+        <div className="viewer-topbar"><h2 id="web-upload-title">{tr("上传文件到 Telegram 收藏夹", "Upload files to Telegram Saved Messages")}</h2><button className="icon-button" disabled={running} onClick={onClose} aria-label={tr("关闭", "Close")} type="button"><X size={21} /></button></div>
+        <p className="muted">{isAdmin
+          ? account && account !== "all"
+            ? `${tr("目标账号", "Target account")}: ${account}。${tr("文件名保持浏览器提供的原始名称。", "Browser-provided filenames are preserved.")}`
+            : tr("管理员上传前必须在主页面选择一个已连接的目标账号。", "Administrators must select one connected target account before uploading.")
+          : tr("普通用户会上传到自己的绑定账号。文件名保持浏览器提供的原始名称。", "Files are uploaded to your linked account and keep their browser-provided names.")}</p>
+        <div className="upload-bulk-actions"><button className="button secondary" disabled={running} onClick={() => onBulkVisibility("private")} type="button"><Shield size={15} />{tr("全部私人", "All private")}</button><button className="button secondary" disabled={running} onClick={() => onBulkVisibility("public")} type="button"><Globe2 size={15} />{tr("全部公开", "All public")}</button></div>
+        <div className="web-upload-list">
+          {entries.map((entry) => (
+            <div className={`web-upload-row status-${entry.status}`} key={entry.id}>
+              <span className="web-upload-file"><strong title={entry.file.name}>{entry.file.name}</strong><small>{formatBytes(entry.file.size)} · {entry.file.type || "application/octet-stream"}</small></span>
+              <select value={entry.visibility} disabled={entry.status !== "ready"} onChange={(event) => onVisibility(entry.id, event.target.value as "public" | "private")} aria-label={`${tr("可见性", "Visibility")} ${entry.file.name}`}><option value="private">{tr("私人相册", "Private album")}</option><option value="public">{tr("公开访问", "Public access")}</option></select>
+              <span className="web-upload-progress"><span style={{ width: `${Math.max(0, Math.min(100, entry.progress))}%` }} /><small>{statusLabel(entry)}{entry.progress > 0 && entry.progress < 100 ? ` · ${entry.progress.toFixed(0)}%` : ""}</small></span>
+              <span className="web-upload-actions">{entry.status === "failed" || entry.status === "cancelled" ? <button className="button ghost" onClick={() => onRetry(entry)} type="button">{tr("重试", "Retry")}</button> : ["receiving", "telegram_upload", "indexing"].includes(entry.status) ? <button className="button danger-ghost" onClick={() => onCancel(entry)} type="button">{tr("取消", "Cancel")}</button> : null}</span>
+              {entry.error && <small className="form-error web-upload-error">{entry.error}</small>}
+            </div>
+          ))}
+        </div>
+        <div className="upload-dialog-actions"><button className="button ghost" disabled={running} onClick={onClose} type="button">{tr("关闭", "Close")}</button><button className="button primary" disabled={!ready || running || (isAdmin && (!account || account === "all"))} onClick={onStart} type="button"><SquareArrowUp size={17} />{tr("开始上传", "Start upload")}</button></div>
+      </section>
+    </div>
+  );
+}
+
+function ReportDialog({ draft, busy, onChange, onClose, onSubmit }: { draft: ReportDraft; busy: boolean; onChange: (draft: ReportDraft) => void; onClose: () => void; onSubmit: () => void }) {
+  const { tr } = useI18n();
+  const reasons = [
+    ["illegal", tr("违法或危险内容", "Illegal or dangerous content")],
+    ["sexual", tr("色情或露骨内容", "Sexual or explicit content")],
+    ["copyright", tr("版权或侵权内容", "Copyright infringement")],
+    ["malware", tr("恶意软件或危险文件", "Malware or dangerous file")],
+    ["spam", tr("垃圾内容或滥用", "Spam or abuse")],
+    ["privacy", tr("隐私侵犯", "Privacy violation")],
+    ["other", tr("其他", "Other")],
+  ];
+  return (
+    <div className="viewer-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="report-dialog" role="dialog" aria-modal="true" aria-labelledby="report-dialog-title">
+        <div className="viewer-topbar"><h2 id="report-dialog-title">{tr("举报资源", "Report media")}</h2><button className="icon-button" onClick={onClose} aria-label={tr("关闭", "Close")} type="button"><X size={21} /></button></div>
+        <p><strong>{draft.item.title}</strong></p>
+        <label><span>{tr("举报理由", "Reason")}</span><select value={draft.reasonCode} onChange={(event) => onChange({ ...draft, reasonCode: event.target.value })}>{reasons.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+        <label><span>{tr("补充说明（可选）", "Additional details (optional)")}</span><textarea maxLength={1000} value={draft.details} onChange={(event) => onChange({ ...draft, details: event.target.value })} rows={5} /></label>
+        <div className="report-dialog-actions"><button className="button ghost" disabled={busy} onClick={onClose} type="button">{tr("取消", "Cancel")}</button><button className="button danger" disabled={busy} onClick={onSubmit} type="button">{busy ? <LoaderCircle className="spin" size={17} /> : <Siren size={17} />}{tr("提交举报", "Submit report")}</button></div>
+      </section>
     </div>
   );
 }
@@ -1027,6 +1378,9 @@ const MediaListView = memo(function MediaListView({
   onOpen,
   onDelete,
   onVisibility,
+  onLike,
+  onReport,
+  socialEnabled,
   busy,
 }: {
   items: MediaItem[];
@@ -1036,6 +1390,9 @@ const MediaListView = memo(function MediaListView({
   onOpen: (item: MediaItem) => void;
   onDelete: (item: MediaItem) => void;
   onVisibility: (item: MediaItem, visibility: MediaVisibility) => void;
+  onLike: (item: MediaItem) => void;
+  onReport: (item: MediaItem) => void;
+  socialEnabled: boolean;
   busy: boolean;
 }) {
   const { tr } = useI18n();
@@ -1060,6 +1417,9 @@ const MediaListView = memo(function MediaListView({
           onOpen={onOpen}
           onDelete={onDelete}
           onVisibility={onVisibility}
+          onLike={onLike}
+          onReport={onReport}
+          socialEnabled={socialEnabled}
           busy={busy}
         />
       ))}
@@ -1075,6 +1435,9 @@ const MediaListRow = memo(function MediaListRow({
   onOpen,
   onDelete,
   onVisibility,
+  onLike,
+  onReport,
+  socialEnabled,
   busy,
 }: {
   item: MediaItem;
@@ -1084,6 +1447,9 @@ const MediaListRow = memo(function MediaListRow({
   onOpen: (item: MediaItem) => void;
   onDelete: (item: MediaItem) => void;
   onVisibility: (item: MediaItem, visibility: MediaVisibility) => void;
+  onLike: (item: MediaItem) => void;
+  onReport: (item: MediaItem) => void;
+  socialEnabled: boolean;
   busy: boolean;
 }) {
   const { tr } = useI18n();
@@ -1104,7 +1470,10 @@ const MediaListRow = memo(function MediaListRow({
       <span className="media-list-kind"><FileKindIcon kind={item.kind} mime={item.mime_type} /><small>{item.kind}</small></span>
       <span className="media-list-size">{formatBytes(item.size)}</span>
       <span className="media-list-date">{formatDate(item.date)}</span>
-      <span className="media-list-visibility"><span className={`visibility-pill ${item.visibility}`}>{visibilityLabel(item.visibility, tr)}</span></span>
+      <span className="media-list-visibility">
+        <span className={`visibility-pill ${item.visibility}`}>{visibilityLabel(item.visibility, tr)}</span>
+        {socialEnabled && <span className="media-social-actions"><button className={item.liked_by_me ? "liked" : ""} disabled={item.owned_by_me} onClick={() => onLike(item)} title={tr("点赞", "Like")} type="button"><Heart size={15} fill={item.liked_by_me ? "currentColor" : "none"} />{item.like_count || 0}</button><button onClick={() => onReport(item)} title={tr("举报", "Report")} type="button"><Siren size={15} /></button></span>}
+      </span>
       {isAdmin && (
         <span className="media-list-actions" onClick={(event) => event.stopPropagation()}>
           <select value={item.visibility} disabled={busy} onChange={(event) => onVisibility(item, event.target.value as MediaVisibility)} aria-label={`${tr("可见性", "Visibility")} ${item.title}`}>
@@ -1226,6 +1595,9 @@ function MediaCard({
   selectable = false,
   selected = false,
   onToggleSelect,
+  onLike,
+  onReport,
+  socialEnabled = false,
 }: {
   item: MediaItem;
   onOpen: () => void;
@@ -1233,6 +1605,9 @@ function MediaCard({
   selectable?: boolean;
   selected?: boolean;
   onToggleSelect?: () => void;
+  onLike?: () => void;
+  onReport?: () => void;
+  socialEnabled?: boolean;
 }) {
   const { tr } = useI18n();
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
@@ -1264,11 +1639,17 @@ function MediaCard({
           <p><time dateTime={item.date}>{formatDate(item.date)}</time><span> · </span>{formatBytes(item.size)}{isAdmin && <><span> · </span><strong className={`visibility-label ${item.visibility}`}>{visibilityLabel(item.visibility, tr)}</strong></>}</p>
         </div>
       </button>
+      {socialEnabled && (
+        <div className="media-card-social">
+          <button className={item.liked_by_me ? "liked" : ""} disabled={item.owned_by_me} onClick={onLike} title={item.owned_by_me ? tr("不能给自己的资源点赞", "You cannot like your own media") : tr("点赞", "Like")} type="button"><Heart size={16} fill={item.liked_by_me ? "currentColor" : "none"} /><span>{item.like_count || 0}</span></button>
+          <button onClick={onReport} title={tr("举报", "Report")} type="button"><Siren size={16} /><span>{tr("举报", "Report")}</span></button>
+        </div>
+      )}
     </div>
   );
 }
 
-function MediaViewer({ item, onClose }: { item: MediaItem; onClose: () => void }) {
+function MediaViewer({ item, onClose, onLike, onReport, socialEnabled = false }: { item: MediaItem; onClose: () => void; onLike?: () => void; onReport?: () => void; socialEnabled?: boolean }) {
   const { tr } = useI18n();
   useEffect(() => {
     function closeOnEscape(event: KeyboardEvent) {
@@ -1312,6 +1693,7 @@ function MediaViewer({ item, onClose }: { item: MediaItem; onClose: () => void }
           <time dateTime={item.date}>{formatDateTime(item.date)}</time>
           <span>{formatBytes(item.size)}</span>
           <span>{item.mime_type}</span>
+          {socialEnabled && <span className="viewer-social"><button className={item.liked_by_me ? "liked" : ""} disabled={item.owned_by_me} onClick={onLike} type="button"><Heart size={17} fill={item.liked_by_me ? "currentColor" : "none"} />{item.like_count || 0}</button><button onClick={onReport} type="button"><Siren size={17} />{tr("举报", "Report")}</button></span>}
         </div>
       </section>
     </div>

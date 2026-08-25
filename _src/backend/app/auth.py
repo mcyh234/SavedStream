@@ -222,6 +222,13 @@ class AuthStore:
                         user_id = int(cursor.lastrowid)
                     await db.execute("UPDATE auth_challenges SET user_id=?,telegram_user_id=?,status='claimed',claimed_at=? WHERE id=?", (int(user_id), str(telegram_user_id), now, challenge["id"]))
                     await db.execute("INSERT INTO auth_audit_events(user_id,action,metadata,created_at) VALUES(?,?,?,?)", (int(user_id), "telegram_bound", "{}", now))
+                    if challenge.get("trust_requested") and challenge.get("browser_id_hash"):
+                        trusted_until = (datetime.now(timezone.utc) + timedelta(seconds=TRUSTED_DEVICE_TTL_SECONDS)).isoformat()
+                        await db.execute(
+                            "INSERT INTO trusted_devices(user_id,browser_id_hash,created_at,expires_at,last_used_at) VALUES(?,?,?,?,?) "
+                            "ON CONFLICT(user_id,browser_id_hash) DO UPDATE SET expires_at=excluded.expires_at,last_used_at=excluded.last_used_at",
+                            (int(user_id), str(challenge["browser_id_hash"]), now, trusted_until, now),
+                        )
                 else:
                     if not user_id or not existing or str(existing.get("telegram_user_id")) != str(telegram_user_id):
                         raise ValueError("Telegram identity does not match this account")

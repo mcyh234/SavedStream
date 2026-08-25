@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, LoaderCircle, ServerCog } from "lucide-react";
 import { api, errorMessage } from "./api";
-import { AdminKeyGate, CenterShell, PublicKeyGate, TelegramAccessGate } from "./AuthPanels";
+import { AccountAuthGate, AccountStateGate, CenterShell } from "./AuthPanels";
 import GalleryPage from "./GalleryPage";
 import { MediaEncryptionGate, useMediaCrypto } from "./MediaCrypto";
 import AdminPage from "./AdminPage";
@@ -77,29 +77,37 @@ export default function App() {
   }
 
   if (!status.media_authenticated) {
-    if (status.access_status !== "approved") {
+    if (status.access_status === "unauthenticated") {
       return (
-        <TelegramAccessGate
-          botUsername={status.helper_bot_username}
-          initialStatus={status.access_status}
+        <AccountAuthGate
+          registrationEnabled={status.registration_enabled}
+          approvalRequired={status.registration_requires_approval}
           onAuthenticated={refreshStatus}
         />
       );
     }
-    if (!status.public_album_enabled) {
-      return (
-        <CenterShell icon={<ServerCog size={30} />} title={tr("公开相册暂未开放", "Public album is not available")}>
-          <p className="gate-message">{tr("管理员尚未开启公开相册访问，请联系管理员。", "The administrator has not enabled public album access.")}</p>
-        </CenterShell>
-      );
-    }
-    return <PublicKeyGate onAuthenticated={refreshStatus} />;
+    return (
+      <AccountStateGate
+        accessStatus={status.access_status}
+        bindingSyncStatus={status.binding_sync_status}
+        publicAlbumEnabled={status.public_album_enabled}
+        approvalRequired={status.registration_requires_approval}
+        onAuthenticated={refreshStatus}
+      />
+    );
   }
 
   if (!status.telegram_authenticated) {
-    if (!status.admin_authenticated) {
-      return <AdminKeyGate onAuthenticated={refreshStatus} />;
-    }
+    if (!status.admin_authenticated) return (
+      <AccountStateGate
+        accessStatus={status.access_status}
+        bindingSyncStatus={status.binding_sync_status}
+        publicAlbumEnabled={status.public_album_enabled}
+        approvalRequired={status.registration_requires_approval}
+        serviceUnavailable
+        onAuthenticated={refreshStatus}
+      />
+    );
     return (
       <CenterShell icon={<ServerCog size={30} />} title={tr("尚未连接托管账号", "No managed account connected")}>
         <p className="gate-message">{tr("请打开管理页，在“多账号协调”中填写 Telegram API ID、API Hash，然后扫码连接账号。", "Open the admin page, configure the Telegram API credentials under multi-account coordination, then connect an account by QR code.")}</p>

@@ -68,6 +68,8 @@ curl -f http://127.0.0.1:8000/healthz
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8000;
+    client_max_body_size 10g;
+    proxy_read_timeout 30m;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -101,6 +103,10 @@ docker compose up -d --build
 ```
 
 重建镜像不会影响 `/data`。如 Telegram 会话过期，可在管理页退出或重置 Telegram session，然后重新扫码。频繁请求可能触发 Telegram `FloodWait`，此时应等待 Telegram 指定的时间，避免反复重启或重新登录。
+
+## 服务端配置灾备备份
+
+管理员后台的“备份”页签同时提供部署备份和服务端配置灾备备份。后者使用管理员设置的密码加密 `.ssbak` 文件，包含 SavedStream 数据库、媒体索引和 TeleBox 账号/Bridge 状态，成功上传到 Telegram 收藏夹后会删除服务端临时文件。备份支持标准五字段 cron 和 IANA 时区（默认 UTC）；管理员也可以扫描 Saved Messages 中的历史备份并事务化恢复。恢复不会带回浏览器会话和活动登录会话，环境变量类配置会提示重新配置或重启。
 
 浏览器是否能直接播放文件取决于编码格式，而不仅是扩展名。当前服务不转码；浏览器不支持的媒体仍可下载，或在后续接入 HLS/转码流程。
 

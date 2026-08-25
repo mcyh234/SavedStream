@@ -231,8 +231,8 @@ FastAPI 通过 Cookie 和 SQLite 会话识别当前访问者，核心依赖为 `
 
 1. 管理员接口要求 `is_admin`，否则返回 `401 ADMIN_AUTH_REQUIRED`。
 2. 媒体接口要求公开相册已开启，且用户 `approved` 且绑定同步状态为 `ready`。
-3. 公开媒体必须满足 `visibility=public` 且 `review_status=approved`；提交者本人始终可以看到自己提交的媒体。
-4. 非管理员只能访问自己被绑定的账号；管理员可以按账号 ID 或默认账号解析。
+3. 公开媒体必须满足 `visibility=public`、`review_status=approved` 且 `hidden=0`；提交者可以在“我的公开”看到自己未隐藏的待审、公开、驳回与撤回资源。
+4. 私人媒体只允许所有者和管理员读取；广场/我的点赞可以跨托管账号读取已经审核通过的公开资源，最终媒体流仍由 `indexed_media_for_principal` 二次鉴权。
 
 ### 9.2 路由清单
 
@@ -243,21 +243,27 @@ FastAPI 通过 Cookie 和 SQLite 会话识别当前访问者，核心依赖为 `
 | 用户认证 | `POST /api/auth/register/start`、`GET /api/auth/register/status`、`POST /api/auth/login`、`GET /api/auth/session`、`POST /api/auth/logout` | 注册挑战、登录与会话 |
 | 设备与密码 | `POST /api/auth/device/verify/start`、`GET /api/auth/device/verify/status`、`POST /api/auth/password/reset/start`、`POST /api/auth/password/reset/complete` | 可信设备验证、密码重置 |
 | 旧账号迁移 | `POST /api/auth/legacy-claim/start`、`GET /api/auth/legacy-claim/status`、`POST /api/internal/auth/telegram-challenge/claim` | 将旧 Telegram 访问账号迁移到用户体系 |
-| 访问者 | `POST /api/access/telegram`、`GET /api/access/telegram/status`、`POST /api/access/telegram/logout`、`POST /api/access/login`、`POST /api/access/logout`、`POST /api/public/login`、`POST /api/public/logout` | Telegram 挑战、访问口令登录 |
+| 旧访问流程（兼容） | `POST /api/access/telegram`、`GET /api/access/telegram/status`、`POST /api/access/login`、`POST /api/public/login` | 已停用并返回 `410 Gone`；前端不得再作为登录入口 |
+| 旧会话退出（兼容） | `POST /api/access/telegram/logout`、`POST /api/access/logout`、`POST /api/public/logout` | 清理升级前遗留 Cookie / session |
 | QR 登录 | `POST /api/auth/qr`、`GET /api/auth/qr/status`、`POST /api/auth/password`、`POST /api/auth/logout` | 管理页二维码登录与两步验证 |
 | 设备密钥 | `GET/POST/DELETE /api/security/device-key` | 浏览器 RSA-OAEP 设备公钥注册、查询、吊销 |
-| 媒体浏览 | `GET /api/media`、`GET /api/media/timeline`、`GET /api/accounts` | 媒体列表、时间线桶、账号列表 |
+| 媒体浏览 | `GET /api/media?view=private\|square\|my_public\|liked`、`GET /api/media/timeline`、`GET /api/accounts` | 私人相册、广场、我的公开、我的点赞、时间线与账号列表 |
+| 点赞与举报 | `PUT/DELETE /api/media/{id}/like`、`POST /api/media/{id}/reports` | 幂等点赞/取消、自赞拒绝、提交举报 |
 | 媒体读取 | `GET /api/media/{id}/thumbnail`、`GET /api/media/{id}/encrypted-thumbnail`、`GET /api/media/{id}/encrypted-chunk`、`GET /api/media/{id}/stream` | 缩略图、加密缩略图/分块、Range 流 |
 | 管理设置 | `GET/PUT /api/admin/settings`、`DELETE /api/admin/cache` | 缓存上限、访问限制、清缓存 |
-| 公开相册 | `GET/PUT /api/admin/public-album`、`POST /api/admin/public-album/key`、`POST /api/admin/public-album/registration-key` | 开关、访问密钥、注册密钥 |
+| 公开相册与注册策略 | `GET/PUT /api/admin/public-album`、`POST /api/admin/public-album/key`、`POST /api/admin/public-album/registration-key` | 公开开关、访问密钥、随机/自定义注册密钥、注册开关、可选的新用户审批策略 |
 | 媒体同步 | `GET /api/admin/media/sync/status`、`POST /api/admin/media/sync` | 各账号同步状态与手动触发 |
 | 审核 | `GET /api/admin/media/review`、`POST /api/admin/media/{id}/review`、`POST /api/admin/media/review/bulk`、`DELETE /api/admin/media/{id}` | 公开媒体审核、删除 |
 | 可见性 | `PATCH /api/admin/media/{id}/visibility`、`POST /api/admin/media/visibility`、`PUT /api/admin/media/{id}` | 单个/批量公开/私密、本地标题 |
 | 流量 | `GET /api/admin/traffic/summary`、`GET /api/admin/traffic/series`、`GET/PUT /api/admin/traffic/settings`、`POST /api/admin/traffic/reset` | 月度流量统计与限制 |
-| 上传任务 | `POST /api/admin/uploads`、`GET/DELETE /api/admin/uploads/{job_id}` | 管理员上传与取消 |
+| WebUI 上传 | `POST /api/uploads`、`GET /api/uploads`、`GET/DELETE /api/uploads/{job_id}` | 普通用户/管理员原始文件流上传、任务查询与取消（所有者隔离） |
+| 管理员上传兼容 | `POST /api/admin/uploads`、`GET/DELETE /api/admin/uploads/{job_id}` | 保留旧管理上传入口并复用上传任务管线 |
+| 举报受理 | `GET /api/admin/reports`、`POST /api/admin/reports/{report_id}/resolve` | 聚合举报、忽略、下架、隐藏、删除与组合处罚 |
+| 用户处罚 | `GET/POST /api/admin/users/{user_id}/sanctions`、`DELETE /api/admin/users/{user_id}/sanctions/{sanction_id}` | 处罚历史、组合处罚与提前解除 |
+| 归属内容删除 | `POST /api/admin/users/{user_id}/content-deletion`、`GET/POST /api/admin/content-deletion-jobs/{job_id}[/retry]` | 异步删除可确认归属内容、进度与失败重试 |
 | Helper Bot | `PUT /api/admin/helper-bot`、`GET/PUT /api/admin/helper-bot/rate-limit` | Bot Token 与限流 |
 | 多账号 | `POST /api/admin/accounts`、`POST /api/admin/accounts/{id}/login/qr`、`GET/DELETE /api/admin/accounts/{id}/login`、`POST /api/admin/accounts/{id}/invites` | 账号增删、二维码登录、邀请码 |
-| 绑定与用户 | `DELETE /api/admin/bindings`、`PUT /api/admin/access-users/{telegram_user_id}`、`POST /api/admin/ingest/jobs/{job_id}/retry` | 解绑、访问用户状态、入库重试 |
+| 绑定与用户 | `DELETE /api/admin/bindings`、`PUT /api/admin/users/{user_id}`、`PUT /api/admin/access-users/{telegram_user_id}`、`POST /api/admin/ingest/jobs/{job_id}/retry` | 新账号审批/禁用、旧访问用户兼容管理、解绑、入库重试 |
 | 健康 | `GET /healthz` | 容器健康检查 |
 
 ### 9.3 常用错误码
@@ -278,6 +284,10 @@ FastAPI 通过 Cookie 和 SQLite 会话识别当前访问者，核心依赖为 `
 | `MEDIA_NOT_FOUND` | 媒体不存在或无权访问 |
 | `TELEGRAM_UNAVAILABLE` | TeleBox Bridge 或 Telegram 不可用 |
 | `TRAFFIC_LIMIT_REACHED` | 月度流量额度已耗尽（HTTP 509） |
+| `UPLOAD_QUOTA_REACHED` | WebUI/Helper Bot 共享的个人文件数、字节数或并发额度已达到上限 |
+| `UPLOAD_MUTED` / `LOGIN_BANNED` / `REPORTING_DISABLED` | 用户受到上传、登录或举报处罚；响应含理由、解除时间和是否永久 |
+| `SELF_LIKE_FORBIDDEN` / `SELF_REPORT_FORBIDDEN` | 禁止给自己的资源点赞或举报自己的资源 |
+| `REPORT_ALREADY_OPEN` | 同一举报者对同一媒体已有未完结举报 |
 
 ## 10. 数据库表概览
 
@@ -296,14 +306,18 @@ FastAPI 通过 Cookie 和 SQLite 会话识别当前访问者，核心依赖为 `
 | `device_keys` | 浏览器设备公钥 |
 | `media_users` | 旧版 Telegram 媒体访问用户 |
 | `access_sessions` | 旧版访问会话 |
-| `media_index` | 多账号媒体索引、可见性、审核状态 |
+| `media_index` | 多账号媒体索引、所有者、上传来源/批次、可见性、审核状态 |
 | `media_sync_state` | 每账号同步游标、状态与错误 |
 | `ingest_reconcile_state` | Helper Bot 入库任务对账游标 |
 | `media_review_events` | 审核事件历史 |
 | `media_deletion_events` | 媒体删除事件 |
 | `review_sync_outbox` | 审核结果向 Bridge 同步的待发送队列 |
 | `media_timeline_buckets` | 按年/月/日预聚合的时间线桶 |
-| `upload_jobs` | 管理员上传任务 |
+| `upload_jobs` | WebUI/管理员上传任务、所有者、请求可见性、批次与共享配额预约 |
+| `media_likes` | 用户对公开媒体的幂等点赞 |
+| `media_reports` | 举报证据、媒体快照和受理状态 |
+| `user_sanctions` | 可过期、可组合、可提前解除的细粒度处罚 |
+| `content_deletion_jobs` / `content_deletion_job_items` | 可确认归属内容的异步删除任务、逐项进度和失败原因 |
 | `traffic_usage_buckets` | 按时间桶统计的流量 |
 | `traffic_limit_settings` | 月度流量设置 |
 | `media_folders` | 多级文件夹（`parent_id=0` 为根，同级名称唯一） |
@@ -356,10 +370,13 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 ### 11.4 Helper Bot 命令与行为
 
 - `/bind <邀请码>`：将当前 Telegram 用户绑定到目标账号。
-- `/web`：获取一次性网页登录码，用于在浏览器中登录公开相册。
+- `/web`：旧版一次性网页登录码已停用；命令只提示用户返回 SavedStream 网页使用用户名/密码登录，旧 `/api/access/telegram` 消费流程返回 `410 Gone`。
+- `/start <challenge>`：Helper Bot 将注册/设备确认挑战转发给 SavedStream 内部接口完成 Telegram 身份确认。
 - 私聊转发媒体：Bot 收到媒体后创建入库任务，先询问可见性，再写入目标账号 Saved Messages。
 - 公开选择进入审核队列；私密选择无需管理员审核。
 - 限流设置包括：`per_user_files_24h`、`per_user_bytes_24h`、`per_user_concurrent`、`max_file_bytes`、`global_files_per_minute`、`max_album_items`、`max_album_bytes`。
+- Helper Bot 在接收、可见性选择和失败重试前查询 SavedStream 内部处罚状态；WebUI 与 Bot 在 Bridge 的同一 `helper_rate_events` / `helper_rate_reservations` 账本中预约、完成或释放个人额度。
+- 内部协作接口：`GET /api/internal/moderation/users/{telegram_user_id}`、`POST /v1/upload-quota/reservations`、完成/释放预约接口，以及 `POST /v1/ingest/users/{telegram_user_id}/cancel`。
 
 ## 12. 前端页面与门控
 
@@ -367,12 +384,13 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 `App.tsx` 根据 `/api/status` 决定渲染哪个界面：
 
-1. 服务未配置 → 提示配置 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH`、`ADMIN_KEY`。
-2. 媒体访问未认证且公开相册关闭 → 提示等待管理员。
-3. 公开相册已开启 → 渲染 `TelegramAccessGate` 或 `PublicKeyGate`。
-4. 管理员未登录 → 渲染 `AdminKeyGate`。
-5. Telegram 托管账号未连接 → 提示进入 `/admin` 配置。
-6. 全部通过 → 进入 `MediaEncryptionGate`，再渲染 `GalleryPage`。
+1. 服务未配置 → 提示配置核心密钥与内部 Bridge。
+2. 未登录 → 渲染 `AccountAuthGate`，提供 SavedStream 用户名/密码登录；管理员开放注册时同时显示注册入口。
+3. 注册 → 调用 `/api/auth/register/start`，用户通过 Helper Bot 完成 Telegram 身份确认，前端轮询 `/api/auth/register/status` 后自动登录。`registration_requires_approval=1`（默认）时等待管理员审批；关闭后，仅当用户存在有效 `/bind` 托管账号绑定时自动设为 `approved/ready`。
+4. 已批准用户从新浏览器登录 → 调用 `/api/auth/login` 后进入 Telegram 设备确认，轮询 `/api/auth/device/verify/status`。
+5. 待审核、被拒绝、被禁用或绑定同步中 → 渲染 `AccountStateGate`，不再调用旧 `/api/access/telegram` 或 `/api/public/login`。
+6. Telegram 托管账号未连接 → 管理员进入 `/admin` 配置；普通用户看到服务暂不可用提示。
+7. 全部通过 → 进入 `MediaEncryptionGate`，再渲染 `GalleryPage`。
 
 ### 12.2 页面与面板
 
@@ -386,9 +404,9 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 | `PublicAlbumPanel` | 公开相册开关与访问密钥 |
 | `MediaIndexPanel` | 媒体索引同步状态 |
 | `UploadPanel` | 管理员上传任务 |
-| `AccessUsersPanel` | 访问用户审批与管理 |
+| `AccessUsersPanel` | `auth_users` 账号审批、禁用与 Telegram/托管账号绑定状态管理 |
 | `CoordinationPanel` | 多账号协调、二维码登录、邀请码 |
-| `AuthPanels` | 管理员密钥、Telegram 挑战、公开密钥等认证面板 |
+| `AuthPanels` | 用户登录/注册、Telegram 注册与设备挑战、账号状态、管理员恢复密钥面板 |
 | `MediaCrypto` | IndexedDB 设备密钥、PBKDF2 解密、MediaSource 播放 |
 
 ### 12.3 浏览器端加密
@@ -408,7 +426,7 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 1. 读取或输入服务器 IP、SSH 用户、域名；密码用 DPAPI 加密保存到 `deploy.config.json`。
 2. 检查 `docker-compose.yml`、`Dockerfile.bridge` 和本机 `tar.exe`。
 3. 打包 `_src` 与 `TeleBox`，排除 `.env`、`node_modules`、`dist`、`__pycache__`、session 等敏感/生成内容。
-4. 若本地 Docker Desktop 可用则构建并导出 Linux 镜像；否则回退到服务器构建。
+4. 优先使用 `-PrebuiltImageArchive` 或本地 Docker 导出的 Linux 镜像；未提供预构建镜像且本地 Docker 不可用时，自动回退到服务器构建，保证一键部署流程不中断。
 5. 上传、备份旧代码与数据卷、更新容器、健康检查。
 6. 新版本失败时恢复旧代码和数据卷。
 7. 检测 Caddy 端口并回显应添加的反代配置。
@@ -417,6 +435,9 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 - `-PackageOnly`：仅验证打包内容。
 - `-ResetConfig`：清除已保存的部署连接信息。
+- `-PrebuiltImageArchive <path>`：复用包含 Docker `*.tar` 成员的 gzip tar 镜像归档（`RepoTags` 需匹配 `savedstream` 与 `telebox`），跳过本地构建和服务器构建。
+- `-AllowServerBuild`：兼容旧命令的保留参数；当前本地 Docker 不可用时会自动回退到服务器构建，无需额外指定。
+- `-KeepBackups 1|2`：健康检查通过后保留最近 1 或 2 份备份，默认 `2`。
 
 ### 13.2 容器与健康检查
 
@@ -436,8 +457,8 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 | 位置 | 测试框架 | 主要测试文件 |
 | --- | --- | --- |
-| `_src/backend/tests` | pytest | `test_database.py`、`test_ranges.py`、`test_security.py`、`test_media_crypto.py`、`test_media_index.py`、`test_media_indexer.py`、`test_telebox_client.py`、`test_telegram_service.py`、`test_access_control.py`、`test_review_policy.py`、`test_cache.py`、`test_traffic.py`、`test_device_session.py`、`test_library_features.py` |
-| `_src/frontend/src` | Vitest | `AuthPanels.test.ts`、`GalleryPage.test.ts`、`I18n.test.ts`、`MediaCrypto.test.ts` |
+| `_src/backend/tests` | pytest | 既有测试，以及 `test_square_upload_moderation.py`（四视图、点赞/举报、上传隔离、处罚与归属删除） |
+| `_src/frontend/src` | Vitest | 既有测试，以及 `GalleryPage.upload.test.tsx`、`AdminPage.sanctions.test.ts` |
 | `TeleBox/src` | Node 内置测试 | `bridge-media.test.ts`、`web-login.test.ts` |
 
 ## 15. 关键常量与默认值
@@ -498,9 +519,9 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 ### 16.4 管理后台分页化
 
-`AdminPage.tsx` 由单页长列表重构为 11 个分区页签（localStorage 记住选择）：
+`AdminPage.tsx` 当前包含 14 个分区页签（localStorage 记住选择）：
 
-仪表盘 · Telegram 与多账号 · 审核队列 · 用户管理 · 公开相册 · 媒体库 · 上传 · 流量限额 · 本地缓存 · Bot 限流 · 站内信。
+仪表盘 · Telegram 与多账号 · 审核队列 · 举报受理 · 用户管理 · 公开相册 · 媒体库 · 上传 · 流量限额 · 本地缓存 · Bot 限流 · 站内信 · 备份 · 存储。
 
 各配置页的保存按钮统一使用右侧悬浮动作条（`.admin-sticky-actions` / `.admin-save-float`，sticky 贴底、靠右、带阴影），滚动页面时保持可触及。
 
@@ -561,7 +582,7 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 **容器挂载与权限**
 - `docker-compose.yml`：`savedstream` 服务新增绑定挂载 `../backups:/backups:rw`（解析到宿主 `/opt/tube/backups`），管理台可读可删。
-- `deploy.ps1`：创建备份目录后自动 `chown 10001:10001` + `chmod 700`，让容器 UID（10001）可以删除备份，同时宿主其他用户不可读；新增 `-KeepBackups` 参数（默认 `3`），部署健康检查通过后自动只保留最近 N 份（旧备份成对删除）。
+- `deploy.ps1`：创建备份目录后自动 `chown 10001:10001` + `chmod 700`，让容器 UID（10001）可以删除备份，同时宿主其他用户不可读；新增 `-KeepBackups` 参数（默认 `2`，最多 `2`），部署健康检查通过后自动只保留最近 N 份（旧备份成对删除），并清理中断部署遗留的孤立卷备份。
 
 **管理 API**（全部 `require_admin`）
 | 方法 | 路径 | 说明 |
@@ -573,7 +594,16 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 **管理后台页面**：新增“备份管理”页签（`BackupAdminPanel`）——备份列表（时间/大小/文件数、可展开查看内部文件）、单份删除（确认）、保留策略表单（输入保留份数 → 预览可释放空间 → 执行清理）。目录未挂载或不可写时给出明确的修复指引（`chown 10001:10001 /opt/tube/backups && chmod 700 /opt/tube/backups`）。
 
 新增测试：`_src/backend/tests/test_backups.py`（聚合/大小统计、缺失目录、删除与非法 stamp、保留策略 dry-run 与执行、管理 API 鉴权与 404/422）。
-### 16.9 存储感知（磁盘警报与优化建议）
+
+### 16.9 服务端配置灾备备份
+
+服务端配置备份与部署备份分离，使用 `.ssbak` 文件保存 SavedStream SQLite、用户/媒体索引/审核/处罚等数据，以及 TeleBox 的 `accounts.json`、`bridge.db` 和 Helper Bot 配置。payload 使用 AES-256-GCM 加密，管理员密码通过 `ADMIN_KEY` 包装后保存在 `system_backup_settings` 中，供 cron 无人值守执行。
+
+备份任务支持五字段 cron 和 IANA 时区，默认写入管理员选择的 Telegram Saved Messages 账号，并使用 `#savedstream-system-backup:v1` 标记。索引中统一记录为 `hidden=1`、`upload_source=system_backup`，不会出现在普通相册、广场或点赞视图。Telegram 上传成功后服务端临时文件立即清理。
+
+管理 API 包括 `/api/admin/system-backups/settings`、`/api/admin/system-backups`、`/api/admin/system-backups/run`、`/api/admin/system-backups/import`、`/api/admin/system-backups/scan-telegram`、`/api/admin/system-backups/{id}/restore` 和任务查询接口。恢复先校验归档并生成当前状态回滚快照，然后暂停索引、原子替换 SavedStream/TeleBox 数据，失败自动回滚；活动浏览器会话和访问会话不会恢复。
+
+### 16.10 存储感知（磁盘警报与优化建议）
 
 **后端**（`_src/backend/app/storage.py`）：
 
@@ -587,3 +617,63 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 新增测试：`_src/backend/tests/test_storage.py`（健康状态、低空间/严重空间、备份过大、缓存接近上限、快照字段形状、GB 格式化）。
 
+## 17. WebUI 上传、公开广场与举报处罚系统
+
+### 17.1 WebUI 上传管线
+
+1. 浏览器拖入或选择文件后，前端建立批次并为每个文件保存独立可见性；原始 `File.name` 经 `X-Upload-Filename`（Base64URL UTF-8）传递。
+2. `POST /api/uploads?visibility=public|private&account=...` 在读取正文前完成账号、处罚、个人配额和 `Content-Length` 校验。
+3. 服务端以 UUID 作为磁盘临时名，目录权限 `0700`、文件权限 `0600`；接收过程中同时计入月度入站流量。
+4. 后台任务调用 Bridge 上传到目标账号 Saved Messages。Telegram 写入成功后完成个人配额记账，再写入本地索引；失败/取消释放尚未完成的预约并清理临时文件。
+5. 普通用户公开请求写入 `requested_visibility=public`、`review_status=pending`、实际 `visibility=private`；管理员公开请求直接为 `approved/public`。
+6. 上传任务包含 `owner_user_id`、`submitter_telegram_user_id`、`requested_visibility`、`review_status`、`batch_id`、`upload_source`；媒体索引保存所有者、来源和 `upload_batch_id`。任务读取/取消只允许所有者或管理员。
+
+WebUI 与 Helper Bot 的个人额度共用 TeleBox `bridge.db`：
+
+- `helper_rate_reservations`：未完成预约，参与并发、文件数和字节数的预占计算；
+- `helper_rate_events`：成功写入 Telegram 后的 24 小时计费事件；
+- 失败/正文长度不符/取消：释放预约；
+- 管理员账号：跳过个人额度；SavedStream 月度总流量是否绕过仍由 `traffic_limit_settings.admin_bypass` 决定。
+
+### 17.2 四种媒体集合
+
+| `view` | 查询规则 | 用途 |
+| --- | --- | --- |
+| `private` | 所有者匹配、`requested_visibility=private`、当前私有、未隐藏 | 我的相册 |
+| `square` | `visibility=public AND review_status=approved AND hidden=0` | 公开广场 |
+| `my_public` | 所有者匹配、`requested_visibility=public`、未隐藏 | 待审/已公开/驳回/撤回 |
+| `liked` | 当前仍满足广场可见性且存在当前用户点赞 | 我的点赞 |
+
+广场、私人相册和我的点赞不返回 Telegram 身份、审核理由/操作者、审核批次、上传来源或内部配额字段；“我的公开”和管理员视图才返回审核状态与原因。媒体缩略图、播放和下载继续经过设备密钥与加密媒体接口。
+
+### 17.3 举报状态与媒体处置
+
+举报状态：`open → processing → resolved|ignored|failed`。同一举报者对同一媒体在 `open/processing/failed` 期间不能重复提交；`failed` 会继续出现在管理员可受理列表。
+
+| 处置 | 结果 |
+| --- | --- |
+| 忽略 | 举报完结，不修改媒体 |
+| 下架 | 审核状态改为 `revoked`，媒体转私人，上传者在“我的公开”可见 |
+| 隐藏 | `hidden=1`，仅管理员可见 |
+| 删除 | 先删除 Telegram Saved Message/Helper Bot 入库任务，再清缓存和本地索引；任一步失败则举报保持 `failed` |
+
+举报完结会向所有相关举报者发送感谢站内信；上传者会收到媒体处置与处罚通知，但不会获知举报者身份。
+
+### 17.4 处罚与角色保护
+
+| 类型 | 限制 |
+| --- | --- |
+| `upload_mute` | 允许登录/浏览，拒绝 WebUI 与 Helper Bot 上传 |
+| `login_ban` | 拒绝账号登录、Telegram 挑战确认、绑定和上传；创建时撤销现有会话与可信设备 |
+| `report_mute` | 拒绝继续提交举报 |
+
+处罚可以组合，每项有独立理由和 `expires_at`（空值表示永久），创建同类新处罚会提前结束旧的生效记录。结构化错误包含 `code`、`sanction_type`、`reason`、`expires_at`、`permanent`。普通管理员只能处罚普通用户；超级管理员可以处罚管理员，但不能处罚自己，也不能使最后一个有效超级管理员失去管理能力。
+
+“删除全部归属内容”只选择满足以下条件的媒体：所有者可由 `owner_user_id` 或安全回填的 Telegram 身份确认，且来源为 WebUI/Helper Bot（或存在明确的入库任务 ID）。任务逐项保存 `pending/completed/failed`，Telegram 删除失败不会虚假完成，可从用户管理页重试失败项。
+
+### 17.5 反向代理要求
+
+- 代理请求体上限必须不小于管理页配置的单文件上限；Nginx 可设置 `client_max_body_size`，Caddy 可使用 `request_body max_size`。
+- 建议关闭 Nginx `proxy_request_buffering`，让请求流直接进入 SavedStream 的受限暂存目录。
+- 大文件上传和 Telegram 入库需要较长的代理读写超时；示例部署使用 3600 秒。
+- 必须保留 `Range` 请求头，并在 HTTPS 部署中启用 `COOKIE_SECURE=true`。

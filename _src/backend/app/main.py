@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
+import os
+import re
 import secrets
+import shutil
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -36,11 +42,25 @@ from .media_crypto import DeviceKeyError, encrypt_for_device, load_device_public
 from .ranges import InvalidRange, parse_range_header
 from .security import TokenSigner, constant_time_equal
 from .storage import storage_snapshot, storage_watchdog
+from .system_backups import (
+    BACKUP_MARKER,
+    SystemBackupError,
+    archive_size,
+    backup_filename,
+    create_archive,
+    extract_archive,
+    next_cron,
+    snapshot_sqlite,
+    unwrap_passphrase,
+    utc_now,
+    wrap_passphrase,
+)
 from .traffic import TrafficController, TrafficLimitExceeded
 from .telebox_client import (
     TELEGRAM_CHUNK_SIZE,
     MediaNotFound,
     InvalidWebLoginCode,
+    UploadQuotaExceeded,
     TeleBoxClient,
     TelegramUnavailable,
     guess_image_content_type,
@@ -83,6 +103,34 @@ class AdminUserUpdatePayload(BaseModel):
     ban_reason: str | None = Field(default=None, max_length=1000)
 
 
+class MediaReportPayload(BaseModel):
+    reason_code: str = Field(pattern="^(illegal|sexual|copyright|malware|spam|privacy|other)$")
+    details: str | None = Field(default=None, max_length=1000)
+
+
+class SanctionPayload(BaseModel):
+    sanction_type: str = Field(pattern="^(upload_mute|login_ban|report_mute)$")
+    reason: str = Field(min_length=1, max_length=1000)
+    expires_at: str | None = Field(default=None, max_length=64)
+
+
+class SanctionTargetPayload(BaseModel):
+    user_id: int = Field(ge=1)
+    sanctions: list[SanctionPayload] = Field(default_factory=list, max_length=3)
+    delete_all_content: bool = False
+
+
+class ReportResolutionPayload(BaseModel):
+    resolution: str = Field(pattern="^(actioned|ignored)$")
+    media_action: str = Field(default="none", pattern="^(none|private|hidden|delete)$")
+    reason: str | None = Field(default=None, max_length=1000)
+    targets: list[SanctionTargetPayload] = Field(default_factory=list, max_length=100)
+
+
+class ContentDeletionPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class AdminCreatePayload(UserPasswordPayload):
     role: str = Field(default="admin", pattern="^(admin|superadmin)$")
 
@@ -95,6 +143,7 @@ class PasswordResetCompletePayload(BaseModel):
 class PublicAlbumSettingsPayload(BaseModel):
     enabled: bool | None = None
     registration_enabled: bool | None = None
+    registration_requires_approval: bool | None = None
     registration_key: str | None = Field(default=None, min_length=1, max_length=512)
 
 
@@ -211,6 +260,15 @@ class BackupCleanupPayload(BaseModel):
     dry_run: bool = False
 
 
+class SystemBackupSettingsPayload(BaseModel):
+    enabled: bool = False
+    cron_expr: str = Field(default="0 3 * * *", min_length=1, max_length=120)
+    timezone: str = Field(default="UTC", min_length=1, max_length=80)
+    account_id: str | None = Field(default=None, max_length=40)
+    passphrase: str | None = Field(default=None, min_length=8, max_length=512)
+    clear_passphrase: bool = False
+
+
 class ReviewPayload(BaseModel):
     decision: str = Field(pattern="^(approved|rejected|revoked|deleted)$")
     reason: str | None = Field(default=None, max_length=1000)
@@ -284,6 +342,11 @@ async def lifespan(app: FastAPI):
     app.state.telegram = telegram
     app.state.indexer = indexer
     await indexer.start()
+    system_backup_scheduler = asyncio.create_task(
+        _system_backup_scheduler(database, telegram, indexer),
+        name="system-backup-scheduler",
+    )
+    app.state.system_backup_scheduler = system_backup_scheduler
     storage_task = asyncio.create_task(
         storage_watchdog(database),
         name="storage-watchdog",
@@ -294,6 +357,18 @@ async def lifespan(app: FastAPI):
         await storage_task
     except asyncio.CancelledError:
         pass
+    system_backup_scheduler.cancel()
+    try:
+        await system_backup_scheduler
+    except asyncio.CancelledError:
+        pass
+    pending_system_backups = list(system_backup_tasks.values())
+    for task in pending_system_backups:
+        if not task.done():
+            task.cancel()
+    if pending_system_backups:
+        await asyncio.gather(*pending_system_backups, return_exceptions=True)
+    system_backup_tasks.clear()
     await indexer.stop()
     pending_uploads = list(upload_tasks.values())
     for task in pending_uploads:
@@ -302,6 +377,13 @@ async def lifespan(app: FastAPI):
     if pending_uploads:
         await asyncio.gather(*pending_uploads, return_exceptions=True)
     upload_tasks.clear()
+    pending_deletions = list(content_deletion_tasks.values())
+    for task in pending_deletions:
+        if not task.done():
+            task.cancel()
+    if pending_deletions:
+        await asyncio.gather(*pending_deletions, return_exceptions=True)
+    content_deletion_tasks.clear()
     await telegram.close()
 
 
@@ -311,6 +393,286 @@ app = FastAPI(title="SavedStream", version="0.1.0", lifespan=lifespan)
 # state itself remains durable in SQLite, so a restart still exposes the last
 # known state and the normal retry path can be used afterwards.
 upload_tasks: dict[str, asyncio.Task[None]] = {}
+content_deletion_tasks: dict[str, asyncio.Task[None]] = {}
+system_backup_tasks: dict[str, asyncio.Task[None]] = {}
+system_backup_lock = asyncio.Lock()
+system_backup_restore_lock = asyncio.Lock()
+
+
+def _system_backup_public_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": bool(int(raw.get("enabled") or 0)),
+        "cron_expr": str(raw.get("cron_expr") or "0 3 * * *"),
+        "timezone": str(raw.get("timezone") or "UTC"),
+        "account_id": raw.get("account_id"),
+        "passphrase_configured": bool(raw.get("passphrase_ciphertext")),
+        "next_run_at": raw.get("next_run_at"),
+        "last_run_at": raw.get("last_run_at"),
+        "last_status": raw.get("last_status") or "idle",
+        "last_error": raw.get("last_error"),
+        "updated_at": raw.get("updated_at"),
+    }
+
+
+async def _stored_system_backup_passphrase(database: Database) -> str:
+    raw = await database.get_system_backup_settings()
+    ciphertext = raw.get("passphrase_ciphertext")
+    if not ciphertext:
+        raise SystemBackupError("backup passphrase is not configured")
+    return unwrap_passphrase(
+        {
+            "salt": str(raw.get("passphrase_salt") or ""),
+            "nonce": str(raw.get("passphrase_nonce") or ""),
+            "ciphertext": str(ciphertext),
+        },
+        settings.admin_key,
+    )
+
+
+def _runtime_config_snapshot() -> bytes:
+    keys = (
+        "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "ADMIN_KEY", "MEDIA_CACHE_KEY",
+        "TELEBOX_API_TOKEN", "SAVEDSTREAM_INTERNAL_TOKEN", "TELEBOX_SECRET_KEY",
+        "TELEBOX_DEFAULT_ACCOUNT", "COOKIE_SECURE", "SESSION_COOKIE_DAYS",
+    )
+    return json.dumps({key: os.getenv(key, "") for key in keys}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+
+async def _notify_system_backup_failure(database: Database, message: str) -> None:
+    try:
+        auth = AuthStore(database.path)
+        admins = [user for user in await auth.list_users() if str(user.get("role")) in {"admin", "superadmin"}]
+        for user in admins:
+            if user.get("id"):
+                await database.create_notification(int(user["id"]), "system_backup", "服务端配置备份失败", message, "/admin")
+    except Exception:
+        # A backup failure must never crash the main service or scheduler.
+        pass
+
+
+async def _run_system_backup_job(
+    job_id: str,
+    *,
+    trigger: str,
+    database: Database,
+    telegram: TeleBoxClient,
+    indexer: MediaIndexer,
+    created_by: int | None = None,
+) -> None:
+    staging = settings.data_dir / "system-backup-staging" / job_id
+    archive_path = staging / backup_filename()
+    account_id: str | None = None
+    try:
+        await database.update_system_backup_job(job_id, status="running", phase="snapshot", progress=5)
+        async with system_backup_lock:
+            config = await database.get_system_backup_settings()
+            account_id = await telegram.resolve_account(str(config.get("account_id") or settings.telebox_default_account))
+            passphrase = await _stored_system_backup_passphrase(database)
+            staging.mkdir(parents=True, exist_ok=True)
+            db_snapshot = staging / "savedstream.db"
+            await asyncio.to_thread(snapshot_sqlite, settings.database_path, db_snapshot)
+            await database.update_system_backup_job(job_id, phase="telebox_export", progress=25)
+            telebox_payload = await telegram.export_system_backup()
+            sections = {
+                "savedstream.db": db_snapshot.read_bytes(),
+                "telebox.json": json.dumps(telebox_payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                "runtime_config.json": _runtime_config_snapshot(),
+            }
+            await database.update_system_backup_job(job_id, phase="encrypt", progress=45)
+            manifest = await asyncio.to_thread(
+                create_archive,
+                archive_path,
+                passphrase=passphrase,
+                sections=sections,
+                metadata={"application": "SavedStream", "backup_marker": BACKUP_MARKER},
+            )
+            await database.update_system_backup_job(job_id, status="uploading", phase="telegram_upload", progress=60)
+            uploaded = await telegram.upload_file(
+                account_id=account_id,
+                file_path=archive_path,
+                filename=archive_path.name,
+                mime_type="application/x-savedstream-backup",
+                caption=f"{BACKUP_MARKER}\n{archive_path.name}",
+            )
+            message_id = int(uploaded.get("id") or uploaded.get("message_id") or 0)
+            backup_id = str(uuid.uuid4())
+            record = await database.create_system_backup({
+                "id": backup_id,
+                "filename": archive_path.name,
+                "source": trigger,
+                "status": "available",
+                "created_at": str(manifest.get("created_at") or utc_now()),
+                "size_bytes": archive_size(archive_path),
+                "sha256": str(manifest.get("archive_sha256") or ""),
+                "account_id": account_id,
+                "message_id": message_id or None,
+                "manifest_json": json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                "error": None,
+                "imported_at": None,
+            })
+            if message_id and uploaded.get("kind"):
+                item = {**uploaded, "account_id": account_id}
+                await database.upsert_media_index(
+                    item,
+                    visibility="private",
+                    hidden=True,
+                    upload_source="system_backup",
+                    requested_visibility="private",
+                    review_status="not_required",
+                )
+            await database.update_system_backup_job(job_id, backup_id=record["id"], status="completed", phase="completed", progress=100, completed_at=utc_now())
+            await database.update_system_backup_settings({"last_run_at": utc_now(), "last_status": "success", "last_error": None})
+    except Exception as exc:
+        message = str(exc)
+        current_job = await database.get_system_backup_job(job_id)
+        attempts = int((current_job or {}).get("attempts") or 0) + 1
+        if attempts < 3:
+            await database.update_system_backup_job(job_id, status="queued", phase="retry_wait", attempts=attempts, error=message)
+            await asyncio.sleep(2 ** attempts)
+            await _run_system_backup_job(job_id, trigger=trigger, database=database, telegram=telegram, indexer=indexer, created_by=created_by)
+            return
+        await database.update_system_backup_job(job_id, status="failed", phase="failed", error=message, completed_at=utc_now())
+        await database.update_system_backup_settings({"last_run_at": utc_now(), "last_status": "failed", "last_error": message})
+        await _notify_system_backup_failure(database, message)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        system_backup_tasks.pop(job_id, None)
+
+
+async def _system_backup_scheduler(database: Database, telegram: TeleBoxClient, indexer: MediaIndexer) -> None:
+    while True:
+        try:
+            config = await database.get_system_backup_settings()
+            if not bool(int(config.get("enabled") or 0)) or not config.get("passphrase_ciphertext"):
+                await asyncio.sleep(30)
+                continue
+            next_at = config.get("next_run_at")
+            now = datetime.now(timezone.utc)
+            if not next_at:
+                next_value = next_cron(str(config.get("cron_expr") or "0 3 * * *"), str(config.get("timezone") or "UTC"), now)
+                await database.update_system_backup_settings({"next_run_at": next_value.isoformat()})
+                await asyncio.sleep(1)
+                continue
+            try:
+                due = datetime.fromisoformat(str(next_at).replace("Z", "+00:00"))
+            except ValueError:
+                due = now
+            delay = (due - now).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(min(delay, 30))
+                continue
+            if system_backup_tasks:
+                next_value = next_cron(str(config.get("cron_expr") or "0 3 * * *"), str(config.get("timezone") or "UTC"), now)
+                await database.update_system_backup_settings({"next_run_at": next_value.isoformat()})
+                await asyncio.sleep(5)
+                continue
+            job_id = str(uuid.uuid4())
+            await database.create_system_backup_job({
+                "id": job_id, "backup_id": None, "trigger": "scheduled", "status": "queued", "phase": "queued",
+                "progress": 0, "attempts": 0, "temp_path": None, "error": None, "created_by": None,
+                "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None,
+            })
+            task = asyncio.create_task(_run_system_backup_job(job_id, trigger="scheduled", database=database, telegram=telegram, indexer=indexer), name=f"system-backup-{job_id}")
+            system_backup_tasks[job_id] = task
+            next_value = next_cron(str(config.get("cron_expr") or "0 3 * * *"), str(config.get("timezone") or "UTC"), now)
+            await database.update_system_backup_settings({"next_run_at": next_value.isoformat()})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(30)
+
+
+async def _copy_upload_to_path(upload: UploadFile, destination: Path) -> int:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with destination.open("wb") as handle:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 10 * 1024**3:
+                raise HTTPException(status_code=413, detail={"code": "BACKUP_TOO_LARGE"})
+            handle.write(chunk)
+    await upload.close()
+    return total
+
+
+async def _restore_system_backup_archive(
+    job_id: str,
+    archive_path: Path,
+    *,
+    database: Database,
+    telegram: TeleBoxClient,
+    indexer: MediaIndexer,
+    passphrase: str,
+    backup_id: str | None = None,
+) -> None:
+    work = settings.data_dir / "system-backup-restore" / job_id
+    rollback_db = work / "rollback.db"
+    try:
+        await database.update_system_backup_job(job_id, status="validating", phase="validating", progress=10)
+        work.mkdir(parents=True, exist_ok=True)
+        manifest = await asyncio.to_thread(extract_archive, archive_path, passphrase, work / "extracted")
+        restored_db = work / "extracted" / "savedstream.db"
+        telebox_file = work / "extracted" / "telebox.json"
+        if not restored_db.is_file():
+            raise SystemBackupError("backup is missing savedstream.db")
+        await asyncio.to_thread(snapshot_sqlite, settings.database_path, rollback_db)
+        previous_telebox = await telegram.export_system_backup() if telebox_file.is_file() else None
+        await database.update_system_backup_job(job_id, status="restoring", phase="pause_indexer", progress=35)
+        async with system_backup_restore_lock:
+            try:
+                pending_uploads = list(upload_tasks.values())
+                for pending in pending_uploads:
+                    if not pending.done():
+                        pending.cancel()
+                if pending_uploads:
+                    await asyncio.gather(*pending_uploads, return_exceptions=True)
+                upload_tasks.clear()
+                if hasattr(indexer, "stop"):
+                    await indexer.stop()
+                await database.update_system_backup_job(job_id, phase="telebox_import", progress=50)
+                if telebox_file.is_file():
+                    await telegram.import_system_backup(json.loads(telebox_file.read_text(encoding="utf-8")))
+                await database.update_system_backup_job(job_id, phase="database_replace", progress=70)
+                os.replace(restored_db, settings.database_path)
+                await database.initialize()
+                if hasattr(indexer, "start"):
+                    await indexer.start()
+            except Exception:
+                if previous_telebox is not None:
+                    try:
+                        await telegram.import_system_backup(previous_telebox)
+                    except Exception:
+                        pass
+                if rollback_db.exists():
+                    os.replace(rollback_db, settings.database_path)
+                await database.initialize()
+                if hasattr(indexer, "start"):
+                    await indexer.start()
+                raise
+        if backup_id:
+            await database.update_system_backup(
+                backup_id,
+                status="available",
+                size_bytes=archive_size(archive_path),
+                sha256=str(manifest.get("archive_sha256") or ""),
+                manifest_json=json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                error=None,
+                imported_at=utc_now(),
+            )
+        await database.update_system_backup_job(job_id, status="completed", phase="completed", progress=100, completed_at=utc_now(), error=None)
+    except Exception as exc:
+        await database.update_system_backup_job(job_id, status="failed", phase="failed", error=str(exc), completed_at=utc_now())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        archive_path.unlink(missing_ok=True)
+        try:
+            archive_path.parent.rmdir()
+        except OSError:
+            pass
+        system_backup_tasks.pop(job_id, None)
 
 
 def get_database(request: Request) -> Database:
@@ -403,7 +765,7 @@ async def _public_album_config(database: Database) -> tuple[bool, str, int]:
     return enabled, key_hash, version
 
 
-async def _registration_config(database: Database) -> tuple[bool, str, int, str]:
+async def _registration_config(database: Database) -> tuple[bool, str, int, str, bool]:
     enabled = await database.get_setting("public_registration_enabled", "0") == "1"
     key_hash = await database.get_setting("registration_key_hash", "")
     try:
@@ -411,7 +773,63 @@ async def _registration_config(database: Database) -> tuple[bool, str, int, str]
     except ValueError:
         version = 1
     fingerprint = await database.get_setting("registration_key_fingerprint", "")
-    return enabled, key_hash, version, fingerprint
+    requires_approval = await database.get_setting("registration_requires_approval", "1") != "0"
+    return enabled, key_hash, version, fingerprint, requires_approval
+
+
+async def _active_telegram_bindings(telegram: TeleBoxClient) -> list[dict[str, Any]] | None:
+    getter = getattr(telegram, "bindings", None)
+    if getter is None:
+        return None
+    try:
+        items = (await getter()).get("items", [])
+    except (AttributeError, TelegramUnavailable):
+        return None
+    return [item for item in items if isinstance(item, dict)]
+
+
+async def _sync_auth_user_binding(
+    auth: AuthStore,
+    telegram: TeleBoxClient,
+    user: dict[str, Any] | None,
+    *,
+    requires_approval: bool,
+    bindings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    if not user or not user.get("telegram_user_id") or str(user.get("role")) != "user":
+        return user
+    if bindings is None:
+        bindings = await _active_telegram_bindings(telegram)
+        if bindings is None:
+            return user
+    telegram_user_id = str(user["telegram_user_id"])
+    binding = next(
+        (
+            item
+            for item in bindings
+            if str(item.get("telegram_user_id")) == telegram_user_id
+            and bool(int(item.get("enabled") or 0))
+            and not bool(int(item.get("banned") or 0))
+            and str(item.get("account_id") or "").strip()
+        ),
+        None,
+    )
+    if not binding:
+        if str(user.get("binding_sync_status") or "pending") == "pending":
+            return user
+        return await auth.update_user(int(user["id"]), binding_sync_status="pending")
+
+    update: dict[str, Any] = {
+        "account_id": str(binding["account_id"]).strip(),
+        "binding_sync_status": "ready",
+    }
+    auto_approved = not requires_approval and str(user.get("status")) == "pending"
+    if auto_approved:
+        update["status"] = "approved"
+    synced = await auth.update_user(int(user["id"]), **update)
+    if auto_approved:
+        await auth.audit(int(user["id"]), "registration_auto_approved")
+    return synced
 
 
 async def _helper_bot_link(telegram: TeleBoxClient, token: str) -> str | None:
@@ -436,6 +854,7 @@ def _safe_user(user: dict[str, Any] | None) -> dict[str, Any] | None:
         "account_id": user.get("account_id"),
         "binding_sync_status": user.get("binding_sync_status"),
         "legacy_claim_required": bool(user.get("legacy_claim_required")),
+        "ban_reason": user.get("ban_reason"),
         "created_at": user.get("created_at"),
         "approved_at": user.get("approved_at"),
     }
@@ -474,6 +893,69 @@ async def require_admin(
     raise HTTPException(status_code=401, detail={"code": "ADMIN_AUTH_REQUIRED"})
 
 
+def _is_media_owner(item: dict[str, Any], principal: AccessPrincipal) -> bool:
+    if principal.user_id is not None and item.get("owner_user_id") is not None:
+        return int(item["owner_user_id"]) == int(principal.user_id)
+    return bool(
+        item.get("submitter_telegram_user_id")
+        and principal.telegram_user_id
+        and str(item["submitter_telegram_user_id"]) == str(principal.telegram_user_id)
+    )
+
+
+def _sanction_detail(sanction: dict[str, Any], code: str) -> dict[str, Any]:
+    return {
+        "code": code,
+        "sanction_type": sanction.get("sanction_type"),
+        "reason": sanction.get("reason") or "违反平台规则",
+        "expires_at": sanction.get("expires_at"),
+        "permanent": sanction.get("expires_at") is None,
+    }
+
+
+async def _active_sanction(
+    database: Database,
+    principal: AccessPrincipal,
+    *sanction_types: str,
+) -> dict[str, Any] | None:
+    # The recovery ADMIN_KEY principal has no database user and therefore no
+    # sanction record.  Named administrator/superadministrator accounts are
+    # still subject to sanctions created by an authorized superadministrator.
+    if principal.user_id is None:
+        return None
+    return await database.active_user_sanction(int(principal.user_id), sanction_types)
+
+
+def _validated_expiry(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_SANCTION_EXPIRY"}) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=422, detail={"code": "INVALID_SANCTION_EXPIRY"})
+    return parsed.isoformat()
+
+
+async def _assert_can_moderate_user(
+    principal: AccessPrincipal,
+    target: dict[str, Any],
+    auth: AuthStore,
+) -> None:
+    target_id = int(target["id"])
+    if principal.user_id is not None and int(principal.user_id) == target_id:
+        raise HTTPException(status_code=409, detail={"code": "SELF_SANCTION_FORBIDDEN"})
+    target_role = str(target.get("role") or "user")
+    if target_role in {"admin", "superadmin"} and principal.role != "superadmin":
+        raise HTTPException(status_code=403, detail={"code": "SUPERADMIN_REQUIRED"})
+    if target_role == "superadmin" and str(target.get("status")) == "approved" and await auth.superadmin_count() <= 1:
+        raise HTTPException(status_code=409, detail={"code": "LAST_SUPERADMIN_REQUIRED"})
+
+
 async def require_media_access(
     principal: AccessPrincipal | None = Depends(optional_access_principal),
     database: Database = Depends(get_database),
@@ -497,6 +979,30 @@ async def require_media_access(
 require_viewer = require_media_access
 
 
+async def require_upload_access(
+    principal: AccessPrincipal = Depends(require_media_access),
+    database: Database = Depends(get_database),
+) -> AccessPrincipal:
+    sanction = await _active_sanction(database, principal, "login_ban", "upload_mute")
+    if sanction:
+        code = "LOGIN_BANNED" if sanction.get("sanction_type") == "login_ban" else "UPLOAD_MUTED"
+        raise HTTPException(status_code=403, detail=_sanction_detail(sanction, code))
+    return principal
+
+
+async def require_report_access(
+    principal: AccessPrincipal = Depends(require_media_access),
+    database: Database = Depends(get_database),
+) -> AccessPrincipal:
+    sanction = await _active_sanction(database, principal, "login_ban", "report_mute")
+    if sanction:
+        code = "LOGIN_BANNED" if sanction.get("sanction_type") == "login_ban" else "REPORTING_DISABLED"
+        raise HTTPException(status_code=403, detail=_sanction_detail(sanction, code))
+    if principal.user_id is None:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
+    return principal
+
+
 async def authorized_account(
     requested_account: str | None,
     principal: AccessPrincipal,
@@ -511,6 +1017,9 @@ async def authorized_account(
         accounts = (await telegram.accounts()).get("items", [])
         if not any(str(item.get("id")) == requested for item in accounts):
             raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"})
+        # Cross-account message access is allowed only so the public square can
+        # stream approved public media.  indexed_media_for_principal performs
+        # the final public/owner authorization and keeps private rows opaque.
         return requested
     return await telegram.resolve_account(requested_account or settings.telebox_default_account)
 
@@ -543,11 +1052,7 @@ async def indexed_media_for_principal(
         item.get("visibility") == "public"
         and item.get("review_status") == "approved"
         and not item.get("hidden")
-    ) and not (
-        item.get("submitter_telegram_user_id")
-        and str(item.get("submitter_telegram_user_id")) == str(principal.telegram_user_id)
-        and not item.get("hidden")
-    ):
+    ) and not (_is_media_owner(item, principal) and not item.get("hidden")):
         # Do not reveal whether a private message ID exists.
         raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND"})
     return item
@@ -589,14 +1094,42 @@ async def traffic_limit_handler(_: Request, exc: TrafficLimitExceeded) -> JSONRe
     )
 
 
+@app.exception_handler(UploadQuotaExceeded)
+async def upload_quota_handler(_: Request, exc: UploadQuotaExceeded) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": {"code": "UPLOAD_QUOTA_REACHED", **detail},
+            "code": "UPLOAD_QUOTA_REACHED",
+        },
+    )
+
+
 @app.get("/api/status")
 async def public_status(
     database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
     telegram: TeleBoxClient = Depends(get_telegram),
     admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE),
     principal: AccessPrincipal | None = Depends(optional_access_principal),
 ) -> dict:
     tg_status = await telegram.status()
+    registration_enabled, _, _, _, registration_requires_approval = await _registration_config(database)
+    if principal and principal.user_id and not principal.is_admin:
+        user = await _sync_auth_user_binding(
+            auth,
+            telegram,
+            await auth.get_user(principal.user_id),
+            requires_approval=registration_requires_approval,
+        )
+        if user:
+            principal = replace(
+                principal,
+                user_status=str(user.get("status") or principal.user_status),
+                account_id=str(user["account_id"]) if user.get("account_id") else None,
+                binding_sync_status=str(user.get("binding_sync_status") or "pending"),
+            )
     admin_authenticated = bool(principal and principal.is_admin) or signer.verify(admin_cookie, "admin", "control")
     public_enabled, public_key_hash, _ = await _public_album_config(database)
     media_authenticated = bool(principal and (principal.is_admin or (
@@ -629,7 +1162,9 @@ async def public_status(
         "public_key_configured": bool(public_key_hash),
         "public_authenticated": media_authenticated,
         "media_session_id": media_session_id,
-        "registration_enabled": (await _registration_config(database))[0],
+        "registration_enabled": registration_enabled,
+        "registration_requires_approval": registration_requires_approval,
+        "binding_sync_status": principal.binding_sync_status if principal else None,
         "admin_user": {
             "id": principal.user_id,
             "username": principal.username,
@@ -712,18 +1247,24 @@ async def admin_recovery(
 @app.post("/api/auth/register/start")
 async def auth_register_start(
     payload: RegisterPayload,
+    request: Request,
     database: Database = Depends(get_database),
     auth: AuthStore = Depends(get_auth),
     telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict[str, Any]:
-    enabled, key_hash, version, _ = await _registration_config(database)
+    enabled, key_hash, version, _, _ = await _registration_config(database)
     if not enabled:
         raise HTTPException(status_code=403, detail={"code": "REGISTRATION_DISABLED"})
     if not key_hash or not _verify_public_key(payload.registration_key, key_hash):
         await asyncio.sleep(0.2)
         raise HTTPException(status_code=401, detail={"code": "INVALID_REGISTRATION_KEY"})
     try:
-        token, challenge = await auth.register_challenge(payload.username, payload.password)
+        token, challenge = await auth.register_challenge(
+            payload.username,
+            payload.password,
+            browser_id_hash=hash_browser_id(request.headers.get(BROWSER_ID_HEADER, "")),
+            trust_requested=payload.trust_device,
+        )
     except ValueError as exc:
         code = "USERNAME_TAKEN" if "already" in str(exc) else "INVALID_REGISTRATION"
         raise HTTPException(status_code=422, detail={"code": code, "message": str(exc)}) from exc
@@ -748,6 +1289,7 @@ async def auth_login(
     payload: UserPasswordPayload,
     response: Response,
     request: Request,
+    database: Database = Depends(get_database),
     auth: AuthStore = Depends(get_auth),
     telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict[str, Any]:
@@ -761,6 +1303,16 @@ async def auth_login(
         await auth.audit(int(user["id"]) if user else None, "login_failed")
         await asyncio.sleep(0.25)
         raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS"})
+    login_ban = await database.active_user_sanction(int(user["id"]), ["login_ban"])
+    if login_ban:
+        await auth.audit(int(user["id"]), "login_blocked_by_sanction")
+        raise HTTPException(status_code=403, detail=_sanction_detail(login_ban, "LOGIN_BANNED"))
+    user = await _sync_auth_user_binding(
+        auth,
+        telegram,
+        user,
+        requires_approval=(await _registration_config(database))[4],
+    ) or user
     if user.get("status") in {"disabled", "denied"}:
         raise HTTPException(status_code=403, detail={"code": f"AUTH_{str(user['status']).upper()}"})
     browser_id = request.headers.get(BROWSER_ID_HEADER, "")
@@ -817,12 +1369,16 @@ async def auth_device_verify_status(
     request: Request,
     challenge_id: str = Query(min_length=20, max_length=256),
     auth: AuthStore = Depends(get_auth),
+    database: Database = Depends(get_database),
 ) -> dict[str, Any]:
     challenge = await auth.get_challenge(challenge_id, kind="device_verify")
     if not challenge:
         raise HTTPException(status_code=404, detail={"code": "AUTH_CHALLENGE_NOT_FOUND"})
     if challenge["status"] == "claimed":
         user = await auth.get_user(int(challenge["user_id"]))
+        login_ban = await database.active_user_sanction(int(challenge["user_id"]), ["login_ban"])
+        if login_ban:
+            raise HTTPException(status_code=403, detail=_sanction_detail(login_ban, "LOGIN_BANNED"))
         browser_id = request.headers.get(BROWSER_ID_HEADER, "")
         token = await auth.create_session(int(challenge["user_id"]), browser_id, COOKIE_TTL, trust_device=bool(challenge.get("trust_requested")))
         response.set_cookie(AUTH_COOKIE, token, max_age=COOKIE_TTL, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/")
@@ -877,12 +1433,19 @@ async def auth_legacy_claim_status(challenge_id: str = Query(min_length=20, max_
 async def internal_claim_telegram_challenge(
     payload: TelegramChallengeClaimPayload,
     authorization: str | None = Header(default=None),
+    database: Database = Depends(get_database),
     auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict[str, Any]:
     expected = settings.savedstream_internal_token or settings.telebox_api_token
     supplied = (authorization or "").removeprefix("Bearer ").strip()
     if not expected or not supplied or not constant_time_equal(supplied, expected):
         raise HTTPException(status_code=401, detail={"code": "INTERNAL_AUTH_REQUIRED"})
+    existing_user = await auth.get_user_by_telegram(payload.telegram_user_id)
+    if existing_user:
+        login_ban = await database.active_user_sanction(int(existing_user["id"]), ["login_ban"])
+        if login_ban:
+            raise HTTPException(status_code=403, detail=_sanction_detail(login_ban, "LOGIN_BANNED"))
     try:
         challenge = await auth.claim_challenge(
             payload.challenge_token,
@@ -893,7 +1456,62 @@ async def internal_claim_telegram_challenge(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={"code": "TELEGRAM_CHALLENGE_REJECTED", "message": str(exc)}) from exc
-    return {"ok": True, "challenge_id": challenge.get("id"), "status": challenge.get("status"), "user_id": challenge.get("user_id")}
+    user = await auth.get_user(int(challenge["user_id"])) if challenge.get("user_id") else None
+    user = await _sync_auth_user_binding(
+        auth,
+        telegram,
+        user,
+        requires_approval=(await _registration_config(database))[4],
+    )
+    return {
+        "ok": True,
+        "challenge_id": challenge.get("id"),
+        "kind": challenge.get("kind"),
+        "status": challenge.get("status"),
+        "user_id": challenge.get("user_id"),
+        "user": _safe_user(user),
+        "registration_requires_approval": (await _registration_config(database))[4],
+    }
+
+
+@app.get("/api/internal/moderation/users/{telegram_user_id}")
+async def internal_user_moderation(
+    telegram_user_id: str,
+    authorization: str | None = Header(default=None),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+) -> dict[str, Any]:
+    expected = settings.savedstream_internal_token or settings.telebox_api_token
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not expected or not supplied or not constant_time_equal(supplied, expected):
+        raise HTTPException(status_code=401, detail={"code": "INTERNAL_AUTH_REQUIRED"})
+    user = await auth.get_user_by_telegram(telegram_user_id)
+    if not user:
+        return {"known": False, "allowed_auth": True, "allowed_upload": True, "sanctions": []}
+    sanctions = await database.list_user_sanctions(int(user["id"]), active_only=True)
+    legacy_status = str(user.get("status") or "pending")
+    if legacy_status in {"disabled", "denied"}:
+        sanctions = [
+            {
+                "sanction_type": "login_ban",
+                "reason": user.get("ban_reason") or ("账号已禁用" if legacy_status == "disabled" else "账号访问已拒绝"),
+                "expires_at": None,
+                "legacy": True,
+            },
+            *sanctions,
+        ]
+    blocked_types = {str(item.get("sanction_type")) for item in sanctions}
+    return {
+        "known": True,
+        "user_id": int(user["id"]),
+        "role": str(user.get("role") or "user"),
+        "personal_quota_bypass": str(user.get("role") or "user") in {"admin", "superadmin"},
+        "status": legacy_status,
+        "allowed_auth": "login_ban" not in blocked_types,
+        "allowed_upload": not bool(blocked_types & {"login_ban", "upload_mute"}),
+        "allowed_report": not bool(blocked_types & {"login_ban", "report_mute"}),
+        "sanctions": sanctions,
+    }
 
 
 @app.get("/api/public/status")
@@ -1113,6 +1731,7 @@ async def list_media(
     q: str = Query(default="", max_length=100),
     account: str | None = Query(default=None, min_length=1, max_length=40),
     scope: str = Query(default="public", pattern="^(public|private|hidden|all)$"),
+    view: str = Query(default="private", pattern="^(private|square|my_public|liked)$"),
     folder: int | None = Query(default=None, alias="folder_id", ge=0),
     date_from: str | None = Query(default=None, alias="from", max_length=10),
     date_to: str | None = Query(default=None, alias="to", max_length=10),
@@ -1122,6 +1741,7 @@ async def list_media(
 ) -> dict:
     account_id = await account_filter(account, principal, telegram)
     visibility = scope if principal.is_admin else "all"
+    collection = None if principal.is_admin else view
     items, next_cursor, has_more = await database.list_media_index(
         account_id=account_id,
         limit=limit,
@@ -1133,6 +1753,10 @@ async def list_media(
         date_from=date_from,
         date_to=date_to,
         owner_telegram_user_id=None if principal.is_admin else principal.telegram_user_id,
+        owner_user_id=None if principal.is_admin else principal.user_id,
+        collection=collection,
+        viewer_user_id=principal.user_id,
+        include_provenance=bool(principal.is_admin or view == "my_public"),
         folder_id=folder,
     )
     for item in items:
@@ -1144,6 +1768,7 @@ async def list_media(
         "next_cursor": next_cursor,
         "has_more": has_more,
         "scope": visibility,
+        "view": collection,
         "index": await database.get_sync_state(account),
     }
 
@@ -1154,21 +1779,27 @@ async def media_timeline(
     kind: str = Query(default="all", pattern="^(all|video|image|audio|file)$"),
     q: str = Query(default="", max_length=100),
     scope: str = Query(default="public", pattern="^(public|private|hidden|all)$"),
+    view: str = Query(default="private", pattern="^(private|square|my_public|liked)$"),
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> dict:
     account_id = await account_filter(account, principal, telegram)
     visibility = scope if principal.is_admin else "all"
+    collection = None if principal.is_admin else view
     return {
         "account_id": account_id,
         "scope": visibility,
+        "view": collection,
         "years": await database.list_timeline(
             account_id=account_id,
             visibility=visibility,
             kind=kind,
             query=q.strip(),
             owner_telegram_user_id=None if principal.is_admin else principal.telegram_user_id,
+            owner_user_id=None if principal.is_admin else principal.user_id,
+            collection=collection,
+            viewer_user_id=principal.user_id,
         ),
         "index": await database.get_sync_state(account_id) if account_id else None,
     }
@@ -1190,6 +1821,74 @@ async def public_accounts(
         ],
         "default_account": selected_default,
     }
+
+
+@app.put("/api/media/{message_id}/like")
+async def like_media(
+    message_id: int,
+    account: str | None = Query(default=None, min_length=1, max_length=40),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    if principal.user_id is None:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
+    account_id = await authorized_account(account, principal, telegram)
+    item = await database.get_media_index(account_id, message_id, include_provenance=True)
+    if not item or item.get("deleted") or item.get("hidden") or item.get("visibility") != "public" or item.get("review_status") != "approved":
+        raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND"})
+    if _is_media_owner(item, principal):
+        raise HTTPException(status_code=409, detail={"code": "SELF_LIKE_FORBIDDEN"})
+    return await database.set_media_like(int(principal.user_id), account_id, message_id, True)
+
+
+@app.delete("/api/media/{message_id}/like")
+async def unlike_media(
+    message_id: int,
+    account: str | None = Query(default=None, min_length=1, max_length=40),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    if principal.user_id is None:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
+    account_id = await authorized_account(account, principal, telegram)
+    return await database.set_media_like(int(principal.user_id), account_id, message_id, False)
+
+
+@app.post("/api/media/{message_id}/reports", status_code=201)
+async def report_media(
+    message_id: int,
+    payload: MediaReportPayload,
+    account: str | None = Query(default=None, min_length=1, max_length=40),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    principal: AccessPrincipal = Depends(require_report_access),
+) -> dict[str, Any]:
+    account_id = await authorized_account(account, principal, telegram)
+    item = await database.get_media_index(account_id, message_id, include_provenance=True)
+    if not item or item.get("deleted") or item.get("hidden") or item.get("visibility") != "public" or item.get("review_status") != "approved":
+        raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND"})
+    if _is_media_owner(item, principal):
+        raise HTTPException(status_code=409, detail={"code": "SELF_REPORT_FORBIDDEN"})
+    owner_user_id = item.get("owner_user_id")
+    if owner_user_id is None and item.get("submitter_telegram_user_id"):
+        owner = await auth.get_user_by_telegram(str(item["submitter_telegram_user_id"]))
+        owner_user_id = owner.get("id") if owner else None
+    try:
+        report = await database.create_media_report(
+            reporter_user_id=int(principal.user_id),
+            account_id=account_id,
+            message_id=message_id,
+            owner_user_id=int(owner_user_id) if owner_user_id is not None else None,
+            reason_code=payload.reason_code,
+            details=payload.details,
+            media_title=str(item.get("title") or item.get("filename") or message_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": "REPORT_ALREADY_OPEN"}) from exc
+    return {"ok": True, "report_id": report["id"], "status": report["status"]}
 
 
 @app.get("/api/media/{message_id}/thumbnail", dependencies=[Depends(require_viewer)])
@@ -1421,7 +2120,7 @@ async def admin_settings(
     cache_stats = await cache.stats()
     viewer_hash = await database.get_setting("viewer_key_hash", "")
     public_enabled, public_key_hash, public_key_version = await _public_album_config(database)
-    registration_enabled, registration_hash, registration_version, registration_fingerprint = await _registration_config(database)
+    registration_enabled, registration_hash, registration_version, registration_fingerprint, registration_requires_approval = await _registration_config(database)
     try:
         helper_rate_limit = await telegram.helper_bot_rate_limit()
     except (AttributeError, TelegramUnavailable):
@@ -1439,6 +2138,7 @@ async def admin_settings(
         "registration_key_configured": bool(registration_hash),
         "registration_key_version": registration_version,
         "registration_key_fingerprint": registration_fingerprint,
+        "registration_requires_approval": registration_requires_approval,
         "telegram": await telegram.status(),
         "accounts": (await telegram.accounts()).get("items", []),
         "helper_bot": await telegram.helper_bot_status(),
@@ -1466,9 +2166,9 @@ def default_helper_rate_limit() -> dict[str, int]:
 
 
 @app.get("/api/admin/public-album", dependencies=[Depends(require_admin)])
-async def admin_public_album(database: Database = Depends(get_database)) -> dict[str, bool | int]:
+async def admin_public_album(database: Database = Depends(get_database)) -> dict[str, Any]:
     enabled, key_hash, version = await _public_album_config(database)
-    registration_enabled, registration_hash, registration_version, fingerprint = await _registration_config(database)
+    registration_enabled, registration_hash, registration_version, fingerprint, registration_requires_approval = await _registration_config(database)
     return {
         "enabled": enabled,
         "key_configured": bool(key_hash),
@@ -1477,6 +2177,7 @@ async def admin_public_album(database: Database = Depends(get_database)) -> dict
         "registration_key_configured": bool(registration_hash),
         "registration_key_version": registration_version,
         "registration_key_fingerprint": fingerprint,
+        "registration_requires_approval": registration_requires_approval,
     }
 
 
@@ -1484,9 +2185,11 @@ async def admin_public_album(database: Database = Depends(get_database)) -> dict
 async def update_public_album(
     payload: PublicAlbumSettingsPayload,
     database: Database = Depends(get_database),
-) -> dict[str, bool | int]:
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict[str, Any]:
     enabled, album_hash, album_version = await _public_album_config(database)
-    registration_enabled, registration_hash, registration_version, fingerprint = await _registration_config(database)
+    registration_enabled, registration_hash, registration_version, fingerprint, registration_requires_approval = await _registration_config(database)
     if payload.enabled is not None:
         if payload.enabled and not album_hash:
             raise HTTPException(status_code=409, detail={"code": "PUBLIC_KEY_NOT_CONFIGURED"})
@@ -1505,6 +2208,24 @@ async def update_public_album(
             raise HTTPException(status_code=409, detail={"code": "REGISTRATION_KEY_NOT_CONFIGURED"})
         registration_enabled = payload.registration_enabled
         await database.set_setting("public_registration_enabled", "1" if registration_enabled else "0")
+    if payload.registration_requires_approval is not None:
+        registration_requires_approval = payload.registration_requires_approval
+        await database.set_setting(
+            "registration_requires_approval",
+            "1" if registration_requires_approval else "0",
+        )
+        if not registration_requires_approval:
+            bindings = await _active_telegram_bindings(telegram)
+            if bindings is not None:
+                for user in await auth.list_users():
+                    if str(user.get("status")) == "pending":
+                        await _sync_auth_user_binding(
+                            auth,
+                            telegram,
+                            user,
+                            requires_approval=False,
+                            bindings=bindings,
+                        )
     return {
         "enabled": enabled,
         "key_configured": bool(album_hash),
@@ -1513,6 +2234,7 @@ async def update_public_album(
         "registration_key_configured": bool(registration_hash or payload.registration_key),
         "registration_key_version": registration_version,
         "registration_key_fingerprint": fingerprint,
+        "registration_requires_approval": registration_requires_approval,
     }
 
 
@@ -1536,15 +2258,267 @@ async def update_registration_key(
     payload: RegistrationKeyPayload,
     database: Database = Depends(get_database),
 ) -> dict[str, Any]:
-    raw_key = payload.key.strip() if payload.key else secrets.token_urlsafe(32)
-    _, _, current_version, _ = await _registration_config(database)
+    if payload.key is not None:
+        raw_key = payload.key.strip()
+        if not raw_key:
+            raise HTTPException(status_code=422, detail={"code": "REGISTRATION_KEY_REQUIRED"})
+        generated = False
+    elif payload.generate:
+        raw_key = secrets.token_urlsafe(32)
+        generated = True
+    else:
+        raise HTTPException(status_code=422, detail={"code": "REGISTRATION_KEY_REQUIRED"})
+    _, _, current_version, _, _ = await _registration_config(database)
     version = current_version + 1
     fingerprint = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
     await database.set_setting("registration_key_hash", _hash_public_key(raw_key))
     await database.set_setting("registration_key_version", str(version))
     await database.set_setting("registration_key_fingerprint", fingerprint)
     await database.set_setting("public_registration_enabled", "0")
-    return {"key": raw_key, "key_version": version, "fingerprint": fingerprint, "enabled": False}
+    return {
+        "key": raw_key,
+        "key_version": version,
+        "fingerprint": fingerprint,
+        "enabled": False,
+        "generated": generated,
+    }
+
+
+@app.get("/api/admin/reports", dependencies=[Depends(require_admin)])
+async def admin_reports(
+    status_filter: str = Query(default="open", alias="status", pattern="^(open|actionable|processing|resolved|ignored|failed|all)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    return {"items": await database.list_media_reports(status=status_filter, limit=limit), "status": status_filter}
+
+
+@app.post("/api/admin/reports/{report_id}/resolve", dependencies=[Depends(require_admin)])
+async def resolve_admin_report(
+    report_id: int,
+    payload: ReportResolutionPayload,
+    principal: AccessPrincipal = Depends(require_admin),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    cache: DiskCache = Depends(get_cache),
+    indexer: MediaIndexer = Depends(get_indexer),
+) -> dict[str, Any]:
+    report = await database.get_media_report(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail={"code": "REPORT_NOT_FOUND"})
+    account_id = str(report["account_id"])
+    message_id = int(report["message_id"])
+    if str(report.get("status")) not in {"open", "failed"}:
+        raise HTTPException(status_code=409, detail={"code": "REPORT_ALREADY_RESOLVED"})
+    reason = (payload.reason or "").strip()[:1000] or None
+    if payload.resolution == "ignored" and (payload.media_action != "none" or payload.targets):
+        # Reject an internally inconsistent moderation request before moving
+        # every report in the group to the durable processing state.
+        raise HTTPException(status_code=422, detail={"code": "IGNORED_REPORT_CANNOT_APPLY_ACTIONS"})
+    reporters = await database.resolve_media_reports(
+        account_id,
+        message_id,
+        status="processing",
+        action=payload.media_action if payload.resolution == "actioned" else "ignored",
+        reason=reason,
+        resolved_by=principal.user_id,
+    )
+    target_results: list[dict[str, Any]] = []
+    try:
+        if payload.resolution != "ignored":
+            if payload.media_action == "private":
+                item = await database.review_media(
+                    account_id,
+                    message_id,
+                    "revoked",
+                    reason=reason or "举报受理后下架",
+                    reviewed_by=str(principal.user_id or "admin"),
+                )
+                if not item:
+                    raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
+                await _sync_review_outbox_now(indexer)
+            elif payload.media_action == "hidden":
+                item = await database.set_media_hidden(account_id, message_id, True)
+                if not item:
+                    raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
+            elif payload.media_action == "delete":
+                await _delete_review_media(
+                    account_id,
+                    message_id,
+                    reason=reason or "举报受理后删除",
+                    deleted_by=str(principal.user_id or "admin"),
+                    database=database,
+                    telegram=telegram,
+                    cache=cache,
+                )
+            for target_payload in payload.targets:
+                target_results.append(
+                    await _apply_sanction_target(
+                        target_payload=target_payload,
+                        principal=principal,
+                        database=database,
+                        auth=auth,
+                        telegram=telegram,
+                        cache=cache,
+                    )
+                )
+        final_status = "ignored" if payload.resolution == "ignored" else "resolved"
+        await database.resolve_media_reports(
+            account_id,
+            message_id,
+            status=final_status,
+            action=payload.media_action if payload.resolution == "actioned" else "ignored",
+            reason=reason,
+            resolved_by=principal.user_id,
+        )
+    except Exception as exc:
+        await database.resolve_media_reports(
+            account_id,
+            message_id,
+            status="failed",
+            action=payload.media_action,
+            reason=str(exc),
+            resolved_by=principal.user_id,
+        )
+        raise
+
+    reporter_ids = {int(item["reporter_user_id"]) for item in reporters}
+    for reporter_user_id in reporter_ids:
+        await database.create_notification(
+            reporter_user_id,
+            "report",
+            "举报处理完成",
+            "感谢你的反馈。管理员已完成核查。" if payload.resolution == "actioned" else "感谢你的反馈。管理员已完成核查，本次举报已作完结处理。",
+            "/?view=square",
+        )
+    owner_user_id = report.get("owner_user_id")
+    if owner_user_id and payload.resolution == "actioned" and payload.media_action != "none":
+        labels = {"private": "下架并转为私人", "hidden": "隐藏", "delete": "删除"}
+        await database.create_notification(
+            int(owner_user_id),
+            "media",
+            "举报处置通知",
+            f"你的资源“{report.get('media_title') or message_id}”已被管理员{labels.get(payload.media_action, payload.media_action)}。"
+            + (f"理由：{reason}" if reason else ""),
+            "/?view=my_public",
+        )
+    return {
+        "ok": True,
+        "status": "ignored" if payload.resolution == "ignored" else "resolved",
+        "resolved_reports": len(reporters),
+        "targets": target_results,
+    }
+
+
+@app.get("/api/admin/users/{user_id}/sanctions", dependencies=[Depends(require_admin)])
+async def list_admin_user_sanctions(
+    user_id: int,
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+) -> dict[str, Any]:
+    if not await auth.get_user(user_id):
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+    return {
+        "items": await database.list_user_sanctions(user_id),
+        "content_deletion_jobs": await database.list_content_deletion_jobs(target_user_id=user_id),
+    }
+
+
+@app.post("/api/admin/users/{user_id}/sanctions", dependencies=[Depends(require_admin)])
+async def create_admin_user_sanctions(
+    user_id: int,
+    payload: SanctionTargetPayload,
+    principal: AccessPrincipal = Depends(require_admin),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    cache: DiskCache = Depends(get_cache),
+) -> dict[str, Any]:
+    if int(payload.user_id) != int(user_id):
+        raise HTTPException(status_code=422, detail={"code": "SANCTION_TARGET_MISMATCH"})
+    return await _apply_sanction_target(
+        target_payload=payload,
+        principal=principal,
+        database=database,
+        auth=auth,
+        telegram=telegram,
+        cache=cache,
+    )
+
+
+@app.delete("/api/admin/users/{user_id}/sanctions/{sanction_id}", dependencies=[Depends(require_admin)])
+async def revoke_admin_user_sanction(
+    user_id: int,
+    sanction_id: int,
+    principal: AccessPrincipal = Depends(require_admin),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+) -> dict[str, Any]:
+    target = await auth.get_user(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+    await _assert_can_moderate_user(principal, target, auth)
+    sanction = await database.get_user_sanction(sanction_id)
+    if not sanction or int(sanction["user_id"]) != int(user_id):
+        raise HTTPException(status_code=404, detail={"code": "SANCTION_NOT_FOUND"})
+    updated = await database.revoke_user_sanction(sanction_id, revoked_by=principal.user_id)
+    await database.create_notification(user_id, "sanction", "处罚已解除", f"处罚 {sanction['sanction_type']} 已由管理员提前解除。", "/")
+    return {"ok": True, "sanction": updated}
+
+
+@app.post("/api/admin/users/{user_id}/content-deletion", dependencies=[Depends(require_admin)])
+async def create_admin_content_deletion(
+    user_id: int,
+    payload: ContentDeletionPayload,
+    principal: AccessPrincipal = Depends(require_admin),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    cache: DiskCache = Depends(get_cache),
+) -> dict[str, Any]:
+    target = await auth.get_user(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+    await _assert_can_moderate_user(principal, target, auth)
+    return await _schedule_content_deletion(
+        target=target,
+        reason=payload.reason,
+        principal=principal,
+        database=database,
+        telegram=telegram,
+        cache=cache,
+    )
+
+
+@app.get("/api/admin/content-deletion-jobs/{job_id}", dependencies=[Depends(require_admin)])
+async def get_admin_content_deletion_job(
+    job_id: str,
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    job = await database.get_content_deletion_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "CONTENT_DELETION_JOB_NOT_FOUND"})
+    return job
+
+
+@app.post("/api/admin/content-deletion-jobs/{job_id}/retry", dependencies=[Depends(require_admin)])
+async def retry_admin_content_deletion_job(
+    job_id: str,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    cache: DiskCache = Depends(get_cache),
+) -> dict[str, Any]:
+    job = await database.get_content_deletion_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "CONTENT_DELETION_JOB_NOT_FOUND"})
+    task = content_deletion_tasks.get(job_id)
+    if task and not task.done():
+        return job
+    task = asyncio.create_task(_process_content_deletion_job(job_id, database, telegram, cache), name=f"content-deletion-{job_id}")
+    content_deletion_tasks[job_id] = task
+    task.add_done_callback(lambda _: content_deletion_tasks.pop(job_id, None))
+    return job
 
 
 @app.get("/api/admin/media/sync/status", dependencies=[Depends(require_admin)])
@@ -1708,6 +2682,151 @@ async def _delete_review_media(
         include_batch=True,
     )
     return deleted, submitters
+
+
+async def _process_content_deletion_job(
+    job_id: str,
+    database: Database,
+    telegram: TeleBoxClient,
+    cache: DiskCache,
+) -> None:
+    await database.refresh_content_deletion_job(job_id, running=True)
+    last_error: str | None = None
+    cancelled = False
+    try:
+        for entry in await database.pending_content_deletion_items(job_id):
+            account_id = str(entry["account_id"])
+            message_id = int(entry["message_id"])
+            current = await database.get_media_index(
+                account_id,
+                message_id,
+                include_deleted=True,
+                include_provenance=True,
+            )
+            if not current or current.get("deleted"):
+                await database.update_content_deletion_item(
+                    job_id, account_id, message_id, status="completed"
+                )
+                continue
+            try:
+                await _delete_review_media(
+                    account_id,
+                    message_id,
+                    reason=str((await database.get_content_deletion_job(job_id) or {}).get("reason") or "管理员删除全部归属内容"),
+                    deleted_by="admin-content-deletion",
+                    database=database,
+                    telegram=telegram,
+                    cache=cache,
+                )
+                await database.update_content_deletion_item(
+                    job_id, account_id, message_id, status="completed"
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                await database.update_content_deletion_item(
+                    job_id,
+                    account_id,
+                    message_id,
+                    status="failed",
+                    error=last_error,
+                )
+    except asyncio.CancelledError:
+        cancelled = True
+        await database.refresh_content_deletion_job(
+            job_id,
+            running=False,
+            error="job cancelled by shutdown",
+            cancelled=True,
+        )
+        raise
+    finally:
+        if not cancelled:
+            await database.refresh_content_deletion_job(job_id, running=False, error=last_error)
+
+
+async def _schedule_content_deletion(
+    *,
+    target: dict[str, Any],
+    reason: str,
+    principal: AccessPrincipal,
+    database: Database,
+    telegram: TeleBoxClient,
+    cache: DiskCache,
+) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    job = await database.create_content_deletion_job(
+        job_id=job_id,
+        target_user_id=int(target["id"]),
+        telegram_user_id=str(target.get("telegram_user_id") or "") or None,
+        reason=reason,
+        created_by=principal.user_id,
+    )
+    task = asyncio.create_task(
+        _process_content_deletion_job(job_id, database, telegram, cache),
+        name=f"content-deletion-{job_id}",
+    )
+    content_deletion_tasks[job_id] = task
+    task.add_done_callback(lambda _: content_deletion_tasks.pop(job_id, None))
+    return job
+
+
+async def _apply_sanction_target(
+    *,
+    target_payload: SanctionTargetPayload,
+    principal: AccessPrincipal,
+    database: Database,
+    auth: AuthStore,
+    telegram: TeleBoxClient,
+    cache: DiskCache,
+) -> dict[str, Any]:
+    target = await auth.get_user(int(target_payload.user_id))
+    if not target:
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+    await _assert_can_moderate_user(principal, target, auth)
+    created: list[dict[str, Any]] = []
+    for sanction_payload in target_payload.sanctions:
+        sanction = await database.create_user_sanction(
+            user_id=int(target["id"]),
+            sanction_type=sanction_payload.sanction_type,
+            reason=sanction_payload.reason,
+            expires_at=_validated_expiry(sanction_payload.expires_at),
+            created_by=principal.user_id,
+        )
+        created.append(sanction)
+        expiry_label = sanction.get("expires_at") or "永久"
+        await database.create_notification(
+            int(target["id"]),
+            "sanction",
+            "账号处罚通知",
+            f"处罚类型：{sanction['sanction_type']}。理由：{sanction['reason']}。解除时间：{expiry_label}。",
+            "/",
+        )
+        if sanction_payload.sanction_type == "login_ban":
+            await auth.revoke_user_sessions(int(target["id"]))
+            await auth.revoke_user_devices(int(target["id"]))
+    if any(item.sanction_type in {"upload_mute", "login_ban"} for item in target_payload.sanctions):
+        for job in await database.list_upload_jobs(500, owner_user_id=int(target["id"])):
+            if str(job.get("status")) not in {"completed", "failed", "cancelled"}:
+                await _cancel_upload(job, database, telegram)
+        if target.get("telegram_user_id") and hasattr(telegram, "cancel_user_ingest_jobs"):
+            try:
+                await telegram.cancel_user_ingest_jobs(
+                    str(target["telegram_user_id"]),
+                    reason=created[-1]["reason"] if created else "账号受到上传限制",
+                )
+            except Exception:
+                pass
+    deletion_job = None
+    if target_payload.delete_all_content:
+        deletion_job = await _schedule_content_deletion(
+            target=target,
+            reason=created[-1]["reason"] if created else "管理员删除全部归属内容",
+            principal=principal,
+            database=database,
+            telegram=telegram,
+            cache=cache,
+        )
+    return {"user_id": int(target["id"]), "sanctions": created, "content_deletion_job": deletion_job}
 
 
 @app.post("/api/admin/media/{message_id}/review", dependencies=[Depends(require_admin)])
@@ -2215,6 +3334,199 @@ async def admin_backup_cleanup(payload: BackupCleanupPayload) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail={"code": "BACKUP_CLEANUP_FAILED", "message": str(exc)}) from exc
 
 
+# ----------------------------------------------------------------------
+# SavedStream system configuration backups (Telegram disaster recovery)
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/admin/system-backups/settings", dependencies=[Depends(require_admin)])
+async def admin_system_backup_settings(database: Database = Depends(get_database)) -> dict[str, Any]:
+    return _system_backup_public_settings(await database.get_system_backup_settings())
+
+
+@app.put("/api/admin/system-backups/settings", dependencies=[Depends(require_admin)])
+async def update_admin_system_backup_settings(
+    payload: SystemBackupSettingsPayload,
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    try:
+        next_run = next_cron(payload.cron_expr, payload.timezone).isoformat() if payload.enabled else None
+    except SystemBackupError as exc:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_BACKUP_SCHEDULE", "message": str(exc)}) from exc
+    values: dict[str, Any] = {
+        "enabled": 1 if payload.enabled else 0,
+        "cron_expr": payload.cron_expr.strip(),
+        "timezone": payload.timezone.strip(),
+        "account_id": payload.account_id.strip() if payload.account_id else None,
+        "next_run_at": next_run,
+        "last_error": None,
+    }
+    if payload.clear_passphrase:
+        values.update({"passphrase_salt": None, "passphrase_nonce": None, "passphrase_ciphertext": None})
+    elif payload.passphrase:
+        try:
+            wrapped = wrap_passphrase(payload.passphrase, settings.admin_key)
+        except SystemBackupError as exc:
+            raise HTTPException(status_code=409, detail={"code": "ADMIN_KEY_REQUIRED_FOR_BACKUP_PASSWORD", "message": str(exc)}) from exc
+        values.update({
+            "passphrase_salt": wrapped["salt"],
+            "passphrase_nonce": wrapped["nonce"],
+            "passphrase_ciphertext": wrapped["ciphertext"],
+        })
+    return _system_backup_public_settings(await database.update_system_backup_settings(values))
+
+
+@app.get("/api/admin/system-backups", dependencies=[Depends(require_admin)])
+async def list_admin_system_backups(
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    return {"items": await database.list_system_backups()}
+
+
+@app.get("/api/admin/system-backups/jobs/{job_id}", dependencies=[Depends(require_admin)])
+async def get_admin_system_backup_job(job_id: str, database: Database = Depends(get_database)) -> dict[str, Any]:
+    job = await database.get_system_backup_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "BACKUP_JOB_NOT_FOUND"})
+    return job
+
+
+@app.post("/api/admin/system-backups/run", dependencies=[Depends(require_admin)])
+async def run_admin_system_backup(
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    indexer: MediaIndexer = Depends(get_indexer),
+    principal: AccessPrincipal = Depends(require_admin),
+) -> dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    await database.create_system_backup_job({
+        "id": job_id, "backup_id": None, "trigger": "manual", "status": "queued", "phase": "queued",
+        "progress": 0, "attempts": 0, "temp_path": None, "error": None,
+        "created_by": principal.user_id, "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None,
+    })
+    task = asyncio.create_task(_run_system_backup_job(job_id, trigger="manual", database=database, telegram=telegram, indexer=indexer, created_by=principal.user_id), name=f"system-backup-{job_id}")
+    system_backup_tasks[job_id] = task
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/admin/system-backups/import", dependencies=[Depends(require_admin)])
+async def import_admin_system_backup(
+    file: UploadFile = File(...),
+    passphrase: str | None = Query(default=None, min_length=1, max_length=512),
+    passphrase_form: str | None = Form(default=None, min_length=1, max_length=512),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    indexer: MediaIndexer = Depends(get_indexer),
+    principal: AccessPrincipal = Depends(require_admin),
+) -> dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    staging = settings.data_dir / "system-backup-staging" / job_id
+    archive_path = staging / (Path(file.filename or "uploaded.ssbak").name or "uploaded.ssbak")
+    if archive_path.suffix.lower() != ".ssbak":
+        raise HTTPException(status_code=422, detail={"code": "INVALID_BACKUP_FILENAME"})
+    try:
+        await _copy_upload_to_path(file, archive_path)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    backup_id = str(uuid.uuid4())
+    await database.create_system_backup({
+        "id": backup_id, "filename": archive_path.name, "source": "upload", "status": "importing",
+        "created_at": utc_now(), "size_bytes": archive_size(archive_path), "sha256": "", "account_id": None,
+        "message_id": None, "manifest_json": "{}", "error": None, "imported_at": None,
+    })
+    try:
+        effective_passphrase = passphrase_form or passphrase or await _stored_system_backup_passphrase(database)
+    except SystemBackupError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(status_code=422, detail={"code": "BACKUP_PASSPHRASE_REQUIRED", "message": str(exc)}) from exc
+    await database.create_system_backup_job({
+        "id": job_id, "backup_id": backup_id, "trigger": "upload", "status": "queued", "phase": "queued",
+        "progress": 0, "attempts": 0, "temp_path": str(archive_path), "error": None,
+        "created_by": principal.user_id, "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None,
+    })
+    task = asyncio.create_task(_restore_system_backup_archive(job_id, archive_path, database=database, telegram=telegram, indexer=indexer, passphrase=effective_passphrase, backup_id=backup_id), name=f"system-restore-{job_id}")
+    system_backup_tasks[job_id] = task
+    return {"job_id": job_id, "backup_id": backup_id, "status": "queued"}
+
+
+@app.post("/api/admin/system-backups/scan-telegram", dependencies=[Depends(require_admin)])
+async def scan_admin_system_backups(
+    account_id: str | None = Query(default=None, max_length=40),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict[str, Any]:
+    account = await telegram.resolve_account(account_id or settings.telebox_default_account)
+    items = await telegram.list_system_backups(account_id=account)
+    created = 0
+    for item in items:
+        backup_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"savedstream:{account}:{item.get('id')}"))
+        existing = await database.get_system_backup(backup_id)
+        await database.create_system_backup({
+            "id": backup_id,
+            "filename": str(item.get("filename") or f"telegram-{item.get('id')}.ssbak"),
+            "source": "telegram",
+            "status": "available",
+            "created_at": str(item.get("date") or utc_now()),
+            "size_bytes": int(item.get("size") or 0),
+            "sha256": "",
+            "account_id": account,
+            "message_id": int(item.get("id") or 0) or None,
+            "manifest_json": json.dumps({"marker": BACKUP_MARKER, "telegram": item}, ensure_ascii=False),
+            "error": None,
+            "imported_at": existing.get("imported_at") if existing else None,
+        })
+        created += 0 if existing else 1
+    return {"account_id": account, "items": await database.list_system_backups(), "discovered": created}
+
+
+@app.post("/api/admin/system-backups/{backup_id}/restore", dependencies=[Depends(require_admin)])
+async def restore_admin_system_backup(
+    backup_id: str,
+    passphrase: str | None = Query(default=None, min_length=1, max_length=512),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    indexer: MediaIndexer = Depends(get_indexer),
+    principal: AccessPrincipal = Depends(require_admin),
+) -> dict[str, Any]:
+    backup = await database.get_system_backup(backup_id)
+    if not backup:
+        raise HTTPException(status_code=404, detail={"code": "SYSTEM_BACKUP_NOT_FOUND"})
+    if not backup.get("account_id") or not backup.get("message_id"):
+        raise HTTPException(status_code=409, detail={"code": "SYSTEM_BACKUP_NOT_LINKED_TO_TELEGRAM"})
+    try:
+        effective_passphrase = passphrase or await _stored_system_backup_passphrase(database)
+    except SystemBackupError as exc:
+        raise HTTPException(status_code=422, detail={"code": "BACKUP_PASSPHRASE_REQUIRED", "message": str(exc)}) from exc
+    job_id = str(uuid.uuid4())
+    staging = settings.data_dir / "system-backup-staging" / job_id
+    archive_path = staging / str(backup.get("filename") or f"{backup_id}.ssbak")
+    staging.mkdir(parents=True, exist_ok=True)
+    with archive_path.open("wb") as handle:
+        message = {"account_id": backup["account_id"], "id": int(backup["message_id"])}
+        offset = 0
+        expected = max(1, int(backup.get("size_bytes") or 0))
+        try:
+            _message, remote_item = await telegram.get_media_message(str(backup["account_id"]), int(backup["message_id"]))
+            expected = max(expected, int(remote_item.get("size") or 0))
+        except Exception:
+            pass
+        while offset < expected:
+            chunk = await telegram.download_chunk(message, offset, expected)
+            if not chunk:
+                break
+            handle.write(chunk)
+            offset += len(chunk)
+    await database.create_system_backup_job({
+        "id": job_id, "backup_id": backup_id, "trigger": "telegram", "status": "queued", "phase": "queued",
+        "progress": 0, "attempts": 0, "temp_path": str(archive_path), "error": None,
+        "created_by": principal.user_id, "created_at": utc_now(), "updated_at": utc_now(), "completed_at": None,
+    })
+    task = asyncio.create_task(_restore_system_backup_archive(job_id, archive_path, database=database, telegram=telegram, indexer=indexer, passphrase=effective_passphrase, backup_id=backup_id), name=f"system-restore-{job_id}")
+    system_backup_tasks[job_id] = task
+    return {"job_id": job_id, "backup_id": backup_id, "status": "queued"}
+
+
 
 
 # ----------------------------------------------------------------------
@@ -2276,6 +3588,10 @@ async def _process_upload_job(
             mime_type=str(job["mime_type"]),
             progress_callback=on_progress,
         )
+        reservation_key = str(job.get("quota_reservation_key") or "")
+        if reservation_key and hasattr(telegram, "complete_upload_quota"):
+            await telegram.complete_upload_quota(reservation_key)
+            await database.update_upload_job(job_id, quota_reservation_key=None)
         current = await database.get_upload_job(job_id)
         if not current or str(current.get("status")) == "cancelled":
             # The Telegram upload may have reached Saved Messages just before
@@ -2287,16 +3603,45 @@ async def _process_upload_job(
         current = await database.get_upload_job(job_id)
         if not current or str(current.get("status")) == "cancelled":
             return
-        await database.upsert_media_index(item, visibility="private")
+        requested_visibility = str(job.get("requested_visibility") or "private")
+        review_status = str(job.get("review_status") or ("pending" if requested_visibility == "public" else "not_required"))
+        effective_visibility = "public" if requested_visibility == "public" and review_status == "approved" else "private"
+        await database.upsert_media_index(
+            item,
+            visibility=effective_visibility,
+            submitter_telegram_user_id=str(job.get("submitter_telegram_user_id") or "") or None,
+            owner_user_id=int(job["owner_user_id"]) if job.get("owner_user_id") is not None else None,
+            requested_visibility=requested_visibility,
+            review_status=review_status,
+            # Web batches are for upload progress/ownership only.  They are
+            # deliberately not review batches because each dropped file can
+            # choose an independent visibility and moderation decision.
+            review_batch_id=None,
+            upload_source=str(job.get("upload_source") or "web"),
+            upload_batch_id=str(job.get("batch_id") or "") or None,
+        )
         await database.rebuild_timeline(str(job["account_id"]))
         await database.complete_upload_job(job_id, message_id=int(item["id"]))
         # Make the item visible to the next local query immediately, while the
         # normal background worker will reconcile it on its next pass.
         indexer.schedule_sync(str(job["account_id"]), full=False)
     except asyncio.CancelledError:
+        reservation_key = str(job.get("quota_reservation_key") or "")
+        if reservation_key and hasattr(telegram, "release_upload_quota"):
+            try:
+                await telegram.release_upload_quota(reservation_key)
+            except Exception:
+                pass
         await database.update_upload_job(job_id, status="cancelled", phase="cancelled", error="upload cancelled")
         raise
     except Exception as exc:
+        reservation_key = str(job.get("quota_reservation_key") or "")
+        current = await database.get_upload_job(job_id)
+        if reservation_key and current and current.get("quota_reservation_key") and hasattr(telegram, "release_upload_quota"):
+            try:
+                await telegram.release_upload_quota(reservation_key)
+            except Exception:
+                pass
         await database.update_upload_job(job_id, status="failed", phase="failed", error=str(exc), temp_path=None)
     finally:
         try:
@@ -2308,7 +3653,11 @@ async def _process_upload_job(
 def _public_upload_job(job: dict | None) -> dict:
     if not job:
         return {}
-    return {key: value for key, value in job.items() if key != "temp_path"}
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {"temp_path", "quota_reservation_key"}
+    }
 
 
 def _public_traffic_settings(raw: dict) -> dict:
@@ -2403,6 +3752,191 @@ async def reset_traffic_usage(
     return {"ok": True, "scope": scope}
 
 
+def _decode_upload_filename(value: str | None, fallback: str) -> str:
+    decoded = ""
+    if value:
+        try:
+            decoded = base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            decoded = ""
+    decoded = decoded.replace("\\", "/").split("/")[-1]
+    decoded = re.sub(r"[\x00-\x1f\x7f]", "", decoded).strip()
+    return (decoded or fallback)[:240]
+
+
+async def _release_upload_reservation(telegram: TeleBoxClient, reservation_key: str | None) -> None:
+    if reservation_key and hasattr(telegram, "release_upload_quota"):
+        try:
+            await telegram.release_upload_quota(reservation_key)
+        except Exception:
+            pass
+
+
+async def _cancel_upload(
+    job: dict[str, Any],
+    database: Database,
+    telegram: TeleBoxClient,
+) -> dict[str, Any]:
+    job_id = str(job["id"])
+    if str(job.get("status")) in {"completed", "failed", "cancelled"}:
+        return _public_upload_job(job)
+    cancelled = await database.cancel_upload_job(job_id)
+    task = upload_tasks.get(job_id)
+    if task and not task.done():
+        task.cancel()
+    await _release_upload_reservation(telegram, str(job.get("quota_reservation_key") or "") or None)
+    if job.get("temp_path"):
+        try:
+            Path(str(job["temp_path"])).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return _public_upload_job(cancelled or {"id": job_id, "status": "cancelled"})
+
+
+@app.post("/api/uploads", status_code=202)
+async def create_user_upload(
+    request: Request,
+    visibility: str = Query(default="private", pattern="^(public|private)$"),
+    account: str | None = Query(default=None, min_length=1, max_length=40),
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    indexer: MediaIndexer = Depends(get_indexer),
+    traffic: TrafficController = Depends(get_traffic),
+    principal: AccessPrincipal = Depends(require_upload_access),
+) -> dict[str, Any]:
+    if principal.is_admin:
+        account_id = await telegram.resolve_account(account)
+    else:
+        account_id = str(principal.account_id or "").strip()
+        if not account_id:
+            raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+        if account and account != account_id:
+            raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+        accounts = (await telegram.accounts()).get("items", [])
+        if not any(str(item.get("id")) == account_id and str(item.get("state")) == "authenticated" for item in accounts):
+            raise HTTPException(status_code=409, detail={"code": "ACCOUNT_NOT_AUTHENTICATED"})
+    try:
+        expected_size = int(request.headers.get("content-length") or "0")
+    except ValueError as exc:
+        raise HTTPException(status_code=411, detail={"code": "CONTENT_LENGTH_REQUIRED"}) from exc
+    if expected_size <= 0:
+        raise HTTPException(status_code=411, detail={"code": "CONTENT_LENGTH_REQUIRED"})
+
+    job_id = uuid.uuid4().hex
+    batch_id = (request.headers.get("x-upload-batch-id") or uuid.uuid4().hex).strip()[:80]
+    filename = _decode_upload_filename(request.headers.get("x-upload-filename"), f"upload-{job_id}")
+    mime_type = (request.headers.get("x-upload-mime") or request.headers.get("content-type") or "application/octet-stream").strip()[:200]
+    reservation_key: str | None = None
+    if not principal.is_admin:
+        if not principal.telegram_user_id:
+            raise HTTPException(status_code=403, detail={"code": "TELEGRAM_IDENTITY_REQUIRED"})
+        reservation = await telegram.reserve_upload_quota(
+            telegram_user_id=principal.telegram_user_id,
+            batch_id=batch_id,
+            file_count=1,
+            total_bytes=expected_size,
+        )
+        reservation_key = str(reservation.get("reservation_key") or "") or None
+
+    staging_dir = settings.data_dir / "upload-staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        staging_dir.chmod(0o700)
+    except OSError:
+        pass
+    temp_path = staging_dir / f"{job_id}.upload"
+    received = 0
+    bypass_limit = await _admin_traffic_bypass(principal, database)
+    await traffic.start_request("upload", "in")
+    try:
+        descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as target:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > expected_size:
+                    raise HTTPException(status_code=400, detail={"code": "UPLOAD_LENGTH_MISMATCH"})
+                await traffic.consume("in", len(chunk), bypass_limit=bypass_limit)
+                target.write(chunk)
+        if received != expected_size:
+            raise HTTPException(status_code=400, detail={"code": "UPLOAD_LENGTH_MISMATCH"})
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        await _release_upload_reservation(telegram, reservation_key)
+        raise
+    finally:
+        await traffic.finish_request("upload")
+
+    requested_visibility = visibility
+    review_status = "approved" if principal.is_admin and visibility == "public" else "pending" if visibility == "public" else "not_required"
+    try:
+        job = await database.create_upload_job(
+            job_id=job_id,
+            account_id=account_id,
+            filename=filename,
+            mime_type=mime_type,
+            size=received,
+            temp_path=str(temp_path),
+            owner_user_id=principal.user_id,
+            submitter_telegram_user_id=principal.telegram_user_id,
+            requested_visibility=requested_visibility,
+            review_status=review_status,
+            batch_id=batch_id,
+            upload_source="web",
+            quota_reservation_key=reservation_key,
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        await _release_upload_reservation(telegram, reservation_key)
+        raise
+    task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer), name=f"upload-{job_id}")
+    upload_tasks[job_id] = task
+    task.add_done_callback(lambda _: upload_tasks.pop(job_id, None))
+    return _public_upload_job(job)
+
+
+@app.get("/api/uploads")
+async def list_my_uploads(
+    limit: int = Query(default=100, ge=1, le=500),
+    database: Database = Depends(get_database),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    owner_id = None if principal.is_admin else principal.user_id
+    if not principal.is_admin and owner_id is None:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
+    return {"items": [_public_upload_job(item) for item in await database.list_upload_jobs(limit, owner_user_id=owner_id)]}
+
+
+@app.get("/api/uploads/{job_id}")
+async def get_my_upload(
+    job_id: str,
+    database: Database = Depends(get_database),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    job = await database.get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "UPLOAD_NOT_FOUND"})
+    if not principal.is_admin and (principal.user_id is None or int(job.get("owner_user_id") or -1) != int(principal.user_id)):
+        raise HTTPException(status_code=404, detail={"code": "UPLOAD_NOT_FOUND"})
+    return _public_upload_job(job)
+
+
+@app.delete("/api/uploads/{job_id}")
+async def cancel_my_upload(
+    job_id: str,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    job = await database.get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "UPLOAD_NOT_FOUND"})
+    if not principal.is_admin and (principal.user_id is None or int(job.get("owner_user_id") or -1) != int(principal.user_id)):
+        raise HTTPException(status_code=404, detail={"code": "UPLOAD_NOT_FOUND"})
+    return await _cancel_upload(job, database, telegram)
+
+
 @app.post("/api/admin/uploads", dependencies=[Depends(require_admin)])
 async def create_upload(
     file: UploadFile = File(...),
@@ -2411,19 +3945,27 @@ async def create_upload(
     telegram: TeleBoxClient = Depends(get_telegram),
     indexer: MediaIndexer = Depends(get_indexer),
     traffic: TrafficController = Depends(get_traffic),
+    principal: AccessPrincipal = Depends(require_upload_access),
 ) -> dict:
     account_id = await telegram.resolve_account(account)
     staging_dir = settings.data_dir / "upload-staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        staging_dir.chmod(0o700)
+    except OSError:
+        pass
     job_id = uuid.uuid4().hex
-    filename = (file.filename or f"upload-{job_id}").strip()[:240]
+    raw_filename = str(file.filename or "")
+    encoded_filename = base64.urlsafe_b64encode(raw_filename.encode("utf-8")).decode("ascii").rstrip("=")
+    filename = _decode_upload_filename(encoded_filename, f"upload-{job_id}")
     mime_type = (file.content_type or "application/octet-stream").strip()[:200]
     temp_path = staging_dir / f"{job_id}.upload"
     size = 0
-    bypass_limit = await _admin_traffic_bypass(AccessPrincipal(is_admin=True), database)
+    bypass_limit = await _admin_traffic_bypass(principal, database)
     await traffic.start_request("upload", "in")
     try:
-        with temp_path.open("wb") as target:
+        descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as target:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
@@ -2431,7 +3973,7 @@ async def create_upload(
                 await traffic.consume("in", len(chunk), bypass_limit=bypass_limit)
                 target.write(chunk)
                 size += len(chunk)
-    except TrafficLimitExceeded:
+    except Exception:
         temp_path.unlink(missing_ok=True)
         raise
     finally:
@@ -2440,14 +3982,21 @@ async def create_upload(
     if size <= 0:
         temp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail={"code": "EMPTY_UPLOAD"})
-    job = await database.create_upload_job(
-        job_id=job_id,
-        account_id=account_id,
-        filename=filename,
-        mime_type=mime_type,
-        size=size,
-        temp_path=str(temp_path),
-    )
+    try:
+        job = await database.create_upload_job(
+            job_id=job_id,
+            account_id=account_id,
+            filename=filename,
+            mime_type=mime_type,
+            size=size,
+            temp_path=str(temp_path),
+            owner_user_id=principal.user_id,
+            submitter_telegram_user_id=principal.telegram_user_id,
+            upload_source="web_admin_compat",
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
     task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer), name=f"upload-{job_id}")
     upload_tasks[job_id] = task
     task.add_done_callback(lambda _: upload_tasks.pop(job_id, None))
@@ -2463,22 +4012,15 @@ async def get_upload(job_id: str, database: Database = Depends(get_database)) ->
 
 
 @app.delete("/api/admin/uploads/{job_id}", dependencies=[Depends(require_admin)])
-async def cancel_upload(job_id: str, database: Database = Depends(get_database)) -> dict:
+async def cancel_upload(
+    job_id: str,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict:
     job = await database.get_upload_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail={"code": "UPLOAD_NOT_FOUND"})
-    if str(job.get("status")) in {"completed", "failed", "cancelled"}:
-        return _public_upload_job(job)
-    cancelled = await database.cancel_upload_job(job_id)
-    task = upload_tasks.get(job_id)
-    if task and not task.done():
-        task.cancel()
-    if job.get("temp_path"):
-        try:
-            Path(str(job["temp_path"])).unlink(missing_ok=True)
-        except OSError:
-            pass
-    return _public_upload_job(cancelled or {"id": job_id, "status": "cancelled"})
+    return await _cancel_upload(job, database, telegram)
 
 
 @app.put("/api/admin/helper-bot", dependencies=[Depends(require_admin)])
@@ -2562,6 +4104,64 @@ async def remove_binding(
     telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict:
     return await telegram.delete_binding(payload.submitter_id)
+
+
+@app.put("/api/admin/users/{user_id}")
+async def update_auth_user(
+    user_id: int,
+    payload: AdminUserUpdatePayload,
+    principal: AccessPrincipal = Depends(require_admin),
+    database: Database = Depends(get_database),
+    auth: AuthStore = Depends(get_auth),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict[str, Any]:
+    current = await auth.get_user(user_id)
+    if not current:
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+    if payload.role == "superadmin" and principal.role != "superadmin":
+        raise HTTPException(status_code=403, detail={"code": "SUPERADMIN_REQUIRED"})
+    removes_last_superadmin = (
+        str(current.get("role")) == "superadmin"
+        and str(current.get("status")) == "approved"
+        and (payload.role not in {None, "superadmin"} or payload.status in {"pending", "disabled", "denied"})
+    )
+    if removes_last_superadmin and await auth.superadmin_count() <= 1:
+        raise HTTPException(status_code=409, detail={"code": "LAST_SUPERADMIN_REQUIRED"})
+
+    account_id = payload.account_id.strip() if payload.account_id is not None else None
+    if account_id:
+        accounts = (await telegram.accounts()).get("items", [])
+        if not any(str(item.get("id")) == account_id for item in accounts):
+            raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"})
+    updated = await auth.update_user(
+        user_id,
+        status=payload.status,
+        role=payload.role,
+        account_id=account_id,
+        ban_reason=payload.ban_reason,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail={"code": "AUTH_USER_NOT_FOUND"})
+
+    telegram_user_id = str(updated.get("telegram_user_id") or "")
+    if telegram_user_id and payload.status is not None:
+        binding_updater = getattr(telegram, "set_binding_status", None)
+        if binding_updater is not None:
+            await binding_updater(
+                telegram_user_id,
+                enabled=payload.status == "approved",
+                banned=payload.status == "disabled",
+                reason=payload.ban_reason or ("管理员禁用账号" if payload.status == "disabled" else None),
+            )
+    if payload.status == "approved" or account_id:
+        updated = await _sync_auth_user_binding(
+            auth,
+            telegram,
+            updated,
+            requires_approval=(await _registration_config(database))[4],
+        ) or updated
+    await auth.audit(user_id, "admin_user_updated")
+    return _safe_user(updated) or {}
 
 
 @app.put("/api/admin/access-users/{telegram_user_id}", dependencies=[Depends(require_admin)])

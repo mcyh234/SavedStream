@@ -1,6 +1,8 @@
 # SavedStream Private
 
-> Personal private edition. Private changes are pushed only to `origin` (`SavedStream-Private`). The public `upstream` repository remains read-only for syncing public fixes.
+> **快速迭代声明 / Fast iteration notice:** 当前程序处于快速迭代期，使用过程中可能出现各种体验不佳或 bug，欢迎在 GitHub 提交 issue 反馈。
+
+> Personal private edition. This snapshot is published to the public SavedStream repository for collaborative iteration.
 
 ## Encrypted media edition
 
@@ -30,6 +32,11 @@ SavedStream 将 Telegram 收藏夹变成一个可搜索、可播放、支持多�
 - Helper Bot 接收媒体，通过邀请码将提交者固定绑定到目标账号
 - userbot 自动将 Helper Bot 中转的文件写入自己的收藏夹
 - WebUI 配置 Telegram API、扫码登录、Bot Token、邀请码和绑定关系
+- 普通用户使用 SavedStream 用户名/密码登录；注册与新浏览器登录通过 Helper Bot 完成 Telegram 身份确认
+- 管理员可选择新用户是否需要人工审批；关闭审批后，完成 Telegram 身份确认并通过 `/bind` 绑定有效托管账号的用户自动获得访问权限
+- WebUI 支持全页面拖拽/多文件上传，每个文件可独立选择公开或私人，并保留浏览器提供的原始文件名
+- 私人“我的相册”与公开“广场”分离；广场提供标题、点赞、我的公开、我的点赞和快速举报
+- 管理员可受理举报、下架/隐藏/删除资源，并组合设置上传禁用、登录封禁、举报禁用与归属内容删除任务
 - 管理员密钥和可选的媒体库访问口令
 - Docker 双容器部署，TeleBox API 仅在内部网络开放
 - Windows PowerShell 一键上传部署、自动备份、健康检查和失败回滚
@@ -39,11 +46,15 @@ SavedStream 将 Telegram 收藏夹变成一个可搜索、可播放、支持多�
 - **媒体库双视图**：网格 / 列表视图切换（选择持久化）；管理员可多选批量设为公开 / 私有 / 隐藏、删除、移动到文件夹
 - **多级文件夹**：直接在网格 / 列表视图中浏览子文件夹，标题上方完整路径面包屑逐级跳转；管理员可在视图内新建 / 重命名 / 删除（递归）
 - **站内信箱**：审核、删除、可见性变更自动通知；未读红点；管理员可向指定用户或全部用户发信
-- **管理后台 13 个页签**：仪表盘 / 多账号 / 审核 / 用户 / 公开相册 / 媒体库 / 上传 / 流量 / 缓存 / Bot 限流 / 信箱 / 备份 / 存储，配置保存按钮右侧悬浮常驻
+- **管理后台 14 个页签**：仪表盘 / 多账号 / 审核 / 举报受理 / 用户 / 公开相册 / 媒体库 / 上传 / 流量 / 缓存 / Bot 限流 / 信箱 / 备份 / 存储，配置保存按钮右侧悬浮常驻
 - **主题系统**：普通用户界面与后台均可切换 5 套主题
 - **部署备份管理**：管理员 WebUI 查看 / 删除历史备份、保留策略一键清理；`deploy.ps1` 自动轮转（`-KeepBackups`）
+- **服务端配置灾备**：管理员可使用加密 `.ssbak` 归档定时备份 SavedStream/TeleBox 配置到 Telegram 收藏夹，并从本地上传或 Telegram 扫描恢复
 - **存储感知**：磁盘 / 数据卷 / 缓存 / 备份占用快照，自动分级告警与优化建议，经信箱通知管理员
 - **纵向时间线滚轮（桌面端）**：位于侧边栏与主内容之间，鼠标滚轮切换月份，节点悬浮气泡显示日期与数量；移动端不显示
+- **WebUI 多文件入库**：拖拽遮罩、逐文件公开/私人选择、接收/Telegram/索引/待审进度、取消和失败重试；普通用户与 Helper Bot 共用 24 小时文件数、字节数和并发额度
+- **公开广场与互动**：侧栏拆分“我的相册 / 广场 / 我的公开 / 我的点赞”，公开资源支持幂等点赞（禁止自赞）和举报
+- **举报处罚闭环**：举报聚合受理、Telegram 删除失败重试、处罚时长与理由、会话撤销、站内信反馈、可确认归属内容的异步批量删除
 
 > 详细变更记录见 [CHANGELOG.md](CHANGELOG.md)，架构与接口设计见 [PROJECT.md](PROJECT.md)。
 
@@ -73,7 +84,7 @@ Compose 运行两个核心容器：
 - Windows PowerShell 5.1 或 PowerShell 7
 - 一台可通过 SSH 登录的 Linux 服务器
 - 服务器已安装 Docker Engine 和 Docker Compose v2
-- 本地安装 Docker Desktop 时会优先在本机构建 Linux 镜像；没有本地 Docker 时会回退到服务器构建
+- 可选：本地安装 Docker Desktop 构建 Linux 镜像；也可以直接复用 CI/其他机器生成的预构建镜像归档，避免服务器构建
 
 运行：
 
@@ -90,6 +101,21 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 5. 新版本失败时恢复旧代码和数据卷。
 6. 回显管理地址和 `ADMIN_KEY`。
 7. 检测现有 Caddy；端口已被占用时只输出应添加的反代配置。
+
+远程部署会实时显示阶段进度和健康检查进度。默认最多保留最近 2 份备份；可用 `-KeepBackups 1` 保留 1 份。为避免服务器构建，使用预构建镜像归档：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -PrebuiltImageArchive .\tube-images.tgz
+```
+
+生成该归档的示例（可放在 CI 或另一台构建机执行）：
+
+```powershell
+docker save -o .\tube-images.tar savedstream:build telebox-bridge:build
+tar.exe --options gzip:compression-level=3 -czf .\tube-images.tgz .\tube-images.tar
+```
+
+`-PrebuiltImageArchive` 必须是包含 Docker `*.tar` 成员的 gzip tar 归档，且归档内 `RepoTags` 至少包含匹配 `savedstream` 与 `telebox` 的镜像（脚本加载后会自动重标记）。如果未提供预构建归档且本地 Docker 不可用，脚本会自动回退到服务器构建，保证直接运行即可完成部署。
 
 部署连接信息会保存在本机 `deploy.config.json`。SSH 密码使用当前 Windows 用户的 DPAPI 加密，后续直接执行同一条命令即可更新。要重新输入配置：
 
@@ -130,7 +156,11 @@ docker compose ps
 4. 为目标账号生成邀请码。
 5. 提交者私聊 Helper Bot 发送 `/bind <邀请码>`。
 
+“公开相册”管理页还可配置注册密钥、开放/关闭注册，以及“新用户需要管理员审批”开关。注册密钥轮换时可选择系统随机生成或由管理员自定义；该审批开关默认开启，关闭后只有存在有效 `/bind` 账号绑定的用户才会自动获批，未绑定用户不会直接进入媒体库。
+
 完成绑定后，提交者发给 Helper Bot 的图片、视频、音频和文件会自动进入对应账号的收藏夹。
+
+已批准用户也可以在 WebUI 顶栏选择文件或直接将多个文件拖入页面。普通用户选择“公开”时，文件会先以私人状态写入 Telegram 收藏夹并进入审核队列；管理员选择公开时直接公开。WebUI 与 Helper Bot 共用管理页“Bot 限流”中的个人 24 小时文件数、字节数和并发额度，管理员绕过个人额度；服务器月度总流量仍按“流量限额”的 `admin_bypass` 设置执行。
 
 ## 反向代理
 
@@ -139,11 +169,26 @@ SavedStream 默认只监听宿主机回环地址。已有 Caddy 时可加入：
 ```caddyfile
 media.example.com {
     encode zstd gzip
+    request_body {
+        max_size 2GB
+    }
     reverse_proxy 127.0.0.1:8000
 }
 ```
 
-使用 HTTPS 时将 `_src/.env` 中的 `COOKIE_SECURE` 设置为 `true`。代理应保留 `Range` 请求头，否则视频拖动播放会受到影响。
+Nginx 示例中应显式允许大请求体并关闭请求缓冲，避免代理先把整个文件写入自己的临时目录：
+
+```nginx
+location / {
+    client_max_body_size 10g;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://127.0.0.1:8000;
+}
+```
+
+代理允许的请求体应不小于管理页配置的单文件上限，并为 Telegram 入库保留足够的读写超时。使用 HTTPS 时将 `_src/.env` 中的 `COOKIE_SECURE` 设置为 `true`。代理应保留 `Range` 请求头，否则视频拖动播放会受到影响。
 
 ## 数据与安全
 
@@ -170,6 +215,7 @@ python -m pytest -q
 ```bash
 cd _src/frontend
 npm install
+npm test
 npm run build
 ```
 
@@ -178,6 +224,7 @@ TeleBox Bridge：
 ```bash
 cd TeleBox
 npm install
+npm test
 npx tsc --noEmit
 ```
 

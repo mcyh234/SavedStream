@@ -200,3 +200,31 @@ def test_delete_and_binding_ban_requests_are_proxied() -> None:
         assert captured[2].url.path == "/v1/accounts/alpha/media/42"
 
     asyncio.run(verify())
+
+
+def test_system_backup_bridge_methods_are_proxied() -> None:
+    async def verify() -> None:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/export"):
+                return httpx.Response(200, json={"files": []})
+            if request.url.path.endswith("/system-backups"):
+                return httpx.Response(200, json={"items": [{"id": 3}]})
+            return httpx.Response(200, json={"ok": True})
+
+        service = TeleBoxClient(make_settings())
+        service.client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://telebox.test")
+        try:
+            assert await service.export_system_backup() == {"files": []}
+            assert await service.import_system_backup({"files": []}) == {"ok": True}
+            assert await service.list_system_backups(account_id="alpha") == [{"id": 3}]
+        finally:
+            await service.close()
+        assert [request.method for request in captured] == ["GET", "POST", "GET"]
+        assert captured[0].url.path == "/v1/system-backups/export"
+        assert captured[1].url.path == "/v1/system-backups/import"
+        assert captured[2].url.path == "/v1/accounts/alpha/system-backups"
+
+    asyncio.run(verify())

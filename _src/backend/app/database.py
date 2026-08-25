@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import binascii
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,6 +22,7 @@ DEFAULT_HELPER_MAX_FILE_BYTES = 2 * TRAFFIC_GB_BYTES
 DEFAULT_HELPER_GLOBAL_FILES_PER_MINUTE = 30
 DEFAULT_HELPER_MAX_ALBUM_ITEMS = 10
 DEFAULT_HELPER_MAX_ALBUM_BYTES = 2 * TRAFFIC_GB_BYTES
+SYSTEM_BACKUP_MARKER = "#savedstream-system-backup:v1"
 
 AUTH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS auth_users (
@@ -360,6 +362,94 @@ class Database:
                 CREATE INDEX IF NOT EXISTS notifications_created_idx
                 ON notifications(user_id, created_at);
 
+                CREATE TABLE IF NOT EXISTS media_likes (
+                    user_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, account_id, message_id),
+                    FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS media_likes_media_idx
+                ON media_likes(account_id, message_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS media_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reporter_user_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    owner_user_id INTEGER,
+                    reason_code TEXT NOT NULL,
+                    details TEXT,
+                    media_title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','processing','resolved','ignored','failed')),
+                    resolution_action TEXT,
+                    resolution_reason TEXT,
+                    resolved_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    FOREIGN KEY(reporter_user_id) REFERENCES auth_users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(owner_user_id) REFERENCES auth_users(id) ON DELETE SET NULL,
+                    FOREIGN KEY(resolved_by) REFERENCES auth_users(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS media_reports_status_idx
+                ON media_reports(status, account_id, message_id, id);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS media_reports_open_reporter_idx
+                ON media_reports(reporter_user_id, account_id, message_id) WHERE status='open';
+
+                CREATE TABLE IF NOT EXISTS user_sanctions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    sanction_type TEXT NOT NULL CHECK(sanction_type IN ('upload_mute','login_ban','report_mute')),
+                    reason TEXT NOT NULL,
+                    starts_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    created_by INTEGER,
+                    revoked_at TEXT,
+                    revoked_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(created_by) REFERENCES auth_users(id) ON DELETE SET NULL,
+                    FOREIGN KEY(revoked_by) REFERENCES auth_users(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS user_sanctions_active_idx
+                ON user_sanctions(user_id, sanction_type, revoked_at, expires_at);
+
+                CREATE TABLE IF NOT EXISTS content_deletion_jobs (
+                    id TEXT PRIMARY KEY,
+                    target_user_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','partial','failed','cancelled')),
+                    total_items INTEGER NOT NULL DEFAULT 0,
+                    processed_items INTEGER NOT NULL DEFAULT 0,
+                    failed_items INTEGER NOT NULL DEFAULT 0,
+                    created_by INTEGER,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(target_user_id) REFERENCES auth_users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(created_by) REFERENCES auth_users(id) ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS content_deletion_job_items (
+                    job_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','completed','failed')),
+                    error TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(job_id, account_id, message_id),
+                    FOREIGN KEY(job_id) REFERENCES content_deletion_jobs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS content_deletion_jobs_user_idx
+                ON content_deletion_jobs(target_user_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS traffic_usage_buckets (
                     bucket_type TEXT NOT NULL CHECK(bucket_type IN ('day', 'month')),
                     bucket_start TEXT NOT NULL,
@@ -372,6 +462,62 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS traffic_usage_bucket_lookup_idx
                 ON traffic_usage_buckets(bucket_type, bucket_start);
+
+                CREATE TABLE IF NOT EXISTS system_backup_settings (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    cron_expr TEXT NOT NULL DEFAULT '0 3 * * *',
+                    timezone TEXT NOT NULL DEFAULT 'UTC',
+                    account_id TEXT,
+                    passphrase_salt TEXT,
+                    passphrase_nonce TEXT,
+                    passphrase_ciphertext TEXT,
+                    next_run_at TEXT,
+                    last_run_at TEXT,
+                    last_status TEXT NOT NULL DEFAULT 'idle',
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS system_backups (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    source TEXT NOT NULL CHECK(source IN ('scheduled','manual','upload','telegram')),
+                    status TEXT NOT NULL DEFAULT 'available',
+                    created_at TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    account_id TEXT,
+                    message_id INTEGER,
+                    manifest_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
+                    imported_at TEXT,
+                    UNIQUE(account_id, message_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS system_backups_created_idx
+                ON system_backups(created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS system_backup_jobs (
+                    id TEXT PRIMARY KEY,
+                    backup_id TEXT,
+                    trigger TEXT NOT NULL CHECK(trigger IN ('scheduled','manual','upload','telegram')),
+                    status TEXT NOT NULL CHECK(status IN ('queued','running','uploading','downloading','validating','restoring','completed','failed','rolled_back')),
+                    phase TEXT NOT NULL DEFAULT 'queued',
+                    progress REAL NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    temp_path TEXT,
+                    error TEXT,
+                    created_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(backup_id) REFERENCES system_backups(id) ON DELETE SET NULL,
+                    FOREIGN KEY(created_by) REFERENCES auth_users(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS system_backup_jobs_status_idx
+                ON system_backup_jobs(status, updated_at);
 
                 CREATE TABLE IF NOT EXISTS traffic_limit_settings (
                     id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -411,6 +557,25 @@ class Database:
                 await db.execute("ALTER TABLE media_index ADD COLUMN review_batch_id TEXT")
             if "hidden" not in media_columns:
                 await db.execute("ALTER TABLE media_index ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            if "owner_user_id" not in media_columns:
+                await db.execute("ALTER TABLE media_index ADD COLUMN owner_user_id INTEGER")
+            if "upload_source" not in media_columns:
+                await db.execute("ALTER TABLE media_index ADD COLUMN upload_source TEXT NOT NULL DEFAULT 'legacy'")
+            if "upload_batch_id" not in media_columns:
+                await db.execute("ALTER TABLE media_index ADD COLUMN upload_batch_id TEXT")
+            upload_columns_cursor = await db.execute("PRAGMA table_info(upload_jobs)")
+            upload_columns = {str(row[1]) for row in await upload_columns_cursor.fetchall()}
+            for column_name, definition in (
+                ("owner_user_id", "INTEGER"),
+                ("submitter_telegram_user_id", "TEXT"),
+                ("requested_visibility", "TEXT NOT NULL DEFAULT 'private'"),
+                ("review_status", "TEXT NOT NULL DEFAULT 'not_required'"),
+                ("batch_id", "TEXT"),
+                ("upload_source", "TEXT NOT NULL DEFAULT 'web'"),
+                ("quota_reservation_key", "TEXT"),
+            ):
+                if column_name not in upload_columns:
+                    await db.execute(f"ALTER TABLE upload_jobs ADD COLUMN {column_name} {definition}")
             # These indexes reference columns added by migrations above.  They
             # must be created after the ALTER TABLE statements so an upgrade
             # from the pre-review schema does not fail during startup.
@@ -421,6 +586,18 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS media_index_owner_idx "
                 "ON media_index(submitter_telegram_user_id, account_id, deleted, message_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS media_index_owner_user_idx "
+                "ON media_index(owner_user_id, requested_visibility, deleted, message_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS media_index_upload_batch_idx "
+                "ON media_index(upload_batch_id, owner_user_id, deleted)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS upload_jobs_owner_idx "
+                "ON upload_jobs(owner_user_id, created_at)"
             )
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS media_index_ingest_job_idx "
@@ -480,6 +657,7 @@ class Database:
                     ("public_album_key_hash", ""),
                     ("public_album_key_version", "1"),
                     ("public_registration_enabled", "0"),
+                    ("registration_requires_approval", "1"),
                     ("registration_key_hash", ""),
                     ("registration_key_version", "1"),
                     ("registration_key_fingerprint", ""),
@@ -508,6 +686,11 @@ class Database:
                 "CASE WHEN m.status='approved' THEN 'ready' ELSE 'pending' END,1,m.requested_at,m.approved_at,m.last_login_at "
                 "FROM media_users m WHERE NOT EXISTS(SELECT 1 FROM auth_users a WHERE a.telegram_user_id=m.telegram_user_id)"
             )
+            await db.execute(
+                "UPDATE media_index SET owner_user_id=(SELECT a.id FROM auth_users a "
+                "WHERE a.telegram_user_id=media_index.submitter_telegram_user_id) "
+                "WHERE owner_user_id IS NULL AND submitter_telegram_user_id IS NOT NULL"
+            )
             # Old one-time web sessions are intentionally invalidated on the
             # first upgraded startup.  The legacy claim flow replaces them.
             await db.execute("DELETE FROM access_sessions")
@@ -523,6 +706,10 @@ class Database:
                     "UTC",
                     _now(),
                 ),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO system_backup_settings(id,updated_at) VALUES(1,?)",
+                (_now(),),
             )
             await db.commit()
 
@@ -540,6 +727,112 @@ class Database:
                 (key, value),
             )
             await db.commit()
+
+    async def get_system_backup_settings(self) -> dict[str, Any]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM system_backup_settings WHERE id=1")
+            row = await cursor.fetchone()
+        return dict(row) if row else {
+            "id": 1,
+            "enabled": 0,
+            "cron_expr": "0 3 * * *",
+            "timezone": "UTC",
+            "account_id": None,
+            "passphrase_salt": None,
+            "passphrase_nonce": None,
+            "passphrase_ciphertext": None,
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": "idle",
+            "last_error": None,
+            "updated_at": _now(),
+        }
+
+    async def update_system_backup_settings(self, values: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "enabled", "cron_expr", "timezone", "account_id", "passphrase_salt",
+            "passphrase_nonce", "passphrase_ciphertext", "next_run_at", "last_run_at",
+            "last_status", "last_error",
+        }
+        values = {key: value for key, value in values.items() if key in allowed}
+        values["updated_at"] = _now()
+        assignments = ",".join(f"{key}=?" for key in values)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"UPDATE system_backup_settings SET {assignments} WHERE id=1",
+                tuple(values.values()),
+            )
+            await db.commit()
+        return await self.get_system_backup_settings()
+
+    async def create_system_backup(self, item: dict[str, Any]) -> dict[str, Any]:
+        fields = [
+            "id", "filename", "source", "status", "created_at", "size_bytes", "sha256",
+            "account_id", "message_id", "manifest_json", "error", "imported_at",
+        ]
+        values = [item.get(field) for field in fields]
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"INSERT INTO system_backups({','.join(fields)}) VALUES({','.join('?' for _ in fields)}) "
+                "ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,status=excluded.status,"
+                "size_bytes=excluded.size_bytes,sha256=excluded.sha256,account_id=excluded.account_id,"
+                "message_id=excluded.message_id,manifest_json=excluded.manifest_json,error=excluded.error,"
+                "imported_at=excluded.imported_at",
+                values,
+            )
+            await db.commit()
+        return await self.get_system_backup(str(item["id"])) or dict(item)
+
+    async def get_system_backup(self, backup_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM system_backups WHERE id=?", (backup_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_system_backups(self, limit: int = 200) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM system_backups ORDER BY created_at DESC LIMIT ?", (max(1, min(1000, limit)),))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def update_system_backup(self, backup_id: str, **values: Any) -> dict[str, Any] | None:
+        allowed = {"filename", "status", "size_bytes", "sha256", "account_id", "message_id", "manifest_json", "error", "imported_at"}
+        values = {key: value for key, value in values.items() if key in allowed}
+        if not values:
+            return await self.get_system_backup(backup_id)
+        assignments = ",".join(f"{key}=?" for key in values)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(f"UPDATE system_backups SET {assignments} WHERE id=?", (*values.values(), backup_id))
+            await db.commit()
+        return await self.get_system_backup(backup_id)
+
+    async def create_system_backup_job(self, item: dict[str, Any]) -> dict[str, Any]:
+        fields = ["id", "backup_id", "trigger", "status", "phase", "progress", "attempts", "temp_path", "error", "created_by", "created_at", "updated_at", "completed_at"]
+        values = [item.get(field) for field in fields]
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(f"INSERT INTO system_backup_jobs({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", values)
+            await db.commit()
+        return await self.get_system_backup_job(str(item["id"])) or dict(item)
+
+    async def get_system_backup_job(self, job_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM system_backup_jobs WHERE id=?", (job_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_system_backup_job(self, job_id: str, **values: Any) -> dict[str, Any] | None:
+        values = {key: value for key, value in values.items() if key in {"backup_id", "status", "phase", "progress", "attempts", "temp_path", "error", "updated_at", "completed_at"}}
+        values.setdefault("updated_at", _now())
+        if not values:
+            return await self.get_system_backup_job(job_id)
+        assignments = ",".join(f"{key}=?" for key in values)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(f"UPDATE system_backup_jobs SET {assignments} WHERE id=?", (*values.values(), job_id))
+            await db.commit()
+        return await self.get_system_backup_job(job_id)
 
     async def update_access_settings(
         self, *, cache_max_bytes: int, access_restricted: bool, viewer_key_hash: str
@@ -825,6 +1118,9 @@ class Database:
         raw["has_thumbnail"] = bool(raw["has_thumbnail"])
         raw["deleted"] = bool(raw["deleted"])
         raw["hidden"] = bool(raw.get("hidden"))
+        raw["like_count"] = int(raw.get("like_count") or 0)
+        raw["liked_by_me"] = bool(raw.get("liked_by_me"))
+        raw["owned_by_me"] = bool(raw.get("owned_by_me"))
         if raw["hidden"]:
             raw["visibility"] = "hidden"
         raw["duration"] = float(raw["duration"]) if raw["duration"] is not None else None
@@ -834,10 +1130,21 @@ class Database:
         raw["title"] = raw.get("title") or raw["original_title"]
         if not include_provenance:
             # Provenance is used for server-side reconciliation and must not
-            # leak Telegram user IDs through public gallery responses.
+            # leak Telegram user IDs or internal moderation metadata through
+            # the private/square/liked gallery responses.  ``my_public`` and
+            # administrator views explicitly opt in so they can render the
+            # user's review state and reason.
             raw.pop("source_ingest_job_id", None)
             raw.pop("submitter_telegram_user_id", None)
+            raw.pop("owner_user_id", None)
+            raw.pop("requested_visibility", None)
+            raw.pop("review_status", None)
+            raw.pop("review_reason", None)
+            raw.pop("reviewed_at", None)
             raw.pop("reviewed_by", None)
+            raw.pop("review_batch_id", None)
+            raw.pop("upload_source", None)
+            raw.pop("upload_batch_id", None)
         return raw
 
     async def upsert_media_index(
@@ -847,9 +1154,12 @@ class Database:
         *,
         source_ingest_job_id: int | None = None,
         submitter_telegram_user_id: str | None = None,
+        owner_user_id: int | None = None,
         requested_visibility: str | None = None,
         review_status: str | None = None,
         review_batch_id: str | None = None,
+        upload_source: str | None = None,
+        upload_batch_id: str | None = None,
         hidden: bool = False,
     ) -> dict[str, Any]:
         account_id = str(item["account_id"])
@@ -871,21 +1181,36 @@ class Database:
         )
         if status not in {"not_required", "pending", "approved", "rejected", "revoked"}:
             status = "not_required"
+        is_system_backup = SYSTEM_BACKUP_MARKER in str(item.get("caption") or "") or str(item.get("filename") or "").endswith(".ssbak")
+        if is_system_backup:
+            effective_visibility = "private"
+            requested = "private"
+            status = "not_required"
+            hidden = True
+            upload_source = "system_backup"
         # Helper Bot public requests are never exposed before an explicit
         # administrator approval.  The legacy compatibility path above is
         # retained only for callers that omit review metadata entirely.
         if source_ingest_job_id is not None and status != "approved":
             effective_visibility = "private"
         async with aiosqlite.connect(self.path) as db:
+            if owner_user_id is None and submitter_telegram_user_id:
+                owner_cursor = await db.execute(
+                    "SELECT id FROM auth_users WHERE telegram_user_id=?",
+                    (str(submitter_telegram_user_id),),
+                )
+                owner_row = await owner_cursor.fetchone()
+                if owner_row:
+                    owner_user_id = int(owner_row[0])
             await db.execute(
                 """
                 INSERT INTO media_index(
                     account_id,message_id,kind,mime_type,size,filename,original_title,caption,message_date,
                     date_year,date_month,date_day,duration,width,height,has_thumbnail,visibility,hidden,deleted,indexed_at,last_seen_at,
-                    source_ingest_job_id,submitter_telegram_user_id,requested_visibility,review_status,review_batch_id
+                    source_ingest_job_id,submitter_telegram_user_id,owner_user_id,requested_visibility,review_status,review_batch_id,upload_source,upload_batch_id
                 ) VALUES(
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE(?, 'private'), ?, 0, ?, ?, ?, ?, ?, ?, ?
+                    COALESCE(?, 'private'), ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(account_id,message_id) DO UPDATE SET
                     kind=excluded.kind,
@@ -916,6 +1241,7 @@ class Database:
                     END,
                     source_ingest_job_id=COALESCE(media_index.source_ingest_job_id, excluded.source_ingest_job_id),
                     submitter_telegram_user_id=COALESCE(media_index.submitter_telegram_user_id, excluded.submitter_telegram_user_id),
+                    owner_user_id=COALESCE(media_index.owner_user_id, excluded.owner_user_id),
                     requested_visibility=CASE
                         WHEN media_index.source_ingest_job_id IS NULL
                              AND excluded.source_ingest_job_id IS NOT NULL
@@ -929,6 +1255,11 @@ class Database:
                         ELSE media_index.review_status
                     END,
                     review_batch_id=COALESCE(media_index.review_batch_id, excluded.review_batch_id),
+                    upload_source=CASE
+                        WHEN media_index.upload_source='legacy' THEN excluded.upload_source
+                        ELSE media_index.upload_source
+                    END,
+                    upload_batch_id=COALESCE(media_index.upload_batch_id, excluded.upload_batch_id),
                     -- A policy-deleted/tombstoned row must not be resurrected by
                     -- a later Telegram index pass.  Telegram message IDs are
                     -- stable within Saved Messages, so a row marked deleted is
@@ -960,9 +1291,12 @@ class Database:
                     now,
                     int(source_ingest_job_id) if source_ingest_job_id is not None else None,
                     str(submitter_telegram_user_id) if submitter_telegram_user_id else None,
+                    int(owner_user_id) if owner_user_id is not None else None,
                     requested,
                     status,
                     review_batch_id,
+                    str(upload_source or item.get("upload_source") or ("helper_bot" if source_ingest_job_id is not None else "legacy"))[:40],
+                    str(upload_batch_id or item.get("upload_batch_id") or "")[:120] or None,
                 ),
             )
             await db.commit()
@@ -975,7 +1309,7 @@ class Database:
             account_id,
             message_id,
             include_deleted=True,
-            include_provenance=bool(source_ingest_job_id),
+            include_provenance=bool(source_ingest_job_id or owner_user_id),
         )
         assert result is not None
         return result
@@ -1099,7 +1433,10 @@ class Database:
         date_from: str | None = None,
         date_to: str | None = None,
         owner_telegram_user_id: str | None = None,
+        owner_user_id: int | None = None,
         owner_account_id: str | None = None,
+        collection: str | None = None,
+        viewer_user_id: int | None = None,
         include_provenance: bool = False,
         folder_id: int | None = None,
     ) -> tuple[list[dict[str, Any]], str | int | None, bool]:
@@ -1108,7 +1445,33 @@ class Database:
         if account_id:
             clauses.append("m.account_id=?")
             params.append(account_id)
-        if visibility == "public":
+        owner_clause = "(m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?))"
+        if collection == "square":
+            clauses.extend(["m.visibility='public'", "m.review_status='approved'", "m.hidden=0"])
+        elif collection == "private":
+            if owner_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([owner_clause, "m.requested_visibility='private'", "m.visibility='private'", "m.hidden=0"])
+                params.extend([int(owner_user_id), str(owner_telegram_user_id or "")])
+        elif collection == "my_public":
+            if owner_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([owner_clause, "m.requested_visibility='public'", "m.hidden=0"])
+                params.extend([int(owner_user_id), str(owner_telegram_user_id or "")])
+        elif collection == "liked":
+            if viewer_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([
+                    "m.visibility='public'",
+                    "m.review_status='approved'",
+                    "m.hidden=0",
+                    "EXISTS(SELECT 1 FROM media_likes ml WHERE ml.user_id=? AND ml.account_id=m.account_id AND ml.message_id=m.message_id)",
+                ])
+                params.append(int(viewer_user_id))
+        elif visibility == "public":
             clauses.extend(["m.visibility='public'", "m.review_status='approved'", "m.hidden=0"])
         elif visibility == "private":
             clauses.extend(["m.visibility='private'", "m.hidden=0"])
@@ -1166,12 +1529,16 @@ class Database:
         params.append(int(limit) + 1)
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
+            viewer_id = int(viewer_user_id) if viewer_user_id is not None else -1
             cursor_obj = await db.execute(
-                "SELECT m.*, t.local_title, COALESCE(NULLIF(t.local_title,''), m.original_title) AS title "
+                "SELECT m.*, t.local_title, COALESCE(NULLIF(t.local_title,''), m.original_title) AS title, "
+                "(SELECT COUNT(*) FROM media_likes lc WHERE lc.account_id=m.account_id AND lc.message_id=m.message_id) AS like_count, "
+                "EXISTS(SELECT 1 FROM media_likes lm WHERE lm.user_id=? AND lm.account_id=m.account_id AND lm.message_id=m.message_id) AS liked_by_me, "
+                "CASE WHEN m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?) THEN 1 ELSE 0 END AS owned_by_me "
                 "FROM media_index m LEFT JOIN media_metadata_v2 t ON t.account_id=m.account_id AND t.message_id=m.message_id "
                 f"{fts_join} {folder_join} "
                 f"WHERE {' AND '.join(clauses)} ORDER BY m.message_id {direction}, m.account_id {direction} LIMIT ?",
-                params,
+                [viewer_id, viewer_id, str(owner_telegram_user_id or ""), *params],
             )
             rows = await cursor_obj.fetchall()
         has_more = len(rows) > limit
@@ -1213,8 +1580,11 @@ class Database:
         kind: str = "all",
         query: str = "",
         owner_telegram_user_id: str | None = None,
+        owner_user_id: int | None = None,
+        collection: str | None = None,
+        viewer_user_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        if account_id and not owner_telegram_user_id and kind == "all" and not query.strip() and visibility in {"public", "private"}:
+        if account_id and collection is None and not owner_telegram_user_id and kind == "all" and not query.strip() and visibility in {"public", "private"}:
             clauses = ["account_id=?"]
             params: list[Any] = [account_id]
             clauses.append("visibility=?")
@@ -1235,7 +1605,33 @@ class Database:
         if account_id:
             clauses.append("m.account_id=?")
             params.append(account_id)
-        if visibility == "public":
+        owner_clause = "(m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?))"
+        if collection == "square":
+            clauses.extend(["m.visibility='public'", "m.review_status='approved'", "m.hidden=0"])
+        elif collection == "private":
+            if owner_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([owner_clause, "m.requested_visibility='private'", "m.visibility='private'", "m.hidden=0"])
+                params.extend([int(owner_user_id), str(owner_telegram_user_id or "")])
+        elif collection == "my_public":
+            if owner_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([owner_clause, "m.requested_visibility='public'", "m.hidden=0"])
+                params.extend([int(owner_user_id), str(owner_telegram_user_id or "")])
+        elif collection == "liked":
+            if viewer_user_id is None:
+                clauses.append("1=0")
+            else:
+                clauses.extend([
+                    "m.visibility='public'",
+                    "m.review_status='approved'",
+                    "m.hidden=0",
+                    "EXISTS(SELECT 1 FROM media_likes ml WHERE ml.user_id=? AND ml.account_id=m.account_id AND ml.message_id=m.message_id)",
+                ])
+                params.append(int(viewer_user_id))
+        elif visibility == "public":
             clauses.extend(["m.visibility='public'", "m.review_status='approved'", "m.hidden=0"])
         elif visibility == "private":
             clauses.extend(["m.visibility='private'", "m.hidden=0"])
@@ -1428,6 +1824,10 @@ class Database:
                 )
                 await db.execute(
                     "DELETE FROM media_metadata_v2 WHERE account_id=? AND message_id=?",
+                    (account_id, int(target["message_id"])),
+                )
+                await db.execute(
+                    "DELETE FROM media_likes WHERE account_id=? AND message_id=?",
                     (account_id, int(target["message_id"])),
                 )
                 if account_id == "default":
@@ -1771,20 +2171,53 @@ class Database:
         return current
 
     async def create_upload_job(
-        self, *, job_id: str, account_id: str, filename: str, mime_type: str, size: int, temp_path: str
+        self,
+        *,
+        job_id: str,
+        account_id: str,
+        filename: str,
+        mime_type: str,
+        size: int,
+        temp_path: str,
+        owner_user_id: int | None = None,
+        submitter_telegram_user_id: str | None = None,
+        requested_visibility: str = "private",
+        review_status: str = "not_required",
+        batch_id: str | None = None,
+        upload_source: str = "web",
+        quota_reservation_key: str | None = None,
     ) -> dict[str, Any]:
+        if requested_visibility not in {"public", "private"}:
+            raise ValueError("invalid requested visibility")
         now = _now()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO upload_jobs(id,account_id,filename,mime_type,size,status,phase,progress,bytes_sent,temp_path,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued','receiving',0,0,?,?,?)",
-                (job_id, account_id, filename, mime_type, int(size), temp_path, now, now),
+                "INSERT INTO upload_jobs(id,account_id,filename,mime_type,size,status,phase,progress,bytes_sent,temp_path,"
+                "owner_user_id,submitter_telegram_user_id,requested_visibility,review_status,batch_id,upload_source,quota_reservation_key,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'queued','receiving',0,0,?,?,?,?,?,?,?,?, ?,?)",
+                (
+                    job_id,
+                    account_id,
+                    filename,
+                    mime_type,
+                    int(size),
+                    temp_path,
+                    int(owner_user_id) if owner_user_id is not None else None,
+                    str(submitter_telegram_user_id) if submitter_telegram_user_id else None,
+                    requested_visibility,
+                    review_status,
+                    batch_id,
+                    str(upload_source)[:40],
+                    quota_reservation_key,
+                    now,
+                    now,
+                ),
             )
             await db.commit()
         return await self.get_upload_job(job_id)  # type: ignore[return-value]
 
     async def update_upload_job(self, job_id: str, **updates: Any) -> dict[str, Any] | None:
-        allowed = {"status", "phase", "progress", "bytes_sent", "message_id", "error", "temp_path"}
+        allowed = {"status", "phase", "progress", "bytes_sent", "message_id", "error", "temp_path", "quota_reservation_key"}
         updates = {key: value for key, value in updates.items() if key in allowed}
         if not updates:
             return await self.get_upload_job(job_id)
@@ -1841,11 +2274,422 @@ class Database:
             row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def list_upload_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def list_upload_jobs(self, limit: int = 100, *, owner_user_id: int | None = None) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM upload_jobs ORDER BY created_at DESC LIMIT ?", (int(limit),))
+            if owner_user_id is None:
+                cursor = await db.execute("SELECT * FROM upload_jobs ORDER BY created_at DESC LIMIT ?", (int(limit),))
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM upload_jobs WHERE owner_user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (int(owner_user_id), int(limit)),
+                )
             return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Public square: likes, reports, sanctions, and moderation jobs
+    # ------------------------------------------------------------------
+
+    async def media_social_state(self, account_id: str, message_id: int, viewer_user_id: int | None) -> dict[str, Any]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS like_count, "
+                "EXISTS(SELECT 1 FROM media_likes WHERE user_id=? AND account_id=? AND message_id=?) AS liked_by_me "
+                "FROM media_likes WHERE account_id=? AND message_id=?",
+                (int(viewer_user_id or -1), account_id, int(message_id), account_id, int(message_id)),
+            )
+            row = await cursor.fetchone()
+        return {
+            "like_count": int(row["like_count"] if row else 0),
+            "liked_by_me": bool(row["liked_by_me"] if row else 0),
+        }
+
+    async def set_media_like(self, user_id: int, account_id: str, message_id: int, liked: bool) -> dict[str, Any]:
+        async with aiosqlite.connect(self.path) as db:
+            if liked:
+                await db.execute(
+                    "INSERT OR IGNORE INTO media_likes(user_id,account_id,message_id,created_at) VALUES(?,?,?,?)",
+                    (int(user_id), account_id, int(message_id), _now()),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM media_likes WHERE user_id=? AND account_id=? AND message_id=?",
+                    (int(user_id), account_id, int(message_id)),
+                )
+            await db.commit()
+        return await self.media_social_state(account_id, message_id, user_id)
+
+    async def create_media_report(
+        self,
+        *,
+        reporter_user_id: int,
+        account_id: str,
+        message_id: int,
+        owner_user_id: int | None,
+        reason_code: str,
+        details: str | None,
+        media_title: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        try:
+            async with aiosqlite.connect(self.path) as db:
+                # Keep the duplicate check and insert under one write lock so
+                # a reporter cannot create a second unfinished report while
+                # the first one is processing or waiting for a failed action
+                # to be retried.
+                await db.execute("BEGIN IMMEDIATE")
+                existing = await db.execute(
+                    "SELECT id FROM media_reports WHERE reporter_user_id=? AND account_id=? AND message_id=? "
+                    "AND status IN ('open','processing','failed') LIMIT 1",
+                    (int(reporter_user_id), account_id, int(message_id)),
+                )
+                if await existing.fetchone():
+                    await db.rollback()
+                    raise ValueError("duplicate unfinished report")
+                cursor = await db.execute(
+                    "INSERT INTO media_reports(reporter_user_id,account_id,message_id,owner_user_id,reason_code,details,media_title,status,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,'open',?)",
+                    (
+                        int(reporter_user_id),
+                        account_id,
+                        int(message_id),
+                        int(owner_user_id) if owner_user_id is not None else None,
+                        str(reason_code)[:40],
+                        (details or "").strip()[:1000] or None,
+                        str(media_title)[:200],
+                        now,
+                    ),
+                )
+                report_id = int(cursor.lastrowid)
+                await db.commit()
+        except ValueError:
+            raise
+        except (sqlite3.IntegrityError, aiosqlite.IntegrityError) as exc:
+            raise ValueError("duplicate open report") from exc
+        report = await self.get_media_report(report_id)
+        assert report is not None
+        return report
+
+    async def get_media_report(self, report_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT r.*,COALESCE(ru.username_display,ru.username_normalized,ru.display_name,'#' || r.reporter_user_id) AS reporter_name,"
+                "COALESCE(ou.username_display,ou.username_normalized,ou.display_name,'') AS owner_name "
+                "FROM media_reports r LEFT JOIN auth_users ru ON ru.id=r.reporter_user_id "
+                "LEFT JOIN auth_users ou ON ou.id=r.owner_user_id WHERE r.id=?",
+                (int(report_id),),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_media_reports(self, *, status: str = "open", limit: int = 200) -> list[dict[str, Any]]:
+        if status not in {"open", "actionable", "processing", "resolved", "ignored", "failed", "all"}:
+            raise ValueError("invalid report status")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status == "actionable":
+            clauses.append("r.status IN ('open','failed')")
+        elif status != "all":
+            clauses.append("r.status=?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(1000, int(limit))))
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT r.*,COALESCE(ru.username_display,ru.username_normalized,ru.display_name,'#' || r.reporter_user_id) AS reporter_name,"
+                "COALESCE(ou.username_display,ou.username_normalized,ou.display_name,'') AS owner_name,"
+                "m.visibility,m.hidden,m.deleted,m.review_status "
+                "FROM media_reports r LEFT JOIN auth_users ru ON ru.id=r.reporter_user_id "
+                "LEFT JOIN auth_users ou ON ou.id=r.owner_user_id "
+                "LEFT JOIN media_index m ON m.account_id=r.account_id AND m.message_id=r.message_id "
+                f"{where} ORDER BY r.id DESC LIMIT ?",
+                params,
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+        groups: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row["account_id"]), int(row["message_id"]))
+            group = groups.setdefault(
+                key,
+                {
+                    "account_id": key[0],
+                    "message_id": key[1],
+                    "media_title": row.get("media_title"),
+                    "owner_user_id": row.get("owner_user_id"),
+                    "owner_name": row.get("owner_name"),
+                    "visibility": "hidden" if row.get("hidden") else row.get("visibility"),
+                    "deleted": bool(row.get("deleted")),
+                    "review_status": row.get("review_status"),
+                    "reports": [],
+                    "report_count": 0,
+                },
+            )
+            group["reports"].append(row)
+            group["report_count"] += 1
+        return list(groups.values())
+
+    async def resolve_media_reports(
+        self,
+        account_id: str,
+        message_id: int,
+        *,
+        status: str,
+        action: str,
+        reason: str | None,
+        resolved_by: int | None,
+    ) -> list[dict[str, Any]]:
+        if status not in {"resolved", "ignored", "failed", "processing"}:
+            raise ValueError("invalid report resolution status")
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM media_reports WHERE account_id=? AND message_id=? AND status IN ('open','processing','failed') ORDER BY id",
+                (account_id, int(message_id)),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            if rows:
+                await db.execute(
+                    "UPDATE media_reports SET status=?,resolution_action=?,resolution_reason=?,resolved_by=?,resolved_at=? "
+                    "WHERE account_id=? AND message_id=? AND status IN ('open','processing','failed')",
+                    (
+                        status,
+                        str(action)[:40],
+                        (reason or "").strip()[:1000] or None,
+                        int(resolved_by) if resolved_by is not None else None,
+                        now if status in {"resolved", "ignored"} else None,
+                        account_id,
+                        int(message_id),
+                    ),
+                )
+                await db.commit()
+        return rows
+
+    async def create_user_sanction(
+        self,
+        *,
+        user_id: int,
+        sanction_type: str,
+        reason: str,
+        expires_at: str | None,
+        created_by: int | None,
+    ) -> dict[str, Any]:
+        if sanction_type not in {"upload_mute", "login_ban", "report_mute"}:
+            raise ValueError("invalid sanction type")
+        now = _now()
+        clean_reason = reason.strip()[:1000] or "违反平台规则"
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE user_sanctions SET revoked_at=?,revoked_by=? WHERE user_id=? AND sanction_type=? "
+                "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?)",
+                (now, int(created_by) if created_by is not None else None, int(user_id), sanction_type, now),
+            )
+            cursor = await db.execute(
+                "INSERT INTO user_sanctions(user_id,sanction_type,reason,starts_at,expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    int(user_id),
+                    sanction_type,
+                    clean_reason,
+                    now,
+                    expires_at,
+                    int(created_by) if created_by is not None else None,
+                    now,
+                ),
+            )
+            sanction_id = int(cursor.lastrowid)
+            await db.commit()
+        item = await self.get_user_sanction(sanction_id)
+        assert item is not None
+        return item
+
+    async def get_user_sanction(self, sanction_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM user_sanctions WHERE id=?", (int(sanction_id),))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_user_sanctions(self, user_id: int, *, active_only: bool = False) -> list[dict[str, Any]]:
+        clauses = ["user_id=?"]
+        params: list[Any] = [int(user_id)]
+        if active_only:
+            clauses.extend(["revoked_at IS NULL", "(expires_at IS NULL OR expires_at>?)"])
+            params.append(_now())
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"SELECT * FROM user_sanctions WHERE {' AND '.join(clauses)} ORDER BY id DESC",
+                params,
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def active_user_sanction(self, user_id: int, sanction_types: Iterable[str]) -> dict[str, Any] | None:
+        types = [str(item) for item in sanction_types]
+        if not types:
+            return None
+        placeholders = ",".join("?" for _ in types)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"SELECT * FROM user_sanctions WHERE user_id=? AND sanction_type IN ({placeholders}) "
+                "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?) ORDER BY id DESC LIMIT 1",
+                [int(user_id), *types, _now()],
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def revoke_user_sanction(self, sanction_id: int, *, revoked_by: int | None) -> dict[str, Any] | None:
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE user_sanctions SET revoked_at=?,revoked_by=? WHERE id=? AND revoked_at IS NULL",
+                (now, int(revoked_by) if revoked_by is not None else None, int(sanction_id)),
+            )
+            await db.commit()
+        return await self.get_user_sanction(sanction_id)
+
+    async def create_content_deletion_job(
+        self,
+        *,
+        job_id: str,
+        target_user_id: int,
+        telegram_user_id: str | None,
+        reason: str,
+        created_by: int | None,
+    ) -> dict[str, Any]:
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT account_id,message_id FROM media_index WHERE deleted=0 AND "
+                "(owner_user_id=? OR (owner_user_id IS NULL AND submitter_telegram_user_id=?)) "
+                "AND (upload_source IN ('web','helper_bot') OR source_ingest_job_id IS NOT NULL)",
+                (int(target_user_id), str(telegram_user_id or "")),
+            )
+            targets = [(str(row[0]), int(row[1])) for row in await cursor.fetchall()]
+            await db.execute(
+                "INSERT INTO content_deletion_jobs(id,target_user_id,reason,status,total_items,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,'queued',?,?,?,?)",
+                (
+                    job_id,
+                    int(target_user_id),
+                    reason.strip()[:1000] or "管理员删除全部归属内容",
+                    len(targets),
+                    int(created_by) if created_by is not None else None,
+                    now,
+                    now,
+                ),
+            )
+            if targets:
+                await db.executemany(
+                    "INSERT INTO content_deletion_job_items(job_id,account_id,message_id,status,updated_at) VALUES(?,?,?,'pending',?)",
+                    [(job_id, account_id, message_id, now) for account_id, message_id in targets],
+                )
+            await db.commit()
+        job = await self.get_content_deletion_job(job_id)
+        assert job is not None
+        return job
+
+    async def get_content_deletion_job(self, job_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM content_deletion_jobs WHERE id=?", (job_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            cursor = await db.execute(
+                "SELECT account_id,message_id,status,error,updated_at FROM content_deletion_job_items WHERE job_id=? ORDER BY account_id,message_id",
+                (job_id,),
+            )
+            item["items"] = [dict(child) for child in await cursor.fetchall()]
+            return item
+
+    async def list_content_deletion_jobs(self, *, target_user_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if target_user_id is None:
+                cursor = await db.execute(
+                    "SELECT * FROM content_deletion_jobs ORDER BY created_at DESC LIMIT ?", (int(limit),)
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM content_deletion_jobs WHERE target_user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (int(target_user_id), int(limit)),
+                )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def pending_content_deletion_items(self, job_id: str) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM content_deletion_job_items WHERE job_id=? AND status IN ('pending','failed') ORDER BY account_id,message_id",
+                (job_id,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def update_content_deletion_item(self, job_id: str, account_id: str, message_id: int, *, status: str, error: str | None = None) -> None:
+        if status not in {"pending", "completed", "failed"}:
+            raise ValueError("invalid deletion item status")
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE content_deletion_job_items SET status=?,error=?,updated_at=? WHERE job_id=? AND account_id=? AND message_id=?",
+                (status, (error or "")[:1000] or None, _now(), job_id, account_id, int(message_id)),
+            )
+            await db.commit()
+
+    async def refresh_content_deletion_job(
+        self,
+        job_id: str,
+        *,
+        running: bool = False,
+        error: str | None = None,
+        cancelled: bool = False,
+    ) -> dict[str, Any] | None:
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*),SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),"
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) "
+                "FROM content_deletion_job_items WHERE job_id=?",
+                (job_id,),
+            )
+            row = await cursor.fetchone()
+            total = int(row[0] or 0) if row else 0
+            completed = int(row[1] or 0) if row else 0
+            failed = int(row[2] or 0) if row else 0
+            pending = int(row[3] or 0) if row else 0
+            if cancelled:
+                status = "cancelled"
+                completed_at = now
+            elif running:
+                status = "running"
+                completed_at = None
+            elif failed and completed:
+                status = "partial"
+                completed_at = now
+            elif failed:
+                status = "failed"
+                completed_at = now
+            elif pending:
+                # An outer worker failure/shutdown must never turn untouched
+                # Telegram messages into a falsely completed deletion job.
+                status = "failed"
+                completed_at = now
+            else:
+                status = "completed"
+                completed_at = now
+            await db.execute(
+                "UPDATE content_deletion_jobs SET status=?,total_items=?,processed_items=?,failed_items=?,error=?,updated_at=?,completed_at=? WHERE id=?",
+                (status, total, completed + failed, failed, (error or "")[:1000] or None, now, completed_at, job_id),
+            )
+            await db.commit()
+        return await self.get_content_deletion_job(job_id)
 
     async def get_traffic_settings(self) -> dict[str, Any]:
         async with aiosqlite.connect(self.path) as db:

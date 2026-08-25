@@ -1026,6 +1026,62 @@ video {
 .telegram-access-state { min-height: 150px; display: grid; place-items: center; align-content: center; gap: 12px; color: var(--text-muted); text-align: center; }
 .telegram-access-state p, .telegram-access-state small { margin: 0; }
 
+.auth-mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: -8px 0 22px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--background);
+}
+
+.auth-mode-tabs button {
+  min-height: 38px;
+  border: 0;
+  border-radius: calc(var(--radius-md) - 4px);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.auth-mode-tabs button.active {
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.2);
+}
+
+.auth-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 3px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.auth-checkbox input { accent-color: var(--secondary); }
+.auth-help { margin: 0; color: var(--text-dim); font-size: 13px; line-height: 1.5; }
+
+.auth-challenge,
+.account-state {
+  display: grid;
+  justify-items: center;
+  gap: 15px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.auth-challenge .gate-message,
+.account-state .gate-message { margin: 0; }
+.auth-challenge small,
+.account-state small { color: var(--text-dim); line-height: 1.5; }
+
 .auth-form {
   display: grid;
   gap: 12px;
@@ -2380,6 +2436,68 @@ video {
 
 .public-album-actions .status-detail {
   flex: 1 1 280px;
+}
+
+.registration-settings-card {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.registration-settings-card .button-row {
+  justify-content: flex-end;
+}
+
+.registration-key-rotation {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+}
+
+.registration-key-mode {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.registration-key-mode button {
+  min-height: 38px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 650;
+}
+
+.registration-key-mode button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.registration-key-mode button.active {
+  color: var(--text);
+  background: var(--surface-elevated);
+  box-shadow: 0 1px 6px rgb(0 0 0 / 0.14);
+}
+
+.registration-key-custom-field {
+  margin-top: 0;
+}
+
+.registration-key-custom-field small {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .generated-secret {
@@ -3925,6 +4043,18 @@ video {
   background: var(--surface);
 }
 
+.backup-upload-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+.backup-upload-row input[type="file"] {
+  max-width: min(100%, 32rem);
+}
+
 .backup-preview p {
   margin: 0 0 6px;
   color: var(--text-muted);
@@ -4082,5 +4212,529 @@ video {
   color: var(--success);
 }
 
+/* ---------------------------------------------------------------------------
+ * Web uploads, square social actions, reports and sanctions
+ * ------------------------------------------------------------------------- */
 
+.sidebar {
+  justify-content: flex-start;
+}
 
+.sidebar-view-nav {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-view-nav + nav {
+  margin-top: 12px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+}
+
+.upload-drop-overlay {
+  position: fixed;
+  z-index: 180;
+  inset: 14px;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 12px;
+  padding: 32px;
+  border: 3px dashed color-mix(in srgb, var(--secondary) 75%, white);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--background) 82%, var(--secondary));
+  box-shadow: inset 0 0 0 999px rgb(0 0 0 / 0.16), var(--shadow-modal);
+  color: var(--text);
+  text-align: center;
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.upload-drop-overlay svg {
+  color: var(--secondary);
+  filter: drop-shadow(0 8px 22px color-mix(in srgb, var(--secondary) 42%, transparent));
+}
+
+.upload-drop-overlay strong {
+  font-size: clamp(22px, 4vw, 38px);
+}
+
+.upload-drop-overlay span {
+  color: var(--text-muted);
+  font-size: 15px;
+}
+
+.upload-dialog-backdrop {
+  z-index: 150;
+}
+
+.upload-dialog,
+.report-dialog,
+.report-resolution-dialog,
+.user-sanction-dialog {
+  width: min(920px, 100%);
+  max-height: min(90dvh, 900px);
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-modal);
+}
+
+.upload-dialog > .muted,
+.report-dialog > p,
+.report-dialog > label,
+.report-resolution-dialog > label,
+.report-resolution-dialog > .sanction-draft-list,
+.report-resolution-dialog > .review-ban-toggle,
+.user-sanction-dialog > :not(.viewer-topbar),
+.upload-bulk-actions,
+.web-upload-list,
+.upload-dialog-actions,
+.report-dialog-actions,
+.report-resolution-actions {
+  margin-right: 20px;
+  margin-left: 20px;
+}
+
+.upload-dialog > .muted {
+  margin-top: 16px;
+  margin-bottom: 12px;
+}
+
+.upload-bulk-actions,
+.upload-dialog-actions,
+.report-dialog-actions,
+.report-resolution-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.upload-bulk-actions {
+  margin-bottom: 14px;
+}
+
+.upload-dialog-actions,
+.report-dialog-actions,
+.report-resolution-actions {
+  justify-content: flex-end;
+  margin-top: 16px;
+  margin-bottom: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.web-upload-list {
+  display: grid;
+  gap: 8px;
+}
+
+.web-upload-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.3fr) minmax(125px, .55fr) minmax(170px, 1fr) auto;
+  align-items: center;
+  gap: 10px 14px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+}
+
+.web-upload-row.status-completed,
+.web-upload-row.status-pending_review {
+  border-color: color-mix(in srgb, var(--success) 40%, var(--border));
+}
+
+.web-upload-row.status-failed {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+
+.web-upload-file,
+.web-upload-progress {
+  position: relative;
+  padding-top: 12px;
+}
+
+.web-upload-progress::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  content: "";
+}
+
+.web-upload-progress {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.web-upload-file strong,
+.web-upload-file small,
+.web-upload-progress small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.web-upload-file small,
+.web-upload-progress small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.web-upload-row select,
+.report-dialog select,
+.report-dialog textarea,
+.report-resolution-dialog select,
+.report-resolution-dialog textarea,
+.sanction-draft-row input,
+.sanction-draft-row select {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+}
+
+.web-upload-progress > span {
+  position: relative;
+  height: 7px;
+  margin-top: -12px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--secondary), var(--success));
+  transition: width 180ms ease;
+}
+
+.web-upload-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.web-upload-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 8px 10px;
+  white-space: normal;
+}
+
+.report-dialog {
+  width: min(560px, 100%);
+}
+
+.report-dialog > p {
+  margin-top: 18px;
+  overflow-wrap: anywhere;
+}
+
+.report-dialog > label,
+.report-resolution-dialog > label {
+  display: grid;
+  gap: 7px;
+  margin-top: 14px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.report-dialog textarea,
+.report-resolution-dialog textarea {
+  resize: vertical;
+}
+
+.media-card-social,
+.media-social-actions,
+.viewer-social {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.media-card-social {
+  justify-content: space-between;
+  padding: 8px 4px 0;
+}
+
+.media-card-social button,
+.media-social-actions button,
+.viewer-social button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+}
+
+.media-card-social button:hover,
+.media-social-actions button:hover,
+.viewer-social button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.media-card-social button.liked,
+.media-social-actions button.liked,
+.viewer-social button.liked {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border));
+  color: var(--danger);
+}
+
+.media-card-social button:disabled,
+.media-social-actions button:disabled,
+.viewer-social button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.media-list-visibility {
+  gap: 6px;
+}
+
+.media-social-actions {
+  flex-wrap: wrap;
+}
+
+.viewer-social {
+  margin-left: auto;
+}
+
+.reports-section {
+  position: relative;
+}
+
+.report-admin-list,
+.report-evidence-list,
+.sanction-draft-list,
+.sanction-history {
+  display: grid;
+  gap: 8px;
+}
+
+.report-admin-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  text-align: left;
+}
+
+.report-admin-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.report-admin-row.failed {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border));
+}
+
+.report-admin-row > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.report-admin-row strong,
+.report-admin-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-admin-row small {
+  color: var(--text-muted);
+}
+
+.report-failed-reason {
+  color: var(--danger) !important;
+}
+
+.report-count {
+  min-width: 54px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  color: var(--danger);
+  font-weight: 750;
+}
+
+.report-resolution-dialog,
+.user-sanction-dialog {
+  width: min(760px, 100%);
+  padding-bottom: 2px;
+}
+
+.report-evidence-list {
+  max-height: 220px;
+  margin: 16px 20px;
+  overflow: auto;
+}
+
+.report-evidence-list > div {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) auto 1fr auto;
+  align-items: start;
+  gap: 6px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.report-evidence-list p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.report-evidence-list small {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.sanction-draft-list {
+  margin-top: 14px;
+}
+
+.sanction-draft-row {
+  display: grid;
+  grid-template-columns: minmax(150px, .8fr) minmax(180px, 1.4fr) minmax(110px, .55fr) minmax(170px, .8fr);
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-subtle);
+}
+
+.sanction-draft-row > .review-ban-toggle:only-child {
+  grid-column: 1 / -1;
+}
+
+.report-resolution-dialog > .review-ban-toggle,
+.user-sanction-dialog > .review-ban-toggle {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-subtle));
+}
+
+.user-sanction-dialog > h3 {
+  margin-top: 18px;
+  margin-bottom: 8px;
+}
+
+.user-sanction-dialog > .button {
+  margin-top: 12px;
+}
+
+.sanction-history {
+  max-height: 260px;
+  overflow: auto;
+}
+
+@media (max-width: 760px) {
+  .upload-drop-overlay {
+    inset: 8px;
+    padding: 20px;
+    border-radius: 12px;
+  }
+
+  .upload-dialog,
+  .report-dialog,
+  .report-resolution-dialog,
+  .user-sanction-dialog {
+    max-height: 96dvh;
+    border-radius: 9px;
+  }
+
+  .web-upload-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .web-upload-file,
+  .web-upload-progress,
+  .web-upload-error {
+    grid-column: 1 / -1;
+  }
+
+  .web-upload-actions {
+    justify-content: stretch;
+  }
+
+  .web-upload-actions .button {
+    width: 100%;
+  }
+
+  .sanction-draft-row {
+    grid-template-columns: 1fr;
+  }
+
+  .sanction-draft-row > .review-ban-toggle:only-child {
+    grid-column: auto;
+  }
+
+  .report-evidence-list > div {
+    grid-template-columns: 1fr auto;
+  }
+
+  .viewer-social {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .upload-dialog > .muted,
+  .report-dialog > p,
+  .report-dialog > label,
+  .report-resolution-dialog > label,
+  .report-resolution-dialog > .sanction-draft-list,
+  .report-resolution-dialog > .review-ban-toggle,
+  .user-sanction-dialog > :not(.viewer-topbar),
+  .upload-bulk-actions,
+  .web-upload-list,
+  .upload-dialog-actions,
+  .report-dialog-actions,
+  .report-resolution-actions,
+  .report-evidence-list {
+    margin-right: 12px;
+    margin-left: 12px;
+  }
+
+  .upload-bulk-actions .button,
+  .upload-dialog-actions .button,
+  .report-dialog-actions .button,
+  .report-resolution-actions .button {
+    flex: 1 1 auto;
+  }
+
+  .report-admin-row {
+    align-items: flex-start;
+  }
+}
