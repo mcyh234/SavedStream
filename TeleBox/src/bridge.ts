@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_i
 CREATE TABLE IF NOT EXISTS web_login_codes (code_hash TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, account_id TEXT NOT NULL, username TEXT, display_name TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
 CREATE TABLE IF NOT EXISTS relay_pairs (account_id TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, paired_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS helper_bans (telegram_user_id TEXT PRIMARY KEY, reason TEXT, banned_at INTEGER NOT NULL, banned_by TEXT NOT NULL);`);
+db.exec(`CREATE TABLE IF NOT EXISTS replication_idempotency (
+  idempotency_key TEXT PRIMARY KEY,
+  source_account_id TEXT NOT NULL,
+  target_account_id TEXT NOT NULL,
+  logical_media_id TEXT,
+  fingerprint TEXT,
+  target_message_id INTEGER NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  content_sha256 TEXT,
+  created_at INTEGER NOT NULL
+);`);
 let jobColumns = new Set(
   (db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).map(
     (column) => column.name,
@@ -1788,9 +1799,15 @@ async function syncMedia(accountId: string, u: URL): Promise<any> {
   const mode = u.searchParams.get("mode") === "full" ? "full" : "incremental";
   const cursor = Number(u.searchParams.get("cursor") || 0);
   const afterId = Number(u.searchParams.get("after_id") || 0);
+  const oldestFirst = mode === "full" && u.searchParams.get("order") === "oldest";
   const options: any = { limit };
   if (mode === "full") {
-    if (cursor) options.offsetId = cursor;
+    if (oldestFirst) {
+      options.reverse = true;
+      if (cursor) options.minId = cursor;
+    } else if (cursor) {
+      options.offsetId = cursor;
+    }
   } else {
     if (afterId) options.minId = afterId;
     options.reverse = true;
@@ -1801,7 +1818,9 @@ async function syncMedia(accountId: string, u: URL): Promise<any> {
     .filter(Boolean)
     .sort((left: any, right: any) => Number(left.id) - Number(right.id));
   const rawIds = messages.map((message: any) => Number(message?.id || 0)).filter(Boolean);
-  const nextCursor = syncPaginationCursor(mode, rawIds, limit);
+  const nextCursor = oldestFirst
+    ? (rawIds.length >= limit ? Math.max(...rawIds.filter((id) => id > 0)) || null : null)
+    : syncPaginationCursor(mode, rawIds, limit);
   return {
     items,
     message_ids: rawIds,
@@ -1872,6 +1891,121 @@ async function mediaItem(accountId: string, messageId: number): Promise<any> {
   const a = manager.get(accountId);
   const msg: any = (await a.client.getMessages("me", { ids: messageId }))[0];
   return serializeMessage(msg);
+}
+
+function replicationHash(filePath: string): string {
+  const hash = crypto.createHash("sha256");
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest("hex");
+}
+
+async function accountHealth(accountId: string): Promise<any> {
+  const started = Date.now();
+  const account = manager.get(accountId);
+  if (account.state !== "authenticated") {
+    return { account_id: accountId, healthy: false, state: account.state, error: account.error || "account is not authenticated" };
+  }
+  try {
+    const me = await account.client.getMe();
+    await account.client.getMessages("me", { limit: 1 });
+    return { account_id: accountId, healthy: Boolean(me), state: account.state, latency_ms: Date.now() - started, user_id: me?.id?.toString() || null };
+  } catch (error) {
+    return { account_id: accountId, healthy: false, state: account.state, latency_ms: Date.now() - started, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function replicationFind(accountId: string, u: URL): Promise<any> {
+  const account = manager.get(accountId);
+  const marker = String(u.searchParams.get("marker") || "").trim();
+  const fingerprint = String(u.searchParams.get("fingerprint") || "").trim();
+  const search = marker || fingerprint;
+  if (!search) return { items: [] };
+  const messages: any[] = await account.client.getMessages("me", { limit: 100, search });
+  return {
+    items: messages
+      .filter((message: any) => String(message?.message || "").includes(search))
+      .map((message: any) => ({ ...serializeMessage(message), account_id: accountId }))
+      .filter(Boolean),
+  };
+}
+
+async function replicationCopy(payload: any): Promise<any> {
+  const sourceId = String(payload?.source_account_id || "");
+  const targetId = String(payload?.target_account_id || "");
+  const sourceMessageId = Number(payload?.source_message_id || 0);
+  const idempotencyKey = String(payload?.idempotency_key || "");
+  if (!sourceId || !targetId || !sourceMessageId || !idempotencyKey) throw new Error("replication source, target, message and idempotency_key are required");
+  const existing = db.prepare("SELECT * FROM replication_idempotency WHERE idempotency_key=?").get(idempotencyKey) as any;
+  if (existing) return { target_message_id: Number(existing.target_message_id), size: Number(existing.size || 0), content_sha256: existing.content_sha256, reused: true };
+  const source = manager.get(sourceId);
+  const target = manager.get(targetId);
+  if (source.state !== "authenticated" || target.state !== "authenticated") throw new Error("source or target account is not authenticated");
+  // A process can die after Telegram accepts the upload but before the
+  // bridge idempotency row is committed.  Search the target Saved Messages
+  // marker before creating another copy so retries remain safe.
+  const fingerprint = String(payload?.fingerprint || "").trim();
+  const logicalMediaId = String(payload?.logical_media_id || "").trim();
+  if (fingerprint || logicalMediaId) {
+    const markerSearch = fingerprint ? `sha256=${fingerprint}` : `logical=${logicalMediaId}`;
+    const candidates: any[] = await target.client.getMessages("me", { limit: 100, search: markerSearch });
+    const existingMessage = candidates.find((message: any) => {
+      const text = String(message?.message || "");
+      return text.includes("#savedstream-replica:v1")
+        && (!fingerprint || text.includes(`sha256=${fingerprint}`))
+        && (!logicalMediaId || text.includes(`logical=${logicalMediaId}`));
+    });
+    if (existingMessage?.id) {
+      const existingInfo = existingMessage.file ? sourceMediaInfo(existingMessage) : { size: 0 };
+      const size = Number(existingInfo.size || existingMessage.file?.size || 0);
+      const sha = fingerprint || null;
+      db.prepare("INSERT OR IGNORE INTO replication_idempotency(idempotency_key,source_account_id,target_account_id,logical_media_id,fingerprint,target_message_id,size,content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?)").run(
+        idempotencyKey, sourceId, targetId, logicalMediaId, fingerprint, Number(existingMessage.id), size, sha, Date.now(),
+      );
+      return { target_message_id: Number(existingMessage.id), size, content_sha256: sha, reused: true };
+    }
+  }
+  const sourceMessage: any = (await source.client.getMessages("me", { ids: sourceMessageId }))[0];
+  if (!sourceMessage?.media) throw new Error("source media not found");
+  const sourceInfo = sourceMediaInfo(sourceMessage);
+  const spool = path.join(UPLOAD_SPOOL, `replica-${crypto.randomBytes(16).toString("hex")}`);
+  try {
+    await source.client.downloadMedia(sourceMessage, { outputFile: spool });
+    const stat = fs.statSync(spool);
+    const sha256 = replicationHash(spool);
+    const caption = String(payload?.caption || "").slice(0, 4096);
+    const filename = String(payload?.filename || sourceInfo.filename || `saved-${sourceMessageId}`).slice(0, 500);
+    const sent: any = await target.client.sendFile("me", {
+      file: new CustomFile(filename, stat.size, spool),
+      caption,
+      forceDocument: false,
+      supportsStreaming: String(payload?.mime_type || sourceInfo.mimeType).startsWith("video/"),
+    } as any);
+    const targetMessageId = Number(sent?.id || 0);
+    if (!targetMessageId) throw new Error("Telegram returned no replica message id");
+    db.prepare("INSERT INTO replication_idempotency(idempotency_key,source_account_id,target_account_id,logical_media_id,fingerprint,target_message_id,size,content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?)").run(
+      idempotencyKey, sourceId, targetId, logicalMediaId, fingerprint, targetMessageId, stat.size, sha256, Date.now(),
+    );
+    return { target_message_id: targetMessageId, size: stat.size, content_sha256: sha256, reused: false };
+  } finally {
+    try { fs.unlinkSync(spool); } catch {}
+  }
+}
+
+async function replicationMutation(payload: any): Promise<any> {
+  const accountId = String(payload?.target_account_id || "");
+  const messageId = Number(payload?.target_message_id || 0);
+  const action = String(payload?.action || "");
+  const account = manager.get(accountId);
+  const message: any = (await account.client.getMessages("me", { ids: messageId }))[0];
+  if (!message) throw new Error("replica message not found");
+  if (action === "delete") {
+    await message.delete({ revoke: true });
+  } else if (action === "caption") {
+    await account.client.editMessage("me", messageId, { message: String(payload?.caption || "") });
+  } else {
+    throw new Error("unsupported replication mutation");
+  }
+  return { ok: true, account_id: accountId, message_id: messageId, action };
 }
 function auth(req: http.IncomingMessage): boolean {
   return Boolean(TOKEN) && req.headers.authorization === `Bearer ${TOKEN}`;
@@ -1968,6 +2102,12 @@ const server = http.createServer(async (req, res) => {
       const payload = await body(req);
       return send(res, 200, await systemBackupImport(payload));
     }
+    if (u.pathname === "/v1/replication/copy" && req.method === "POST") {
+      return send(res, 201, await replicationCopy(await body(req)));
+    }
+    if (u.pathname === "/v1/replication/mutation" && req.method === "POST") {
+      return send(res, 200, await replicationMutation(await body(req)));
+    }
     /* Redaction-safe replacement of the legacy account-list branch.
     if (u.pathname === "/v1/accounts" && req.method === "GET")
       return send(res, 200, { items: manager.list(), default_account: [*** 账号 ***] });
@@ -2030,6 +2170,9 @@ const server = http.createServer(async (req, res) => {
           detail: "not found",
         },
       );
+    const accountHealthRoute = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/health$/);
+    if (accountHealthRoute && req.method === "GET")
+      return send(res, 200, await accountHealth(accountHealthRoute[1]));
     const accountStart = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/start$/);
     if (accountStart && req.method === "POST") {
       await manager.startAccount(accountStart[1]);
@@ -2264,6 +2407,9 @@ const server = http.createServer(async (req, res) => {
     const mediaList = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/media$/);
     if (mediaList && req.method === "GET")
       return send(res, 200, await listMedia(mediaList[1], u));
+    const replicationFindRoute = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/replication\/find$/);
+    if (replicationFindRoute && req.method === "GET")
+      return send(res, 200, await replicationFind(replicationFindRoute[1], u));
     const systemBackupList = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/system-backups$/);
     if (systemBackupList && req.method === "GET")
       return send(res, 200, await listSystemBackups(systemBackupList[1], u));

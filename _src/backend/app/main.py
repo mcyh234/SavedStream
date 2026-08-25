@@ -10,6 +10,7 @@ import secrets
 import shutil
 import tempfile
 import uuid
+import aiosqlite
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -38,6 +39,7 @@ from .database import (
     Database,
 )
 from .media_indexer import MediaIndexer
+from .replication import DisasterRecoveryManager
 from .media_crypto import DeviceKeyError, encrypt_for_device, load_device_public_key, parse_device_public_key
 from .ranges import InvalidRange, parse_range_header
 from .security import TokenSigner, constant_time_equal
@@ -195,6 +197,21 @@ class AccountPayload(BaseModel):
     api_id: int = Field(gt=0)
     api_hash: str = Field(min_length=20, max_length=128)
     session: str = Field(default="", max_length=8192)
+    group_id: str | None = Field(default=None, max_length=80)
+    role: str = Field(default="primary", pattern="^(primary|replica)$")
+    priority: int = Field(default=100, ge=1, le=10000)
+
+
+class AccountGroupSettingsPayload(BaseModel):
+    auto_failover_enabled: bool = True
+    replication_enabled: bool = True
+    rate_min_interval_ms: int = Field(default=3000, ge=1500, le=600000)
+    rate_max_messages_per_minute: int = Field(default=10, ge=1, le=20)
+    rate_concurrency: int = Field(default=1, ge=1, le=1)
+
+
+class ManualFailoverPayload(BaseModel):
+    target_account_id: str = Field(min_length=1, max_length=40)
 
 
 class TelegramAccessPayload(BaseModel):
@@ -335,13 +352,18 @@ async def lifespan(app: FastAPI):
     telegram = TeleBoxClient(settings)
     await telegram.initialize()
     indexer = MediaIndexer(database, telegram)
+    replication = DisasterRecoveryManager(database, telegram)
+    indexer.replication = replication
     app.state.database = database
     app.state.auth = auth
     app.state.cache = cache
     app.state.traffic = traffic
     app.state.telegram = telegram
     app.state.indexer = indexer
+    app.state.replication = replication
     await indexer.start()
+    await replication.ensure_groups()
+    await replication.start()
     system_backup_scheduler = asyncio.create_task(
         _system_backup_scheduler(database, telegram, indexer),
         name="system-backup-scheduler",
@@ -369,6 +391,7 @@ async def lifespan(app: FastAPI):
     if pending_system_backups:
         await asyncio.gather(*pending_system_backups, return_exceptions=True)
     system_backup_tasks.clear()
+    await replication.stop()
     await indexer.stop()
     pending_uploads = list(upload_tasks.values())
     for task in pending_uploads:
@@ -737,6 +760,18 @@ def get_indexer(request: Request) -> MediaIndexer:
     return indexer
 
 
+def get_replication(
+    request: Request,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> DisasterRecoveryManager:
+    manager = getattr(request.app.state, "replication", None)
+    if manager is None:
+        manager = DisasterRecoveryManager(database, telegram)
+        request.app.state.replication = manager
+    return manager
+
+
 def _hash_public_key(value: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.scrypt(value.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
@@ -823,6 +858,20 @@ async def _sync_auth_user_binding(
         "account_id": str(binding["account_id"]).strip(),
         "binding_sync_status": "ready",
     }
+    # Persist the logical account group so a later failover transparently
+    # updates the user's physical route without requiring re-binding.
+    group_id = None
+    try:
+        # AuthStore and SavedStream share the same SQLite path; this lightweight
+        # lookup avoids changing the binding API shape.
+        async with aiosqlite.connect(auth.path) as db:  # type: ignore[attr-defined]
+            cursor = await db.execute("SELECT group_id FROM telegram_account_group_members WHERE account_id=?", (str(binding["account_id"]).strip(),))
+            row = await cursor.fetchone()
+            group_id = str(row[0]) if row and row[0] else None
+    except Exception:
+        group_id = None
+    if group_id:
+        update["account_group_id"] = group_id
     auto_approved = not requires_approval and str(user.get("status")) == "pending"
     if auto_approved:
         update["status"] = "approved"
@@ -1007,6 +1056,7 @@ async def authorized_account(
     requested_account: str | None,
     principal: AccessPrincipal,
     telegram: TeleBoxClient,
+    database: Database | None = None,
 ) -> str:
     if not principal.is_admin:
         requested = (requested_account or principal.account_id or "").strip()
@@ -1014,13 +1064,23 @@ async def authorized_account(
             requested = principal.account_id or ""
         if not requested:
             raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+        if database:
+            group = await database.account_group_for_account(requested)
+            if group:
+                requested = str(group.get("active_account_id") or requested)
         accounts = (await telegram.accounts()).get("items", [])
         if not any(str(item.get("id")) == requested for item in accounts):
             raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"})
+        if not any(str(item.get("id")) == requested and str(item.get("state")) == "authenticated" for item in accounts):
+            raise HTTPException(status_code=409, detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE", "account_id": requested})
         # Cross-account message access is allowed only so the public square can
         # stream approved public media.  indexed_media_for_principal performs
         # the final public/owner authorization and keeps private rows opaque.
         return requested
+    if database:
+        group = await database.account_group_for_account(requested_account or settings.telebox_default_account)
+        if group:
+            return str(group.get("active_account_id") or requested_account or settings.telebox_default_account)
     return await telegram.resolve_account(requested_account or settings.telebox_default_account)
 
 
@@ -1028,14 +1088,21 @@ async def account_filter(
     requested_account: str | None,
     principal: AccessPrincipal,
     telegram: TeleBoxClient,
+    database: Database | None = None,
 ) -> str | None:
     """Resolve a list filter while allowing public media across accounts."""
     requested = (requested_account or "").strip()
     if not requested or requested in {"all", "*"}:
         return None
+    if database:
+        group = await database.account_group_for_account(requested)
+        if group:
+            requested = str(group.get("active_account_id") or requested)
     accounts = (await telegram.accounts()).get("items", [])
     if not any(str(item.get("id")) == requested for item in accounts):
         raise HTTPException(status_code=404, detail={"code": "ACCOUNT_NOT_FOUND"})
+    if not any(str(item.get("id")) == requested and str(item.get("state")) == "authenticated" for item in accounts):
+        raise HTTPException(status_code=409, detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE", "account_id": requested})
     return requested
 
 
@@ -1739,7 +1806,7 @@ async def list_media(
     telegram: TeleBoxClient = Depends(get_telegram),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> dict:
-    account_id = await account_filter(account, principal, telegram)
+    account_id = await account_filter(account, principal, telegram, database)
     visibility = scope if principal.is_admin else "all"
     collection = None if principal.is_admin else view
     items, next_cursor, has_more = await database.list_media_index(
@@ -1769,7 +1836,7 @@ async def list_media(
         "has_more": has_more,
         "scope": visibility,
         "view": collection,
-        "index": await database.get_sync_state(account),
+        "index": await database.get_sync_state(account_id) if account_id else None,
     }
 
 
@@ -1784,7 +1851,7 @@ async def media_timeline(
     telegram: TeleBoxClient = Depends(get_telegram),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> dict:
-    account_id = await account_filter(account, principal, telegram)
+    account_id = await account_filter(account, principal, telegram, database)
     visibility = scope if principal.is_admin else "all"
     collection = None if principal.is_admin else view
     return {
@@ -1808,10 +1875,15 @@ async def media_timeline(
 @app.get("/api/accounts", dependencies=[Depends(require_viewer)])
 async def public_accounts(
     telegram: TeleBoxClient = Depends(get_telegram),
+    database: Database = Depends(get_database),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> dict:
     payload = await telegram.accounts()
     items = payload.get("items", [])
+    groups = await database.list_account_groups()
+    active_ids = {str(group.get("active_account_id")) for group in groups}
+    if active_ids:
+        items = [item for item in items if str(item.get("id")) in active_ids]
     configured_default = settings.telebox_default_account
     selected_default = configured_default if any(item.get("id") == configured_default for item in items) else next((item["id"] for item in items if item.get("state") == "authenticated"), items[0]["id"] if items else configured_default)
     return {
@@ -1833,7 +1905,7 @@ async def like_media(
 ) -> dict[str, Any]:
     if principal.user_id is None:
         raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
-    account_id = await authorized_account(account, principal, telegram)
+    account_id = await authorized_account(account, principal, telegram, database)
     item = await database.get_media_index(account_id, message_id, include_provenance=True)
     if not item or item.get("deleted") or item.get("hidden") or item.get("visibility") != "public" or item.get("review_status") != "approved":
         raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND"})
@@ -1852,7 +1924,7 @@ async def unlike_media(
 ) -> dict[str, Any]:
     if principal.user_id is None:
         raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED"})
-    account_id = await authorized_account(account, principal, telegram)
+    account_id = await authorized_account(account, principal, telegram, database)
     return await database.set_media_like(int(principal.user_id), account_id, message_id, False)
 
 
@@ -1866,7 +1938,7 @@ async def report_media(
     telegram: TeleBoxClient = Depends(get_telegram),
     principal: AccessPrincipal = Depends(require_report_access),
 ) -> dict[str, Any]:
-    account_id = await authorized_account(account, principal, telegram)
+    account_id = await authorized_account(account, principal, telegram, database)
     item = await database.get_media_index(account_id, message_id, include_provenance=True)
     if not item or item.get("deleted") or item.get("hidden") or item.get("visibility") != "public" or item.get("review_status") != "approved":
         raise HTTPException(status_code=404, detail={"code": "MEDIA_NOT_FOUND"})
@@ -1902,7 +1974,7 @@ async def media_thumbnail(
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> Response:
-    account = await authorized_account(account, principal, telegram)
+    account = await authorized_account(account, principal, telegram, database)
     indexed = await indexed_media_for_principal(database, account, message_id, principal)
     if size is not None:
         cache_key = telegram.media_cache_key(
@@ -1949,7 +2021,7 @@ async def encrypted_thumbnail(
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> Response:
-    account = await authorized_account(account, principal, telegram)
+    account = await authorized_account(account, principal, telegram, database)
     indexed = await indexed_media_for_principal(database, account, message_id, principal)
     # The device query parameter is a browser-cache key.  When present it
     # must match the authenticated fingerprint so a rotated device key cannot
@@ -1993,7 +2065,7 @@ async def encrypted_chunk(
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> Response:
-    account = await authorized_account(account, principal, telegram)
+    account = await authorized_account(account, principal, telegram, database)
     indexed = await indexed_media_for_principal(database, account, message_id, principal)
     device_key = await registered_device_public_key(x_savedstream_device_key, device_cookie, database)
     message, item = await telegram.get_media_message(account, message_id)
@@ -2040,7 +2112,7 @@ async def media_stream(
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> StreamingResponse:
-    account = await authorized_account(account, principal, telegram)
+    account = await authorized_account(account, principal, telegram, database)
     indexed = await indexed_media_for_principal(database, account, message_id, principal)
     message, item = await telegram.get_media_message(account, message_id)
     total = int(item["size"])
@@ -2115,7 +2187,9 @@ async def admin_settings(
     cache: DiskCache = Depends(get_cache),
     telegram: TeleBoxClient = Depends(get_telegram),
     traffic: TrafficController = Depends(get_traffic),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict:
+    await replication.ensure_groups()
     cache_limit = await database.get_cache_limit()
     cache_stats = await cache.stats()
     viewer_hash = await database.get_setting("viewer_key_hash", "")
@@ -2125,6 +2199,24 @@ async def admin_settings(
         helper_rate_limit = await telegram.helper_bot_rate_limit()
     except (AttributeError, TelegramUnavailable):
         helper_rate_limit = default_helper_rate_limit()
+    account_rows = (await telegram.accounts()).get("items", [])
+    account_meta: dict[str, dict[str, Any]] = {}
+    for group in await database.list_account_groups():
+        for member in group.get("members", []):
+            account_meta[str(member.get("account_id"))] = {
+                "account_group_id": group.get("id"),
+                "account_role": member.get("role"),
+                "account_priority": member.get("priority"),
+                "account_enabled": bool(member.get("enabled")),
+                "replication_status": member.get("sync_status"),
+                "replication_processed_files": member.get("processed_files"),
+                "replication_processed_bytes": member.get("processed_bytes"),
+                "replication_total_files": member.get("total_files"),
+                "replication_total_bytes": member.get("total_bytes"),
+                "replication_error": member.get("last_error"),
+                "active": str(group.get("active_account_id")) == str(member.get("account_id")),
+            }
+    account_rows = [{**item, **account_meta.get(str(item.get("id")), {})} for item in account_rows]
     return {
         "cache_max_gb": round(cache_limit / (1024**3), 2),
         "cache_bytes": cache_stats["bytes"],
@@ -2140,7 +2232,8 @@ async def admin_settings(
         "registration_key_fingerprint": registration_fingerprint,
         "registration_requires_approval": registration_requires_approval,
         "telegram": await telegram.status(),
-        "accounts": (await telegram.accounts()).get("items", []),
+        "accounts": account_rows,
+        "account_groups": await database.list_account_groups(),
         "helper_bot": await telegram.helper_bot_status(),
         "bindings": (await telegram.bindings()).get("items", []),
         "ingest_jobs": (await telegram.jobs()).get("items", []),
@@ -2535,6 +2628,9 @@ async def admin_media_sync(
     indexer: MediaIndexer = Depends(get_indexer),
 ) -> dict:
     account_id = await telegram.resolve_account(account)
+    group = await database.account_group_for_account(account_id)
+    if group:
+        account_id = str(group.get("active_account_id") or account_id)
     scheduled = indexer.schedule_sync(account_id, full=full)
     return {"scheduled": scheduled, "state": await database.get_sync_state(account_id)}
 
@@ -2682,6 +2778,25 @@ async def _delete_review_media(
         include_batch=True,
     )
     return deleted, submitters
+
+
+async def _queue_replication_mutation(
+    replication: DisasterRecoveryManager | None,
+    account_id: str,
+    message_id: int,
+    action: str,
+    *,
+    caption: str | None = None,
+) -> None:
+    if not replication:
+        return
+    try:
+        await replication.enqueue_mutation(account_id, int(message_id), action, caption=caption)
+    except Exception:
+        # Moderation must remain authoritative locally even if the replica
+        # queue is temporarily unavailable; the durable queue will retry
+        # already-created jobs independently.
+        pass
 
 
 async def _process_content_deletion_job(
@@ -2838,6 +2953,7 @@ async def review_media(
     cache: DiskCache = Depends(get_cache),
     telegram: TeleBoxClient = Depends(get_telegram),
     indexer: MediaIndexer = Depends(get_indexer),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, Any]:
     account_id = await telegram.resolve_account(account)
     targets = await database.media_review_targets(account_id, message_id, include_batch=True)
@@ -2865,6 +2981,7 @@ async def review_media(
             telegram=telegram,
             cache=cache,
         )
+        await _queue_replication_mutation(replication, account_id, message_id, "delete")
         await _notify_telegram_users(
             database,
             submitters,
@@ -2888,6 +3005,12 @@ async def review_media(
     if not item:
         raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
     await _sync_review_outbox_now(indexer)
+    await _queue_replication_mutation(
+        replication,
+        account_id,
+        message_id,
+        "public" if payload.decision == "approved" else "private" if payload.decision in {"rejected", "revoked"} else "private",
+    )
     item_title = str(item.get("title") or item.get("filename") or message_id)
     reason_text = (payload.reason or "").strip() or "未说明原因"
     if payload.decision == "approved":
@@ -2907,6 +3030,7 @@ async def delete_admin_media(
     database: Database = Depends(get_database),
     cache: DiskCache = Depends(get_cache),
     telegram: TeleBoxClient = Depends(get_telegram),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, Any]:
     account_id = await telegram.resolve_account(account)
     targets = await database.media_review_targets(account_id, message_id, include_batch=True)
@@ -2933,6 +3057,7 @@ async def delete_admin_media(
         telegram=telegram,
         cache=cache,
     )
+    await _queue_replication_mutation(replication, account_id, message_id, "delete")
     await _notify_telegram_users(
         database,
         submitters,
@@ -2955,6 +3080,7 @@ async def review_media_bulk(
     cache: DiskCache = Depends(get_cache),
     telegram: TeleBoxClient = Depends(get_telegram),
     indexer: MediaIndexer = Depends(get_indexer),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, Any]:
     targets: list[dict[str, Any]] = []
     for entry in payload.items:
@@ -3000,6 +3126,7 @@ async def review_media_bulk(
                     telegram=telegram,
                     cache=cache,
                 )
+                await _queue_replication_mutation(replication, account_id, int(target["id"]), "delete")
                 deleted_items.extend(deleted)
                 deleted_ids.update((account_id, int(row["id"])) for row in batch_targets)
                 break
@@ -3024,6 +3151,13 @@ async def review_media_bulk(
         reviewed_by="admin",
     )
     await _sync_review_outbox_now(indexer)
+    for entry in payload.items:
+        await _queue_replication_mutation(
+            replication,
+            str(entry["account_id"]),
+            int(entry["message_id"]),
+            "public" if payload.decision == "approved" else "private",
+        )
     labels = {"approved": "通过并公开", "rejected": "未通过", "revoked": "已设为私有"}
     await _notify_telegram_users(
         database,
@@ -3044,6 +3178,7 @@ async def update_media_visibility(
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
     indexer: MediaIndexer = Depends(get_indexer),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict:
     account_id = await telegram.resolve_account(account)
     current = await database.get_media_index(account_id, message_id)
@@ -3064,6 +3199,12 @@ async def update_media_visibility(
     if not item:
         raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
     await _sync_review_outbox_now(indexer)
+    await _queue_replication_mutation(
+        replication,
+        account_id,
+        message_id,
+        "hide" if payload.visibility == "hidden" else "private" if payload.visibility == "private" else "public",
+    )
     item_title = str(item.get("title") or item.get("filename") or message_id)
     submitter = item.get("submitter_telegram_user_id")
     if payload.visibility == "hidden":
@@ -3080,6 +3221,7 @@ async def update_media_visibility_bulk(
     payload: BulkVisibilityPayload,
     database: Database = Depends(get_database),
     indexer: MediaIndexer = Depends(get_indexer),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, int | str]:
     entries = [item.model_dump() for item in payload.items]
     submitters: set[tuple[str, str | None]] = set()
@@ -3116,6 +3258,13 @@ async def update_media_visibility_bulk(
         )
         updated = len(reviewed)
     await _sync_review_outbox_now(indexer)
+    for entry in entries:
+        await _queue_replication_mutation(
+            replication,
+            str(entry["account_id"]),
+            int(entry["message_id"]),
+            "hide" if payload.visibility == "hidden" else "private" if payload.visibility == "private" else "public",
+        )
     count = len(entries)
     if payload.visibility == "hidden":
         await _notify_telegram_users(database, submitters, "media", "资源已被隐藏", f"管理员已隐藏你提交的 {count} 项资源（仅管理员可见）。")
@@ -3559,6 +3708,7 @@ async def _process_upload_job(
     database: Database,
     telegram: TeleBoxClient,
     indexer: MediaIndexer,
+    replication: DisasterRecoveryManager | None = None,
 ) -> None:
     job = await database.get_upload_job(job_id)
     if not job:
@@ -3619,9 +3769,17 @@ async def _process_upload_job(
             review_batch_id=None,
             upload_source=str(job.get("upload_source") or "web"),
             upload_batch_id=str(job.get("batch_id") or "") or None,
+            account_group_id=str(job.get("account_group_id") or "") or None,
         )
         await database.rebuild_timeline(str(job["account_id"]))
         await database.complete_upload_job(job_id, message_id=int(item["id"]))
+        if replication:
+            try:
+                await replication.enqueue_media(str(job["account_id"]), int(item["id"]))
+            except Exception:
+                # Replication is durable/best-effort and must not make the
+                # primary upload fail after Telegram has accepted it.
+                pass
         # Make the item visible to the next local query immediately, while the
         # normal background worker will reconcile it on its next pass.
         indexer.schedule_sync(str(job["account_id"]), full=False)
@@ -3803,18 +3961,29 @@ async def create_user_upload(
     indexer: MediaIndexer = Depends(get_indexer),
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_upload_access),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, Any]:
+    account_group_id: str | None = None
     if principal.is_admin:
         account_id = await telegram.resolve_account(account)
+        group = await database.account_group_for_account(account_id)
+        account_group_id = str(group.get("id")) if group else None
     else:
         account_id = str(principal.account_id or "").strip()
         if not account_id:
             raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
         if account and account != account_id:
             raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+        group = await database.account_group_for_account(account_id)
+        if group:
+            account_group_id = str(group.get("id"))
+            account_id = str(group.get("active_account_id") or account_id)
         accounts = (await telegram.accounts()).get("items", [])
         if not any(str(item.get("id")) == account_id and str(item.get("state")) == "authenticated" for item in accounts):
-            raise HTTPException(status_code=409, detail={"code": "ACCOUNT_NOT_AUTHENTICATED"})
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE", "account_group_id": account_group_id, "account_id": account_id},
+            )
     try:
         expected_size = int(request.headers.get("content-length") or "0")
     except ValueError as exc:
@@ -3878,6 +4047,7 @@ async def create_user_upload(
             mime_type=mime_type,
             size=received,
             temp_path=str(temp_path),
+            account_group_id=account_group_id,
             owner_user_id=principal.user_id,
             submitter_telegram_user_id=principal.telegram_user_id,
             requested_visibility=requested_visibility,
@@ -3890,7 +4060,7 @@ async def create_user_upload(
         temp_path.unlink(missing_ok=True)
         await _release_upload_reservation(telegram, reservation_key)
         raise
-    task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer), name=f"upload-{job_id}")
+    task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer, replication), name=f"upload-{job_id}")
     upload_tasks[job_id] = task
     task.add_done_callback(lambda _: upload_tasks.pop(job_id, None))
     return _public_upload_job(job)
@@ -3946,8 +4116,11 @@ async def create_upload(
     indexer: MediaIndexer = Depends(get_indexer),
     traffic: TrafficController = Depends(get_traffic),
     principal: AccessPrincipal = Depends(require_upload_access),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict:
     account_id = await telegram.resolve_account(account)
+    group = await database.account_group_for_account(account_id)
+    account_group_id = str(group.get("id")) if group else None
     staging_dir = settings.data_dir / "upload-staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -3990,6 +4163,7 @@ async def create_upload(
             mime_type=mime_type,
             size=size,
             temp_path=str(temp_path),
+            account_group_id=account_group_id,
             owner_user_id=principal.user_id,
             submitter_telegram_user_id=principal.telegram_user_id,
             upload_source="web_admin_compat",
@@ -3997,7 +4171,7 @@ async def create_upload(
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
-    task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer), name=f"upload-{job_id}")
+    task = asyncio.create_task(_process_upload_job(job_id, database, telegram, indexer, replication), name=f"upload-{job_id}")
     upload_tasks[job_id] = task
     task.add_done_callback(lambda _: upload_tasks.pop(job_id, None))
     return _public_upload_job(job)
@@ -4070,8 +4244,23 @@ async def create_account_invite(
 async def create_managed_account(
     payload: AccountPayload,
     telegram: TeleBoxClient = Depends(get_telegram),
+    database: Database = Depends(get_database),
 ) -> dict:
-    return await telegram.create_account(payload.model_dump())
+    group_id = str(payload.group_id or f"account-{payload.id}")
+    if payload.role == "replica" and not await database.get_account_group(group_id):
+        raise HTTPException(status_code=422, detail={"code": "ACCOUNT_GROUP_NOT_FOUND"})
+    if payload.role == "primary" and payload.group_id and await database.get_account_group(group_id):
+        raise HTTPException(status_code=409, detail={"code": "PRIMARY_ACCOUNT_ALREADY_EXISTS"})
+    account_payload = payload.model_dump()
+    account_payload.pop("group_id", None)
+    account_payload.pop("role", None)
+    account_payload.pop("priority", None)
+    created = await telegram.create_account(account_payload)
+    if payload.role == "replica":
+        await database.add_account_group_member(group_id, payload.id, role="replica", priority=payload.priority)
+    else:
+        await database.ensure_account_group(group_id, name=payload.label, primary_account_id=payload.id)
+    return {**created, "group_id": group_id, "role": payload.role, "priority": payload.priority}
 
 
 @app.post("/api/admin/accounts/{account_id}/login/qr", dependencies=[Depends(require_admin)])
@@ -4096,6 +4285,104 @@ async def cancel_account_login(
     telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict:
     return await telegram.cancel_account_login(account_id)
+
+
+@app.get("/api/admin/account-groups", dependencies=[Depends(require_admin)])
+async def list_admin_account_groups(
+    database: Database = Depends(get_database),
+    replication: DisasterRecoveryManager = Depends(get_replication),
+) -> dict[str, Any]:
+    await replication.ensure_groups()
+    return {"items": await database.list_account_groups()}
+
+
+@app.get("/api/admin/account-groups/{group_id}", dependencies=[Depends(require_admin)])
+async def get_admin_account_group(group_id: str, database: Database = Depends(get_database)) -> dict[str, Any]:
+    group = await database.get_account_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_GROUP_NOT_FOUND"})
+    return group
+
+
+@app.put("/api/admin/account-groups/{group_id}/settings", dependencies=[Depends(require_admin)])
+async def update_admin_account_group_settings(
+    group_id: str,
+    payload: AccountGroupSettingsPayload,
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    group = await database.update_account_group(
+        group_id,
+        auto_failover_enabled=1 if payload.auto_failover_enabled else 0,
+        replication_enabled=1 if payload.replication_enabled else 0,
+        rate_min_interval_ms=payload.rate_min_interval_ms,
+        rate_max_messages_per_minute=payload.rate_max_messages_per_minute,
+        rate_concurrency=payload.rate_concurrency,
+    )
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_GROUP_NOT_FOUND"})
+    return group
+
+
+@app.post("/api/admin/account-groups/{group_id}/replicas/{account_id}/sync", dependencies=[Depends(require_admin)])
+async def start_admin_replica_sync(
+    group_id: str,
+    account_id: str,
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    group = await database.get_account_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_GROUP_NOT_FOUND"})
+    member = next((item for item in group.get("members", []) if str(item.get("account_id")) == account_id), None)
+    if not member or str(member.get("role")) != "replica":
+        raise HTTPException(status_code=422, detail={"code": "REPLICA_NOT_FOUND"})
+    await database.update_account_group_member(group_id, account_id, sync_status="pending", sync_cursor=None, processed_files=0, processed_bytes=0, total_files=0, total_bytes=0, last_error=None)
+    return {"ok": True, "group_id": group_id, "account_id": account_id, "status": "pending"}
+
+
+@app.get("/api/admin/replication/jobs/{job_id}", dependencies=[Depends(require_admin)])
+async def get_admin_replication_job(job_id: str, database: Database = Depends(get_database)) -> dict[str, Any]:
+    job = await database.get_replication_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "REPLICATION_JOB_NOT_FOUND"})
+    return job
+
+
+@app.post("/api/admin/replication/jobs/{job_id}/retry", dependencies=[Depends(require_admin)])
+async def retry_admin_replication_job(job_id: str, database: Database = Depends(get_database)) -> dict[str, Any]:
+    job = await database.get_replication_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"code": "REPLICATION_JOB_NOT_FOUND"})
+    updated = await database.update_replication_job(job_id, status="queued", phase="queued", error=None, next_retry_at=None)
+    if str(job.get("job_type")) == "backfill" and job.get("group_id") and job.get("target_account_id"):
+        await database.update_account_group_member(
+            str(job["group_id"]),
+            str(job["target_account_id"]),
+            sync_status="running",
+            last_error=None,
+        )
+    return updated or job
+
+
+@app.post("/api/admin/account-groups/{group_id}/failover", dependencies=[Depends(require_admin)])
+async def manual_admin_failover(
+    group_id: str,
+    payload: ManualFailoverPayload,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict[str, Any]:
+    group = await database.get_account_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail={"code": "ACCOUNT_GROUP_NOT_FOUND"})
+    target = next((item for item in group.get("members", []) if str(item.get("account_id")) == payload.target_account_id), None)
+    if not target or not int(target.get("enabled") or 0) or str(target.get("role")) != "replica" or str(target.get("sync_status")) != "ready":
+        raise HTTPException(status_code=422, detail={"code": "REPLICA_NOT_READY"})
+    account_rows = (await telegram.accounts()).get("items", [])
+    state = next((item.get("state") for item in account_rows if str(item.get("id")) == payload.target_account_id), None)
+    if state != "authenticated":
+        raise HTTPException(status_code=409, detail={"code": "REPLICA_NOT_AUTHENTICATED"})
+    previous = str(group.get("active_account_id") or "")
+    await database.record_failover(group_id, previous, payload.target_account_id, "manual administrator failover", int(group.get("health_failures") or 0))
+    return await database.get_account_group(group_id)  # type: ignore[return-value]
 
 
 @app.delete("/api/admin/bindings", dependencies=[Depends(require_admin)])
@@ -4225,11 +4512,13 @@ async def update_media_title(
     account: str | None = Query(default=None, min_length=1, max_length=40),
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
+    replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, bool]:
     account = await telegram.resolve_account(account)
     if not await database.get_media_index(account, message_id):
         raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
     await database.set_local_title(message_id, payload.title, account)
+    await _queue_replication_mutation(replication, account, message_id, "caption", caption=payload.title)
     return {"ok": True}
 
 

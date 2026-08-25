@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import binascii
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -218,6 +219,11 @@ class Database:
                     reviewed_at TEXT,
                     reviewed_by TEXT,
                     review_batch_id TEXT,
+                    account_group_id TEXT,
+                    logical_media_id TEXT,
+                    content_sha256 TEXT,
+                    origin_account_id TEXT,
+                    origin_message_id INTEGER,
                     PRIMARY KEY(account_id, message_id)
                 );
 
@@ -317,6 +323,109 @@ class Database:
                     temp_path TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_account_groups (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    primary_account_id TEXT NOT NULL,
+                    active_account_id TEXT NOT NULL,
+                    auto_failover_enabled INTEGER NOT NULL DEFAULT 1,
+                    replication_enabled INTEGER NOT NULL DEFAULT 1,
+                    rate_min_interval_ms INTEGER NOT NULL DEFAULT 3000,
+                    rate_max_messages_per_minute INTEGER NOT NULL DEFAULT 10,
+                    rate_concurrency INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'healthy' CHECK(status IN ('healthy','degraded','failed_over')),
+                    health_failures INTEGER NOT NULL DEFAULT 0,
+                    last_health_error TEXT,
+                    last_failover_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_account_group_members (
+                    group_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('primary','replica')),
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sync_status TEXT NOT NULL DEFAULT 'pending' CHECK(sync_status IN ('pending','running','ready','paused','failed')),
+                    sync_cursor INTEGER,
+                    processed_files INTEGER NOT NULL DEFAULT 0,
+                    processed_bytes INTEGER NOT NULL DEFAULT 0,
+                    total_files INTEGER,
+                    total_bytes INTEGER,
+                    last_error TEXT,
+                    last_sync_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(group_id, account_id),
+                    UNIQUE(account_id)
+                );
+                CREATE INDEX IF NOT EXISTS telegram_account_group_member_idx
+                ON telegram_account_group_members(group_id, role, enabled, priority);
+
+                CREATE TABLE IF NOT EXISTS telegram_replication_mappings (
+                    group_id TEXT NOT NULL,
+                    logical_media_id TEXT NOT NULL,
+                    source_account_id TEXT NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    target_account_id TEXT NOT NULL,
+                    target_message_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    content_sha256 TEXT,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    mime_type TEXT,
+                    filename TEXT,
+                    owner_user_id INTEGER,
+                    submitter_telegram_user_id TEXT,
+                    visibility TEXT NOT NULL DEFAULT 'private',
+                    requested_visibility TEXT NOT NULL DEFAULT 'private',
+                    review_status TEXT NOT NULL DEFAULT 'not_required',
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(group_id, target_account_id, logical_media_id),
+                    UNIQUE(group_id, target_account_id, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS telegram_replication_source_idx
+                ON telegram_replication_mappings(group_id, source_account_id, source_message_id);
+
+                CREATE TABLE IF NOT EXISTS telegram_replication_jobs (
+                    id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    job_type TEXT NOT NULL CHECK(job_type IN ('backfill','live','mutation')),
+                    source_account_id TEXT,
+                    source_message_id INTEGER,
+                    target_account_id TEXT,
+                    logical_media_id TEXT,
+                    fingerprint TEXT,
+                    mutation_action TEXT,
+                    mutation_caption TEXT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    phase TEXT NOT NULL DEFAULT 'queued',
+                    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','retry_wait','completed','failed','skipped')),
+                    progress REAL NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    next_retry_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS telegram_replication_jobs_queue_idx
+                ON telegram_replication_jobs(status, next_retry_at, created_at);
+                CREATE INDEX IF NOT EXISTS telegram_replication_jobs_group_idx
+                ON telegram_replication_jobs(group_id, target_account_id, status);
+
+                CREATE TABLE IF NOT EXISTS telegram_failover_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL,
+                    previous_account_id TEXT NOT NULL,
+                    active_account_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    health_failures INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS media_folders (
@@ -535,6 +644,19 @@ class Database:
                 """
             )
             await db.executescript(AUTH_SCHEMA)
+            auth_columns_cursor = await db.execute("PRAGMA table_info(auth_users)")
+            auth_columns = {str(row[1]) for row in await auth_columns_cursor.fetchall()}
+            if "account_group_id" not in auth_columns:
+                await db.execute("ALTER TABLE auth_users ADD COLUMN account_group_id TEXT")
+            media_user_columns_cursor = await db.execute("PRAGMA table_info(media_users)")
+            media_user_columns = {str(row[1]) for row in await media_user_columns_cursor.fetchall()}
+            if "account_group_id" not in media_user_columns:
+                await db.execute("ALTER TABLE media_users ADD COLUMN account_group_id TEXT")
+            group_columns_cursor = await db.execute("PRAGMA table_info(telegram_account_groups)")
+            group_columns = {str(row[1]) for row in await group_columns_cursor.fetchall()}
+            for column_name, definition in (("rate_min_interval_ms", "INTEGER NOT NULL DEFAULT 3000"), ("rate_max_messages_per_minute", "INTEGER NOT NULL DEFAULT 10"), ("rate_concurrency", "INTEGER NOT NULL DEFAULT 1")):
+                if column_name not in group_columns:
+                    await db.execute(f"ALTER TABLE telegram_account_groups ADD COLUMN {column_name} {definition}")
             # Existing installations predate Helper Bot provenance fields.
             # Add them in place without rebuilding or deleting the media index.
             columns_cursor = await db.execute("PRAGMA table_info(media_index)")
@@ -573,9 +695,24 @@ class Database:
                 ("batch_id", "TEXT"),
                 ("upload_source", "TEXT NOT NULL DEFAULT 'web'"),
                 ("quota_reservation_key", "TEXT"),
+                ("account_group_id", "TEXT"),
             ):
                 if column_name not in upload_columns:
                     await db.execute(f"ALTER TABLE upload_jobs ADD COLUMN {column_name} {definition}")
+            replication_columns_cursor = await db.execute("PRAGMA table_info(telegram_replication_jobs)")
+            replication_columns = {str(row[1]) for row in await replication_columns_cursor.fetchall()}
+            for column_name, definition in (("mutation_action", "TEXT"), ("mutation_caption", "TEXT")):
+                if column_name not in replication_columns:
+                    await db.execute(f"ALTER TABLE telegram_replication_jobs ADD COLUMN {column_name} {definition}")
+            for column_name, definition in (
+                ("account_group_id", "TEXT"),
+                ("logical_media_id", "TEXT"),
+                ("content_sha256", "TEXT"),
+                ("origin_account_id", "TEXT"),
+                ("origin_message_id", "INTEGER"),
+            ):
+                if column_name not in media_columns:
+                    await db.execute(f"ALTER TABLE media_index ADD COLUMN {column_name} {definition}")
             # These indexes reference columns added by migrations above.  They
             # must be created after the ALTER TABLE statements so an upgrade
             # from the pre-review schema does not fail during startup.
@@ -598,6 +735,10 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS upload_jobs_owner_idx "
                 "ON upload_jobs(owner_user_id, created_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS media_index_group_idx "
+                "ON media_index(account_group_id, logical_media_id, deleted)"
             )
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS media_index_ingest_job_idx "
@@ -690,6 +831,20 @@ class Database:
                 "UPDATE media_index SET owner_user_id=(SELECT a.id FROM auth_users a "
                 "WHERE a.telegram_user_id=media_index.submitter_telegram_user_id) "
                 "WHERE owner_user_id IS NULL AND submitter_telegram_user_id IS NOT NULL"
+            )
+            await db.execute(
+                "UPDATE media_index SET logical_media_id=COALESCE(logical_media_id, account_id || ':' || message_id), "
+                "origin_account_id=COALESCE(origin_account_id, account_id), "
+                "origin_message_id=COALESCE(origin_message_id, message_id)"
+            )
+            await db.execute(
+                "UPDATE auth_users SET account_group_id=(SELECT group_id FROM telegram_account_group_members m WHERE m.account_id=auth_users.account_id) WHERE account_group_id IS NULL"
+            )
+            await db.execute(
+                "UPDATE media_users SET account_group_id=(SELECT group_id FROM telegram_account_group_members m WHERE m.account_id=media_users.account_id) WHERE account_group_id IS NULL"
+            )
+            await db.execute(
+                "UPDATE media_index SET account_group_id=(SELECT group_id FROM telegram_account_group_members m WHERE m.account_id=media_index.account_id) WHERE account_group_id IS NULL"
             )
             # Old one-time web sessions are intentionally invalidated on the
             # first upgraded startup.  The legacy claim flow replaces them.
@@ -1145,6 +1300,11 @@ class Database:
             raw.pop("review_batch_id", None)
             raw.pop("upload_source", None)
             raw.pop("upload_batch_id", None)
+            raw.pop("account_group_id", None)
+            raw.pop("logical_media_id", None)
+            raw.pop("content_sha256", None)
+            raw.pop("origin_account_id", None)
+            raw.pop("origin_message_id", None)
         return raw
 
     async def upsert_media_index(
@@ -1161,6 +1321,11 @@ class Database:
         upload_source: str | None = None,
         upload_batch_id: str | None = None,
         hidden: bool = False,
+        account_group_id: str | None = None,
+        logical_media_id: str | None = None,
+        content_sha256: str | None = None,
+        origin_account_id: str | None = None,
+        origin_message_id: int | None = None,
     ) -> dict[str, Any]:
         account_id = str(item["account_id"])
         message_id = int(item["id"])
@@ -1298,6 +1463,10 @@ class Database:
                     str(upload_source or item.get("upload_source") or ("helper_bot" if source_ingest_job_id is not None else "legacy"))[:40],
                     str(upload_batch_id or item.get("upload_batch_id") or "")[:120] or None,
                 ),
+            )
+            await db.execute(
+                "UPDATE media_index SET account_group_id=COALESCE(?,account_group_id), logical_media_id=COALESCE(?,logical_media_id,account_id || ':' || message_id), content_sha256=COALESCE(?,content_sha256), origin_account_id=COALESCE(?,origin_account_id,account_id), origin_message_id=COALESCE(?,origin_message_id,message_id) WHERE account_id=? AND message_id=?",
+                (account_group_id, logical_media_id, content_sha256, origin_account_id, origin_message_id, account_id, message_id),
             )
             await db.commit()
         await self._refresh_search_index(account_id, message_id)
@@ -2037,6 +2206,17 @@ class Database:
             await db.commit()
         await self.rebuild_timeline(account_id)
 
+    async def set_media_content_hash(self, account_id: str, message_id: int, content_sha256: str) -> None:
+        digest = str(content_sha256 or "").strip().lower()
+        if not digest:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE media_index SET content_sha256=?,last_seen_at=? WHERE account_id=? AND message_id=?",
+                (digest, _now(), account_id, int(message_id)),
+            )
+            await db.commit()
+
     async def mark_media_missing(self, account_id: str, seen_message_ids: Iterable[int]) -> int:
         """Mark indexed messages absent from a completed full Telegram scan."""
         seen_values: set[int] = set()
@@ -2179,6 +2359,7 @@ class Database:
         mime_type: str,
         size: int,
         temp_path: str,
+        account_group_id: str | None = None,
         owner_user_id: int | None = None,
         submitter_telegram_user_id: str | None = None,
         requested_visibility: str = "private",
@@ -2192,12 +2373,13 @@ class Database:
         now = _now()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO upload_jobs(id,account_id,filename,mime_type,size,status,phase,progress,bytes_sent,temp_path,"
+                "INSERT INTO upload_jobs(id,account_id,account_group_id,filename,mime_type,size,status,phase,progress,bytes_sent,temp_path,"
                 "owner_user_id,submitter_telegram_user_id,requested_visibility,review_status,batch_id,upload_source,quota_reservation_key,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'queued','receiving',0,0,?,?,?,?,?,?,?,?, ?,?)",
+                "VALUES(?,?,?,? ,? ,?,'queued','receiving',0,0,?,?,?,?,?,?,?,?, ?,?)",
                 (
                     job_id,
                     account_id,
+                    account_group_id,
                     filename,
                     mime_type,
                     int(size),
@@ -2285,6 +2467,304 @@ class Database:
                     (int(owner_user_id), int(limit)),
                 )
             return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Telegram logical account groups and disaster-recovery replication
+    # ------------------------------------------------------------------
+
+    async def ensure_account_group(self, group_id: str, *, name: str | None = None, primary_account_id: str) -> dict[str, Any]:
+        group_id = str(group_id).strip()
+        primary_account_id = str(primary_account_id).strip()
+        if not group_id or not primary_account_id:
+            raise ValueError("group_id and primary_account_id are required")
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO telegram_account_groups(id,name,primary_account_id,active_account_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (group_id, (name or group_id)[:120], primary_account_id, primary_account_id, now, now),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO telegram_account_group_members(group_id,account_id,role,sync_status,created_at,updated_at) VALUES(?,?, 'primary','ready',?,?)",
+                (group_id, primary_account_id, now, now),
+            )
+            await db.execute("UPDATE auth_users SET account_group_id=? WHERE account_id=? AND (account_group_id IS NULL OR account_group_id='')", (group_id, primary_account_id))
+            await db.execute("UPDATE media_users SET account_group_id=? WHERE account_id=? AND (account_group_id IS NULL OR account_group_id='')", (group_id, primary_account_id))
+            await db.execute("UPDATE media_index SET account_group_id=? WHERE account_id=? AND (account_group_id IS NULL OR account_group_id='')", (group_id, primary_account_id))
+            await db.commit()
+        return await self.get_account_group(group_id)  # type: ignore[return-value]
+
+    async def add_account_group_member(
+        self,
+        group_id: str,
+        account_id: str,
+        *,
+        role: str = "replica",
+        priority: int = 100,
+    ) -> dict[str, Any]:
+        if role not in {"primary", "replica"}:
+            raise ValueError("invalid account group role")
+        now = _now()
+        status = "ready" if role == "primary" else "pending"
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO telegram_account_group_members(group_id,account_id,role,priority,sync_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(group_id,account_id) DO UPDATE SET role=excluded.role,priority=excluded.priority,updated_at=excluded.updated_at",
+                (group_id, account_id, role, max(1, min(10000, int(priority))), status, now, now),
+            )
+            await db.commit()
+        return await self.get_account_group(group_id)  # type: ignore[return-value]
+
+    async def get_account_group(self, group_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM telegram_account_groups WHERE id=?", (group_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            member_cursor = await db.execute(
+                "SELECT * FROM telegram_account_group_members WHERE group_id=? ORDER BY role='primary' DESC, priority, account_id",
+                (group_id,),
+            )
+            members = [dict(item) for item in await member_cursor.fetchall()]
+        return {**dict(row), "members": members}
+
+    async def list_account_groups(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            groups = [dict(row) for row in await (await db.execute("SELECT * FROM telegram_account_groups ORDER BY id")).fetchall()]
+            members_cursor = await db.execute("SELECT * FROM telegram_account_group_members ORDER BY group_id, role='primary' DESC, priority, account_id")
+            members = [dict(row) for row in await members_cursor.fetchall()]
+        by_group: dict[str, list[dict[str, Any]]] = {}
+        for member in members:
+            by_group.setdefault(str(member["group_id"]), []).append(member)
+        for group in groups:
+            group["members"] = by_group.get(str(group["id"]), [])
+        return groups
+
+    async def account_group_for_account(self, account_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT g.*, m.role, m.priority, m.enabled, m.sync_status, m.processed_files, m.processed_bytes, m.total_files, m.total_bytes, m.last_error, m.sync_cursor "
+                "FROM telegram_account_groups g JOIN telegram_account_group_members m ON m.group_id=g.id WHERE m.account_id=?",
+                (account_id,),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_account_group(self, group_id: str, **updates: Any) -> dict[str, Any] | None:
+        allowed = {"active_account_id", "auto_failover_enabled", "replication_enabled", "rate_min_interval_ms", "rate_max_messages_per_minute", "rate_concurrency", "status", "health_failures", "last_health_error", "last_failover_at", "name"}
+        updates = {key: value for key, value in updates.items() if key in allowed}
+        if updates:
+            assignments = ",".join(f"{key}=?" for key in updates)
+            values = list(updates.values()) + [_now(), group_id]
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute(f"UPDATE telegram_account_groups SET {assignments},updated_at=? WHERE id=?", values)
+                await db.commit()
+        return await self.get_account_group(group_id)
+
+    async def update_account_group_member(self, group_id: str, account_id: str, **updates: Any) -> dict[str, Any] | None:
+        allowed = {"role", "priority", "enabled", "sync_status", "sync_cursor", "processed_files", "processed_bytes", "total_files", "total_bytes", "last_error", "last_sync_at"}
+        updates = {key: value for key, value in updates.items() if key in allowed}
+        if updates:
+            assignments = ",".join(f"{key}=?" for key in updates)
+            values = list(updates.values()) + [_now(), group_id, account_id]
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute(f"UPDATE telegram_account_group_members SET {assignments},updated_at=? WHERE group_id=? AND account_id=?", values)
+                await db.commit()
+        return await self.account_group_for_account(account_id)
+
+    async def create_replication_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        values = {
+            "id": str(payload.get("id") or uuid.uuid4()),
+            "group_id": str(payload["group_id"]),
+            "job_type": str(payload.get("job_type") or "live"),
+            "source_account_id": payload.get("source_account_id"),
+            "source_message_id": payload.get("source_message_id"),
+            "target_account_id": payload.get("target_account_id"),
+            "logical_media_id": payload.get("logical_media_id"),
+            "fingerprint": payload.get("fingerprint"),
+            "mutation_action": payload.get("mutation_action"),
+            "mutation_caption": payload.get("mutation_caption"),
+            "idempotency_key": str(payload.get("idempotency_key") or uuid.uuid4()),
+            "phase": str(payload.get("phase") or "queued"),
+            "status": str(payload.get("status") or "queued"),
+            "progress": float(payload.get("progress") or 0),
+            "attempts": int(payload.get("attempts") or 0),
+            "error": payload.get("error"),
+            "next_retry_at": payload.get("next_retry_at"),
+            "created_at": str(payload.get("created_at") or now),
+            "updated_at": str(payload.get("updated_at") or now),
+            "completed_at": payload.get("completed_at"),
+        }
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO telegram_replication_jobs(id,group_id,job_type,source_account_id,source_message_id,target_account_id,logical_media_id,fingerprint,mutation_action,mutation_caption,idempotency_key,phase,status,progress,attempts,error,next_retry_at,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(values[key] for key in ("id","group_id","job_type","source_account_id","source_message_id","target_account_id","logical_media_id","fingerprint","mutation_action","mutation_caption","idempotency_key","phase","status","progress","attempts","error","next_retry_at","created_at","updated_at","completed_at")),
+            )
+            await db.commit()
+        return await self.get_replication_job(values["id"])  # type: ignore[return-value]
+
+    async def get_replication_job(self, job_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM telegram_replication_jobs WHERE id=?", (job_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_replication_jobs(self, *, group_id: str | None = None, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if group_id and status:
+                cursor = await db.execute("SELECT * FROM telegram_replication_jobs WHERE group_id=? AND status=? ORDER BY created_at DESC LIMIT ?", (group_id, status, int(limit)))
+            elif group_id:
+                cursor = await db.execute("SELECT * FROM telegram_replication_jobs WHERE group_id=? ORDER BY created_at DESC LIMIT ?", (group_id, int(limit)))
+            elif status:
+                cursor = await db.execute("SELECT * FROM telegram_replication_jobs WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, int(limit)))
+            else:
+                cursor = await db.execute("SELECT * FROM telegram_replication_jobs ORDER BY created_at DESC LIMIT ?", (int(limit),))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def requeue_running_replication_jobs(self) -> int:
+        """Make interrupted copy jobs recoverable after an app restart."""
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "UPDATE telegram_replication_jobs SET status='queued', phase='queued', "
+                "next_retry_at=NULL, updated_at=? WHERE status='running'",
+                (_now(),),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0)
+
+    async def update_replication_job(self, job_id: str, **updates: Any) -> dict[str, Any] | None:
+        allowed = {"phase", "status", "progress", "attempts", "error", "next_retry_at", "completed_at"}
+        updates = {key: value for key, value in updates.items() if key in allowed}
+        if updates:
+            assignments = ",".join(f"{key}=?" for key in updates)
+            values = list(updates.values()) + [_now(), job_id]
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute(f"UPDATE telegram_replication_jobs SET {assignments},updated_at=? WHERE id=?", values)
+                await db.commit()
+        return await self.get_replication_job(job_id)
+
+    async def enqueue_replication_for_media(self, *, group_id: str, source_account_id: str, source_message_id: int, logical_media_id: str, fingerprint: str | None = None, job_type: str = "live") -> int:
+        group = await self.get_account_group(group_id)
+        if not group or not int(group.get("replication_enabled") or 0):
+            return 0
+        created = 0
+        for member in group.get("members", []):
+            target = str(member.get("account_id"))
+            if target == source_account_id or not int(member.get("enabled") or 0) or str(member.get("sync_status")) not in {"ready", "running", "pending"}:
+                continue
+            key = f"{job_type}:{group_id}:{source_account_id}:{source_message_id}:{target}"
+            await self.create_replication_job({
+                "group_id": group_id, "job_type": job_type, "source_account_id": source_account_id,
+                "source_message_id": source_message_id, "target_account_id": target,
+                "logical_media_id": logical_media_id, "fingerprint": fingerprint, "idempotency_key": key,
+            })
+            created += 1
+        return created
+
+    async def get_replication_mapping(self, group_id: str, target_account_id: str, logical_media_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM telegram_replication_mappings WHERE group_id=? AND target_account_id=? AND logical_media_id=?", (group_id, target_account_id, logical_media_id))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_replication_mappings(self, group_id: str, source_account_id: str, source_message_id: int) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM telegram_replication_mappings WHERE group_id=? AND source_account_id=? AND source_message_id=?", (group_id, source_account_id, int(source_message_id)))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_replication_mappings_for_logical(self, group_id: str, logical_media_id: str) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM telegram_replication_mappings WHERE group_id=? AND logical_media_id=?",
+                (group_id, logical_media_id),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def update_replica_metadata(
+        self,
+        group_id: str,
+        logical_media_id: str,
+        *,
+        visibility: str | None = None,
+        requested_visibility: str | None = None,
+        review_status: str | None = None,
+        hidden: bool | None = None,
+        deleted: bool | None = None,
+    ) -> int:
+        """Apply a moderation mutation to every physical copy of a media item."""
+        assignments: list[str] = []
+        values: list[Any] = []
+        if visibility in {"public", "private"}:
+            assignments.append("visibility=?"); values.append(visibility)
+        if requested_visibility in {"public", "private"}:
+            assignments.append("requested_visibility=?"); values.append(requested_visibility)
+        if review_status in {"not_required", "pending", "approved", "rejected", "revoked"}:
+            assignments.append("review_status=?"); values.append(review_status)
+        if hidden is not None:
+            assignments.append("hidden=?"); values.append(1 if hidden else 0)
+        if deleted is not None:
+            assignments.append("deleted=?"); values.append(1 if deleted else 0)
+        if not assignments:
+            return 0
+        assignments.append("last_seen_at=?"); values.append(_now())
+        values.extend([group_id, logical_media_id])
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "UPDATE media_index SET " + ",".join(assignments) +
+                " WHERE account_group_id=? AND logical_media_id=?",
+                values,
+            )
+            changed = int(cursor.rowcount or 0)
+            await db.commit()
+        return changed
+
+    async def save_replication_mapping(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        fields = ("group_id","logical_media_id","source_account_id","source_message_id","target_account_id","target_message_id","fingerprint","content_sha256","size","mime_type","filename","owner_user_id","submitter_telegram_user_id","visibility","requested_visibility","review_status","hidden")
+        values = [payload.get(field) for field in fields]
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO telegram_replication_mappings(" + ",".join(fields) + ",created_at,updated_at) VALUES(" + ",".join("?" for _ in fields) + ",?,?) ON CONFLICT(group_id,target_account_id,logical_media_id) DO UPDATE SET target_message_id=excluded.target_message_id,fingerprint=excluded.fingerprint,content_sha256=excluded.content_sha256,updated_at=excluded.updated_at",
+                (*values, now, now),
+            )
+            # Likes belong to the logical media item. Carry them to a newly
+            # materialized physical copy so a failover does not reset users'
+            # social state.
+            await db.execute(
+                "INSERT OR IGNORE INTO media_likes(user_id,account_id,message_id,created_at) "
+                "SELECT l.user_id,?, ?,l.created_at FROM media_likes l "
+                "WHERE l.account_id=? AND l.message_id=?",
+                (str(payload["target_account_id"]), int(payload["target_message_id"]), str(payload["source_account_id"]), int(payload["source_message_id"])),
+            )
+            await db.commit()
+        return await self.get_replication_mapping(str(payload["group_id"]), str(payload["target_account_id"]), str(payload["logical_media_id"]))  # type: ignore[return-value]
+
+    async def record_failover(self, group_id: str, previous_account_id: str, active_account_id: str, reason: str, health_failures: int) -> None:
+        now = _now()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("INSERT INTO telegram_failover_events(group_id,previous_account_id,active_account_id,reason,health_failures,created_at) VALUES(?,?,?,?,?,?)", (group_id, previous_account_id, active_account_id, reason, int(health_failures), now))
+            if previous_account_id:
+                await db.execute(
+                    "UPDATE telegram_account_group_members SET sync_status='paused',last_error=?,updated_at=? WHERE group_id=? AND account_id=?",
+                    ("quarantined after failover", now, group_id, previous_account_id),
+                )
+            await db.execute("UPDATE telegram_account_groups SET active_account_id=?,status='failed_over',health_failures=0,last_health_error=NULL,last_failover_at=?,updated_at=? WHERE id=?", (active_account_id, now, now, group_id))
+            await db.execute("UPDATE auth_users SET account_id=? WHERE account_group_id=?", (active_account_id, group_id))
+            await db.execute("UPDATE media_users SET account_id=? WHERE account_group_id=?", (active_account_id, group_id))
+            await db.execute(
+                "UPDATE upload_jobs SET account_id=?,updated_at=? WHERE account_group_id=? "
+                "AND status NOT IN ('completed','failed','cancelled')",
+                (active_account_id, now, group_id),
+            )
+            await db.commit()
 
     # ------------------------------------------------------------------
     # Public square: likes, reports, sanctions, and moderation jobs

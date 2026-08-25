@@ -297,7 +297,7 @@ class AuthStore:
             await db.execute("DELETE FROM trusted_devices WHERE user_id=?", (int(user_id),))
             await db.commit()
 
-    async def update_user(self, user_id: int, *, status: str | None = None, role: str | None = None, account_id: str | None = None, binding_sync_status: str | None = None, ban_reason: str | None = None) -> dict[str, Any] | None:
+    async def update_user(self, user_id: int, *, status: str | None = None, role: str | None = None, account_id: str | None = None, account_group_id: str | None = None, binding_sync_status: str | None = None, ban_reason: str | None = None) -> dict[str, Any] | None:
         if status and status not in {"pending", "approved", "disabled", "denied"}:
             raise ValueError("invalid user status")
         if role and role not in {"user", "admin", "superadmin"}:
@@ -313,6 +313,9 @@ class AuthStore:
         if account_id is not None:
             fields.append("account_id=?")
             values.append(account_id)
+        if account_group_id is not None:
+            fields.append("account_group_id=?")
+            values.append(account_group_id)
         if binding_sync_status is not None:
             fields.append("binding_sync_status=?")
             values.append(binding_sync_status)

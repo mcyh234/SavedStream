@@ -17,9 +17,10 @@ class MediaIndexer:
     instead of starting over.
     """
 
-    def __init__(self, database: Database, telegram: TeleBoxClient) -> None:
+    def __init__(self, database: Database, telegram: TeleBoxClient, replication: Any | None = None) -> None:
         self.database = database
         self.telegram = telegram
+        self.replication = replication
         self._task: asyncio.Task[None] | None = None
         self._ingest_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -182,7 +183,13 @@ class MediaIndexer:
                             requested_visibility=requested_visibility,
                             review_status=review_status,
                             review_batch_id=str(job.get("review_batch_id") or "") or None,
+                            account_group_id=str((await self.database.account_group_for_account(account_id) or {}).get("id") or "") or None,
                         )
+                        if self.replication:
+                            try:
+                                await self.replication.enqueue_media(account_id, saved_message_id)
+                            except Exception:
+                                pass
                         affected_accounts.add(account_id)
                         processed += 1
                     except asyncio.CancelledError:

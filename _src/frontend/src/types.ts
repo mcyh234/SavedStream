@@ -67,6 +67,45 @@ export interface AccountStatus {
   error?: string | null;
   user_id?: string | null;
   username?: string | null;
+  account_group_id?: string | null;
+  account_role?: "primary" | "replica" | string;
+  account_priority?: number;
+  account_enabled?: boolean;
+  replication_status?: "pending" | "running" | "ready" | "paused" | "failed" | string;
+  replication_processed_files?: number;
+  replication_processed_bytes?: number;
+  replication_total_files?: number | null;
+  replication_total_bytes?: number | null;
+  replication_error?: string | null;
+  active?: boolean;
+}
+
+export interface TelegramAccountGroup {
+  id: string;
+  name: string;
+  primary_account_id: string;
+  active_account_id: string;
+  auto_failover_enabled: number | boolean;
+  replication_enabled: number | boolean;
+  rate_min_interval_ms?: number;
+  rate_max_messages_per_minute?: number;
+  rate_concurrency?: number;
+  status: string;
+  health_failures: number;
+  last_health_error?: string | null;
+  last_failover_at?: string | null;
+  members: Array<AccountStatus & {
+    group_id: string;
+    account_id: string;
+    role: string;
+    priority: number;
+    sync_status: string;
+    processed_files?: number;
+    processed_bytes?: number;
+    total_files?: number | null;
+    total_bytes?: number | null;
+    last_error?: string | null;
+  }>;
 }
 
 export interface HelperBotStatus {
@@ -445,4 +484,5 @@ export interface AdminSettings {
   upload_jobs: UploadJob[];
   traffic: TrafficSummary;
   helper_rate_limit: HelperRateLimit;
+  account_groups?: TelegramAccountGroup[];
 }

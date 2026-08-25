@@ -68,6 +68,7 @@ import type {
   MediaReportGroup,
   UserSanction,
   ContentDeletionJob,
+  TelegramAccountGroup,
 } from "./types";
 import ThemeSelector from "./ThemeSelector";
 
@@ -2691,6 +2692,9 @@ function CoordinationPanel({ settings, onRefresh }: { settings: AdminSettings; o
   const [profileLabel, setProfileLabel] = useState("");
   const [apiId, setApiId] = useState("");
   const [apiHash, setApiHash] = useState("");
+  const [accountRole, setAccountRole] = useState<"primary" | "replica">("primary");
+  const [accountGroupId, setAccountGroupId] = useState("");
+  const [accountPriority, setAccountPriority] = useState("100");
   const [loginAccountId, setLoginAccountId] = useState("");
   const [loginStatus, setLoginStatus] = useState<{ state: string; qr_url?: string | null; expires_at?: string | null; error?: string | null } | null>(null);
   const loginCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -2732,12 +2736,13 @@ function CoordinationPanel({ settings, onRefresh }: { settings: AdminSettings; o
     await run("account", async () => {
       const created = await api<{ id: string }>("/api/admin/accounts", {
         method: "POST",
-        body: JSON.stringify({ id: profileId, label: profileLabel || profileId, api_id: Number(apiId), api_hash: apiHash, session: "" }),
+        body: JSON.stringify({ id: profileId, label: profileLabel || profileId, api_id: Number(apiId), api_hash: apiHash, session: "", role: accountRole, group_id: accountRole === "replica" ? accountGroupId : undefined, priority: Number(accountPriority) || 100 }),
       });
       const login = await api<typeof loginStatus>(`/api/admin/accounts/${encodeURIComponent(created.id)}/login/qr`, { method: "POST" });
       setLoginAccountId(created.id);
       setLoginStatus(login);
       setProfileId(""); setProfileLabel(""); setApiId(""); setApiHash("");
+      setAccountRole("primary"); setAccountGroupId(""); setAccountPriority("100");
     });
   }
 
@@ -2781,6 +2786,17 @@ function CoordinationPanel({ settings, onRefresh }: { settings: AdminSettings; o
             <input required value={profileLabel} onChange={(e) => setProfileLabel(e.target.value)} placeholder={tr("显示名称", "Display name")} />
             <input required inputMode="numeric" value={apiId} onChange={(e) => setApiId(e.target.value)} placeholder="Telegram API ID" />
             <input required type="password" value={apiHash} onChange={(e) => setApiHash(e.target.value)} placeholder="Telegram API Hash" />
+            <select value={accountRole} onChange={(e) => setAccountRole(e.target.value as "primary" | "replica")} aria-label={tr("账号角色", "Account role")}>
+              <option value="primary">{tr("主账号", "Primary account")}</option>
+              <option value="replica">{tr("备用容灾账号", "Disaster-recovery replica")}</option>
+            </select>
+            {accountRole === "replica" && <>
+              <select required value={accountGroupId} onChange={(e) => setAccountGroupId(e.target.value)} aria-label={tr("逻辑账号组", "Logical account group")}>
+                <option value="">{tr("选择逻辑账号组", "Select account group")}</option>
+                {(settings.account_groups || []).map((group) => <option key={group.id} value={group.id}>{group.name} · {group.id}</option>)}
+              </select>
+              <input required type="number" min={1} max={10000} value={accountPriority} onChange={(e) => setAccountPriority(e.target.value)} placeholder={tr("优先级", "Priority")} />
+            </>}
           </div>
           <button className="button secondary" disabled={busy === "account"} type="submit">{busy === "account" ? <LoaderCircle className="spin" size={17} /> : <UserPlus size={17} />}{tr("添加并扫码连接", "Add and connect by QR")}</button>
         </form>
@@ -2816,6 +2832,26 @@ function CoordinationPanel({ settings, onRefresh }: { settings: AdminSettings; o
             </div>
           ))}
         </div>
+        {(settings.account_groups || []).map((group: TelegramAccountGroup) => <div className="coordination-pane" key={group.id}>
+          <h3><Shield size={18} />{tr("容灾账号组", "Disaster-recovery group")} · {group.name}</h3>
+          <p>{tr("当前活动账号", "Active account")}: <strong>{group.active_account_id}</strong> · {group.status} · {tr("健康失败", "health failures")} {group.health_failures}</p>
+          <div className="coordination-lists">
+            {group.members.filter((member) => member.role === "replica").map((member) => {
+              const processed = Number(member.processed_files || 0);
+              const total = Number(member.total_files || 0);
+              const processedBytes = Number(member.processed_bytes || 0);
+              const totalBytes = Number(member.total_bytes || 0);
+              const percent = total > 0 ? Math.min(100, processed / total * 100) : member.sync_status === "ready" ? 100 : 0;
+              const bytePercent = totalBytes > 0 ? Math.min(100, processedBytes / totalBytes * 100) : percent;
+              return <div className="coordination-row" key={`${group.id}:${member.account_id}`}>
+                <span><strong>{member.account_id} · {member.sync_status}</strong><small>{processed}/{total || "?"} {tr("文件", "files")} · {formatBytes(processedBytes)}/{totalBytes ? formatBytes(totalBytes) : "?"}{member.last_error ? ` · ${member.last_error}` : ""}</small><progress max={100} value={percent} aria-label={tr("文件同步进度", "File replication progress")} /><progress max={100} value={bytePercent} aria-label={tr("字节同步进度", "Byte replication progress")} /></span>
+                <button className="button secondary" disabled={busy === `sync-${member.account_id}`} onClick={() => void run(`sync-${member.account_id}`, () => api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/replicas/${encodeURIComponent(member.account_id)}/sync`, { method: "POST" }))} type="button"><RefreshCw size={15} />{tr("重新同步", "Resync")}</button>
+                {member.sync_status === "ready" && member.account_id !== group.active_account_id && <button className="button secondary" disabled={busy === `failover-${member.account_id}`} onClick={() => { if (window.confirm(tr("确认切换到此容灾账号？系统不会自动切回主账号。", "Switch to this replica? Automatic failback is disabled."))) void run(`failover-${member.account_id}`, () => api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/failover`, { method: "POST", body: JSON.stringify({ target_account_id: member.account_id }) })); }} type="button"><Shield size={15} />{tr("立即切换", "Fail over now")}</button>}
+              </div>;
+            })}
+          </div>
+          <button className="button secondary" onClick={() => void run(`group-${group.id}`, () => api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/settings`, { method: "PUT", body: JSON.stringify({ auto_failover_enabled: !Boolean(group.auto_failover_enabled), replication_enabled: Boolean(group.replication_enabled), rate_min_interval_ms: group.rate_min_interval_ms || 3000, rate_max_messages_per_minute: group.rate_max_messages_per_minute || 10, rate_concurrency: 1 }) }))} type="button">{Boolean(group.auto_failover_enabled) ? tr("关闭自动切换", "Disable auto failover") : tr("开启自动切换", "Enable auto failover")}</button>
+        </div>)}
         <div><h3>{tr("提交者绑定", "Submitter bindings")}</h3>{settings.bindings.length === 0 ? <p className="muted">{tr("暂无绑定", "No bindings")}</p> : settings.bindings.map((item) => <div className="coordination-row" key={item.telegram_user_id}><span><strong>{item.telegram_user_id}</strong><small>{item.account_id}</small></span><button className="icon-button" title={tr("撤销绑定", "Revoke binding")} aria-label={tr("撤销绑定", "Revoke binding")} onClick={() => void run(`binding-${item.telegram_user_id}`, () => api("/api/admin/bindings", { method: "DELETE", body: JSON.stringify({ submitter_id: item.telegram_user_id }) }))} type="button"><Trash2 size={17} /></button></div>)}</div>
         <details className="ingest-jobs">
           <summary>

@@ -1,5 +1,11 @@
 # SavedStream
 
+> 当前程序处于快速迭代期，使用可能会出现体验不佳或各种 Bug；欢迎提交 Issue。
+
+## Telegram 多账号容灾
+
+管理后台支持为账号设置逻辑账号组和备用容灾角色。复制队列、Telegram FloodWait、进度游标和故障切换状态均由后端持久化；备用账号保持隐藏于普通用户账号选择器之外。
+
 ## TeleBox 双容器模式
 
 Compose 会启动 `savedstream` 和内部的 `telebox` Bridge。浏览器只访问 SavedStream；TeleBox 的 9000 端口不会发布到宿主机。

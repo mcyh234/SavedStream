@@ -4,6 +4,10 @@
 
 > Personal private edition. This snapshot is published to the public SavedStream repository for collaborative iteration.
 
+## Telegram 多账号容灾
+
+管理员可以在“Telegram 与多账号”中将已扫码账号加入逻辑账号组并标记为备用容灾账号。备用账号会从主账号 Saved Messages 最早消息开始按保守速率限流同步，系统使用稳定 marker、指纹和映射表去重；新入库媒体会异步复制到所有启用副本。主账号连续 3 次健康检查失败后，系统可自动切换到已完成同步的最高优先级副本；主账号恢复后不会自动切回。复制失败不阻塞主流程，会在后台保留重试任务和错误状态。
+
 ## Encrypted media edition
 
 - Thumbnail and media cache files are encrypted at rest with AES-256-GCM and the independent `MEDIA_CACHE_KEY`.

@@ -86,6 +86,51 @@ class TeleBoxClient:
     async def account_login_status(self, account_id: str) -> dict[str, Any]:
         return (await self._request("GET", f"/v1/accounts/{quote(account_id)}/login")).json()
 
+    async def account_health(self, account_id: str) -> dict[str, Any]:
+        return (await self._request("GET", f"/v1/accounts/{quote(account_id)}/health")).json()
+
+    async def replication_copy(
+        self,
+        *,
+        source_account_id: str,
+        target_account_id: str,
+        source_message_id: int,
+        logical_media_id: str,
+        fingerprint: str,
+        filename: str,
+        mime_type: str,
+        caption: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return (
+            await self._request(
+                "POST",
+                "/v1/replication/copy",
+                json={
+                    "source_account_id": source_account_id,
+                    "target_account_id": target_account_id,
+                    "source_message_id": int(source_message_id),
+                    "logical_media_id": logical_media_id,
+                    "fingerprint": fingerprint,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "caption": caption,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+        ).json()
+
+    async def replication_mutation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return (await self._request("POST", "/v1/replication/mutation", json=payload)).json()
+
+    async def find_replication(self, account_id: str, *, marker: str | None = None, fingerprint: str | None = None) -> dict[str, Any]:
+        params: dict[str, str] = {}
+        if marker:
+            params["marker"] = marker
+        if fingerprint:
+            params["fingerprint"] = fingerprint
+        return (await self._request("GET", f"/v1/accounts/{quote(account_id)}/replication/find", params=params)).json()
+
     async def cancel_account_login(self, account_id: str) -> dict[str, Any]:
         return (await self._request("DELETE", f"/v1/accounts/{quote(account_id)}/login")).json()
 
@@ -125,12 +170,15 @@ class TeleBoxClient:
         cursor: int | None = None,
         after_id: int | None = None,
         limit: int = 200,
+        order: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"mode": mode, "limit": max(1, min(500, int(limit)))}
         if cursor:
             params["cursor"] = cursor
         if after_id:
             params["after_id"] = after_id
+        if order in {"oldest", "newest"}:
+            params["order"] = order
         return (await self._request("GET", f"/v1/accounts/{quote(account_id)}/media/sync", params=params)).json()
 
     async def get_media_message(self, account_id: str, message_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
