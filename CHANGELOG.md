@@ -10,6 +10,8 @@
 - 新增加密 `.ssbak` 归档、cron 定时上传 Telegram 收藏夹、失败重试和临时文件清理。
 - 新增管理员本地上传、Telegram 历史扫描、下载恢复和事务回滚。
 - 备份内容覆盖 SavedStream 数据库、媒体索引以及 TeleBox 账号/Bridge/Helper Bot 状态。
+- 修复重复扫描 Telegram 时同一账号与消息记录冲突导致的 500；扫描现在幂等复用已有备份记录，并保留归档校验信息与导入时间。
+- 未显式选择账号时，Telegram 备份扫描使用服务端配置备份设置中的账号，前端不再发送空的 `account_id` 查询参数。
 
 ## Telegram 多账号容灾
 

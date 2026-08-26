@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.database import Database
+from app.main import scan_admin_system_backups
 from app.system_backups import (
     SystemBackupError,
     create_archive,
@@ -61,6 +62,93 @@ async def test_system_backup_database_tables_and_settings(tmp_path: Path) -> Non
         "created_at": "2026-08-25T00:00:00+00:00", "updated_at": "2026-08-25T00:00:00+00:00", "completed_at": None,
     })
     assert job["id"] == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_system_backup_telegram_location_upsert_is_idempotent(tmp_path: Path) -> None:
+    database = Database(tmp_path / "savedstream.db")
+    await database.initialize()
+    original = await database.create_system_backup({
+        "id": "local-random-id",
+        "filename": "savedstream-system-20260826-120000.ssbak",
+        "source": "manual",
+        "status": "available",
+        "created_at": "2026-08-26T04:00:00+00:00",
+        "size_bytes": 123,
+        "sha256": "known-sha256",
+        "account_id": "alpha",
+        "message_id": 77,
+        "manifest_json": '{"format_version":1}',
+        "error": None,
+        "imported_at": "2026-08-26T05:00:00+00:00",
+    })
+    rescanned = await database.create_system_backup({
+        "id": "telegram-derived-id",
+        "filename": original["filename"],
+        "source": "telegram",
+        "status": "available",
+        "created_at": original["created_at"],
+        "size_bytes": 123,
+        "sha256": "",
+        "account_id": "alpha",
+        "message_id": 77,
+        "manifest_json": '{"marker":"#savedstream-system-backup:v1"}',
+        "error": None,
+        "imported_at": None,
+    })
+
+    assert rescanned["id"] == "local-random-id"
+    assert rescanned["sha256"] == "known-sha256"
+    assert rescanned["imported_at"] == "2026-08-26T05:00:00+00:00"
+    assert len(await database.list_system_backups()) == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_telegram_reuses_existing_backup_and_configured_account(tmp_path: Path) -> None:
+    class FakeTeleBox:
+        requested_account = ""
+
+        async def resolve_account(self, account_id: str) -> str:
+            self.requested_account = account_id
+            return account_id
+
+        async def list_system_backups(self, *, account_id: str) -> list[dict]:
+            assert account_id == "configured-backup"
+            return [{
+                "id": 88,
+                "filename": "savedstream-system-20260826-130000.ssbak",
+                "date": "2026-08-26T05:00:00+00:00",
+                "size": 456,
+            }]
+
+    database = Database(tmp_path / "savedstream.db")
+    await database.initialize()
+    await database.update_system_backup_settings({"account_id": "configured-backup"})
+    await database.create_system_backup({
+        "id": "existing-local-id",
+        "filename": "savedstream-system-20260826-130000.ssbak",
+        "source": "scheduled",
+        "status": "available",
+        "created_at": "2026-08-26T05:00:00+00:00",
+        "size_bytes": 456,
+        "sha256": "archive-sha",
+        "account_id": "configured-backup",
+        "message_id": 88,
+        "manifest_json": '{"format_version":1}',
+        "error": None,
+        "imported_at": None,
+    })
+    telegram = FakeTeleBox()
+
+    result = await scan_admin_system_backups(account_id="", database=database, telegram=telegram)  # type: ignore[arg-type]
+
+    assert telegram.requested_account == "configured-backup"
+    assert result["discovered"] == 0
+    assert len(result["items"]) == 1
+    assert result["items"][0]["id"] == "existing-local-id"
+    manifest = json.loads(result["items"][0]["manifest_json"])
+    assert manifest["format_version"] == 1
+    assert manifest["telegram"]["id"] == 88
 
 
 @pytest.mark.asyncio

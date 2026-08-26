@@ -3661,23 +3661,51 @@ async def scan_admin_system_backups(
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
 ) -> dict[str, Any]:
-    account = await telegram.resolve_account(account_id or settings.telebox_default_account)
+    requested_account = str(account_id or "").strip()
+    if not requested_account:
+        backup_settings = await database.get_system_backup_settings()
+        requested_account = str(backup_settings.get("account_id") or settings.telebox_default_account).strip()
+    account = await telegram.resolve_account(requested_account)
     items = await telegram.list_system_backups(account_id=account)
     created = 0
     for item in items:
-        backup_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"savedstream:{account}:{item.get('id')}"))
-        existing = await database.get_system_backup(backup_id)
+        try:
+            message_id = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if message_id <= 0:
+            continue
+        existing = await database.get_system_backup_by_telegram_message(account, message_id)
+        stable_backup_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"savedstream:{account}:{message_id}"))
+        if not existing:
+            existing = await database.get_system_backup(stable_backup_id)
+        backup_id = str(existing["id"]) if existing else stable_backup_id
+        if existing:
+            try:
+                manifest_json = json.loads(str(existing.get("manifest_json") or "{}"))
+            except (TypeError, ValueError):
+                manifest_json = {}
+            if not isinstance(manifest_json, dict):
+                manifest_json = {}
+            manifest_json["telegram"] = item
+            manifest_json.setdefault("marker", BACKUP_MARKER)
+        else:
+            manifest_json = {"marker": BACKUP_MARKER, "telegram": item}
         await database.create_system_backup({
             "id": backup_id,
             "filename": str(item.get("filename") or f"telegram-{item.get('id')}.ssbak"),
-            "source": "telegram",
+            "source": str(existing.get("source") or "telegram") if existing else "telegram",
             "status": "available",
-            "created_at": str(item.get("date") or utc_now()),
+            "created_at": (
+                str(existing.get("created_at") or item.get("date") or utc_now())
+                if existing
+                else str(item.get("date") or utc_now())
+            ),
             "size_bytes": int(item.get("size") or 0),
-            "sha256": "",
+            "sha256": str(existing.get("sha256") or "") if existing else "",
             "account_id": account,
-            "message_id": int(item.get("id") or 0) or None,
-            "manifest_json": json.dumps({"marker": BACKUP_MARKER, "telegram": item}, ensure_ascii=False),
+            "message_id": message_id,
+            "manifest_json": json.dumps(manifest_json, ensure_ascii=False),
             "error": None,
             "imported_at": existing.get("imported_at") if existing else None,
         })

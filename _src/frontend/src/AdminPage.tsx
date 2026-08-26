@@ -1673,7 +1673,8 @@ function SystemBackupAdminPanel({ settings }: { settings: AdminSettings | null }
   async function scanTelegram() {
     setBusy("scan"); setError(""); setNotice("");
     try {
-      const result = await api<{ discovered: number; items: SystemBackupRecord[] }>("/api/admin/system-backups/scan-telegram?account_id=" + encodeURIComponent(draft.account_id || ""), { method: "POST" });
+      const accountQuery = draft.account_id ? `?account_id=${encodeURIComponent(draft.account_id)}` : "";
+      const result = await api<{ discovered: number; items: SystemBackupRecord[] }>(`/api/admin/system-backups/scan-telegram${accountQuery}`, { method: "POST" });
       setItems(result.items || []); setNotice(tr(`已发现 ${result.discovered} 份 Telegram 备份。`, `Discovered ${result.discovered} Telegram backup(s).`));
     } catch (reason) { setError(errorMessage(reason)); }
     finally { setBusy(""); }

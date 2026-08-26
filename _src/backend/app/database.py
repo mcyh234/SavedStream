@@ -932,23 +932,56 @@ class Database:
             "id", "filename", "source", "status", "created_at", "size_bytes", "sha256",
             "account_id", "message_id", "manifest_json", "error", "imported_at",
         ]
-        values = [item.get(field) for field in fields]
+        resolved_id = str(item["id"])
         async with aiosqlite.connect(self.path) as db:
+            # A backup created locally receives a random id before it is uploaded,
+            # while a later Telegram scan derives a stable id from the message.
+            # Reconcile those two identities under a write lock so repeated or
+            # concurrent scans remain idempotent instead of violating the
+            # UNIQUE(account_id, message_id) constraint.
+            await db.execute("BEGIN IMMEDIATE")
+            account_id = item.get("account_id")
+            message_id = item.get("message_id")
+            if account_id is not None and message_id is not None:
+                cursor = await db.execute(
+                    "SELECT id FROM system_backups WHERE account_id=? AND message_id=?",
+                    (str(account_id), int(message_id)),
+                )
+                existing = await cursor.fetchone()
+                if existing:
+                    resolved_id = str(existing[0])
+            values = [resolved_id if field == "id" else item.get(field) for field in fields]
             await db.execute(
                 f"INSERT INTO system_backups({','.join(fields)}) VALUES({','.join('?' for _ in fields)}) "
                 "ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,status=excluded.status,"
-                "size_bytes=excluded.size_bytes,sha256=excluded.sha256,account_id=excluded.account_id,"
+                "size_bytes=excluded.size_bytes,"
+                "sha256=CASE WHEN excluded.sha256<>'' THEN excluded.sha256 ELSE system_backups.sha256 END,"
+                "account_id=excluded.account_id,"
                 "message_id=excluded.message_id,manifest_json=excluded.manifest_json,error=excluded.error,"
-                "imported_at=excluded.imported_at",
+                "imported_at=COALESCE(excluded.imported_at,system_backups.imported_at)",
                 values,
             )
             await db.commit()
-        return await self.get_system_backup(str(item["id"])) or dict(item)
+        return await self.get_system_backup(resolved_id) or {**item, "id": resolved_id}
 
     async def get_system_backup(self, backup_id: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM system_backups WHERE id=?", (backup_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_system_backup_by_telegram_message(
+        self,
+        account_id: str,
+        message_id: int,
+    ) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM system_backups WHERE account_id=? AND message_id=?",
+                (str(account_id), int(message_id)),
+            )
             row = await cursor.fetchone()
         return dict(row) if row else None
 
