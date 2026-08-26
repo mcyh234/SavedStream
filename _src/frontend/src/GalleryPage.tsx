@@ -348,7 +348,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         q: debouncedQuery,
         scope: isAdmin ? scope : "public",
       });
-      if (!isAdmin) params.set("view", view);
+      if (!isAdmin || view !== "private") params.set("view", view);
       if (account && account !== "all") params.set("account", account);
       if (folderId !== null) params.set("folder_id", String(folderId));
       if (nextCursor !== null) params.set("cursor", String(nextCursor));
@@ -387,7 +387,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         q: debouncedQuery,
         scope: isAdmin ? scope : "public",
       });
-      if (!isAdmin) params.set("view", view);
+      if (!isAdmin || view !== "private") params.set("view", view);
       if (account && account !== "all") params.set("account", account);
       const result = await api<TimelineResponse>(`/api/media/timeline?${params}`);
       setTimeline(result);
@@ -656,14 +656,12 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
       </header>
 
       <aside className="sidebar" aria-label={tr("媒体分类", "Media categories")}>
-        {!isAdmin && (
-          <nav className="sidebar-view-nav" aria-label={tr("媒体空间", "Media spaces")}>
-            <button className={view === "private" ? "active" : ""} onClick={() => { setView("private"); setDateRange(null); setFolderId(null); }} type="button"><Shield size={20} /><span>{tr("我的相册", "My album")}</span></button>
-            <button className={view === "square" ? "active" : ""} onClick={() => { setView("square"); setDateRange(null); setFolderId(null); }} type="button"><Globe2 size={20} /><span>{tr("广场", "Square")}</span></button>
-            <button className={view === "my_public" ? "active" : ""} onClick={() => { setView("my_public"); setDateRange(null); setFolderId(null); }} type="button"><SquareArrowUp size={20} /><span>{tr("我的公开", "My public")}</span></button>
-            <button className={view === "liked" ? "active" : ""} onClick={() => { setView("liked"); setDateRange(null); setFolderId(null); }} type="button"><Heart size={20} /><span>{tr("我的点赞", "My likes")}</span></button>
-          </nav>
-        )}
+        <nav className="sidebar-view-nav" aria-label={tr("媒体空间", "Media spaces")}>
+          <button className={view === "private" ? "active" : ""} onClick={() => { setView("private"); setDateRange(null); setFolderId(null); }} type="button"><Shield size={20} /><span>{isAdmin ? tr("媒体管理", "Media admin") : tr("我的相册", "My album")}</span></button>
+          <button className={view === "square" ? "active" : ""} onClick={() => { setView("square"); setDateRange(null); setFolderId(null); }} type="button"><Globe2 size={20} /><span>{tr("广场", "Square")}</span></button>
+          <button className={view === "my_public" ? "active" : ""} onClick={() => { setView("my_public"); setDateRange(null); setFolderId(null); }} type="button"><SquareArrowUp size={20} /><span>{tr("我的公开", "My public")}</span></button>
+          <button className={view === "liked" ? "active" : ""} onClick={() => { setView("liked"); setDateRange(null); setFolderId(null); }} type="button"><Heart size={20} /><span>{tr("我的点赞", "My likes")}</span></button>
+        </nav>
         <nav>
           {filters.map((filter) => {
             const Icon = filter.icon;
@@ -699,6 +697,11 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
 
       <main className="library" id="main-content">
         <div className="mobile-filters" aria-label={tr("媒体分类", "Media categories")}>
+          <button className={view === "private" ? "active" : ""} onClick={() => { setView("private"); setDateRange(null); setFolderId(null); }} type="button">{isAdmin ? tr("媒体管理", "Media admin") : tr("我的相册", "My album")}</button>
+          <button className={view === "square" ? "active" : ""} onClick={() => { setView("square"); setDateRange(null); setFolderId(null); }} type="button">{tr("广场", "Square")}</button>
+          <button className={view === "my_public" ? "active" : ""} onClick={() => { setView("my_public"); setDateRange(null); setFolderId(null); }} type="button">{tr("我的公开", "My public")}</button>
+          <button className={view === "liked" ? "active" : ""} onClick={() => { setView("liked"); setDateRange(null); setFolderId(null); }} type="button">{tr("我的点赞", "My likes")}</button>
+          <span className="mobile-filter-divider" aria-hidden="true" />
           {filters.map((filter) => (
             <button
               className={kind === filter.value ? "active" : ""}

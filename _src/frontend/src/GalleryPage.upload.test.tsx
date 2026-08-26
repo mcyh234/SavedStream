@@ -130,4 +130,23 @@ describe("gallery upload and square interactions", () => {
     expect(container.querySelector(".report-dialog")?.textContent).toMatch(/举报资源|Report media/);
     expect(container.querySelector(".media-card-social")?.textContent).toContain("3");
   });
+
+  it("keeps square, uploader public, and likes visible for administrators", async () => {
+    await act(async () => {
+      root.render(<I18nProvider><GalleryPage isAdmin /></I18nProvider>);
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    const navigation = container.querySelector(".sidebar-view-nav");
+    expect(navigation?.textContent).toMatch(/广场|Square/);
+    expect(navigation?.textContent).toMatch(/我的公开|My public/);
+    expect(navigation?.textContent).toMatch(/我的点赞|My likes/);
+
+    const squareButton = [...container.querySelectorAll<HTMLButtonElement>(".sidebar-view-nav button")]
+      .find((button) => /广场|Square/.test(button.textContent || ""));
+    await act(async () => {
+      squareButton?.click();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(apiMock.calls.some((url) => url.startsWith("/api/media?") && url.includes("view=square"))).toBe(true);
+  });
 });

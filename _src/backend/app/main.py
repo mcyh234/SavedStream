@@ -1808,7 +1808,10 @@ async def list_media(
 ) -> dict:
     account_id = await account_filter(account, principal, telegram, database)
     visibility = scope if principal.is_admin else "all"
-    collection = None if principal.is_admin else view
+    # Administrators keep the existing all-media management view under the
+    # default "private" tab, but can also use the public square and their own
+    # uploader/like collections from the same sidebar as regular users.
+    collection = view if (not principal.is_admin or view != "private") else None
     items, next_cursor, has_more = await database.list_media_index(
         account_id=account_id,
         limit=limit,
@@ -1819,8 +1822,8 @@ async def list_media(
         visibility=visibility,
         date_from=date_from,
         date_to=date_to,
-        owner_telegram_user_id=None if principal.is_admin else principal.telegram_user_id,
-        owner_user_id=None if principal.is_admin else principal.user_id,
+        owner_telegram_user_id=principal.telegram_user_id if collection is not None else None,
+        owner_user_id=principal.user_id if collection is not None else None,
         collection=collection,
         viewer_user_id=principal.user_id,
         include_provenance=bool(principal.is_admin or view == "my_public"),
@@ -1853,7 +1856,7 @@ async def media_timeline(
 ) -> dict:
     account_id = await account_filter(account, principal, telegram, database)
     visibility = scope if principal.is_admin else "all"
-    collection = None if principal.is_admin else view
+    collection = view if (not principal.is_admin or view != "private") else None
     return {
         "account_id": account_id,
         "scope": visibility,
@@ -1863,8 +1866,8 @@ async def media_timeline(
             visibility=visibility,
             kind=kind,
             query=q.strip(),
-            owner_telegram_user_id=None if principal.is_admin else principal.telegram_user_id,
-            owner_user_id=None if principal.is_admin else principal.user_id,
+            owner_telegram_user_id=principal.telegram_user_id if collection is not None else None,
+            owner_user_id=principal.user_id if collection is not None else None,
             collection=collection,
             viewer_user_id=principal.user_id,
         ),

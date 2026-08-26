@@ -2036,6 +2036,15 @@ video {
     font-weight: 650;
   }
 
+  .mobile-filter-divider {
+    width: 1px;
+    height: 28px;
+    flex: 0 0 1px;
+    align-self: center;
+    margin: 0 2px;
+    background: var(--border-strong);
+  }
+
   .library-heading {
     gap: 12px;
     margin-bottom: 18px;
