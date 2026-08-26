@@ -327,7 +327,7 @@ FastAPI 通过 Cookie 和 SQLite 会话识别当前访问者，核心依赖为 `
 | `traffic_usage_buckets` | 按时间桶统计的流量 |
 | `traffic_limit_settings` | 月度流量设置 |
 | `media_folders` | 多级文件夹（`parent_id=0` 为根，同级名称唯一） |
-| `media_folder_items` | 文件夹与媒体的多对多关联 |
+| `media_folder_items` | 媒体的当前文件夹位置；移动时替换旧位置 |
 | `notifications` | 信箱通知（每用户一行，广播展开写入） |
 
 ## 11. TeleBox Bridge 详细
@@ -503,12 +503,13 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 
 ### 16.2 文件夹（多级）
 
-新表 `media_folders`（`parent_id=0` 表示根级，`(parent_id, name)` 唯一）与 `media_folder_items`（一个文件可属于多个文件夹）：
+新表 `media_folders`（`parent_id=0` 表示根级，`(parent_id, name)` 唯一）与 `media_folder_items`（一个文件保存一个当前文件夹位置）：
 
 - `GET /api/folders`：所有登录用户可读；非管理员只能看到自己可见媒体的计数。
 - `POST /api/admin/folders`、`PATCH /api/admin/folders/{id}`（重命名/移动，含循环移动校验）、`DELETE /api/admin/folders/{id}`（递归删除子树与关联项）。
 - `PUT/DELETE /api/admin/folders/{id}/items`：批量放入/移出媒体。
 - `GET /api/media?folder_id=N`：按文件夹过滤媒体列表，可见性规则照常生效。
+- 未指定 `folder_id` 且没有搜索词时，只返回尚未归档到文件夹的根级媒体；提供搜索词时会自动包含文件夹内的匹配项。
 - **前端交互（2026 第二轮调整）**：文件夹不再放侧边栏，而是直接渲染在网格视图（文件夹卡片）与列表视图（文件夹行）的媒体区顶部，点击进入下一级；标题上方有完整路径面包屑（全部文件 / 上级 / 当前文件夹），每一级可点击跳回；管理员可在视图内“新建文件夹”（创建于当前目录）、悬停卡片/行重命名或删除（递归删除子树）；批量工具栏保留“移动到文件夹”。侧边栏只保留媒体分类。
 
 ### 16.3 信箱（通知系统）
@@ -630,9 +631,9 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 1. 浏览器拖入或选择文件后，前端建立批次并为每个文件保存独立可见性；原始 `File.name` 经 `X-Upload-Filename`（Base64URL UTF-8）传递。
 2. `POST /api/uploads?visibility=public|private&account=...` 在读取正文前完成账号、处罚、个人配额和 `Content-Length` 校验。
 3. 服务端以 UUID 作为磁盘临时名，目录权限 `0700`、文件权限 `0600`；接收过程中同时计入月度入站流量。
-4. 后台任务调用 Bridge 上传到目标账号 Saved Messages。Telegram 写入成功后完成个人配额记账，再写入本地索引；失败/取消释放尚未完成的预约并清理临时文件。
+4. 服务端按用户绑定、逻辑账号组和当前活动账号自动分配目标账号，后台任务调用 Bridge 上传到 Saved Messages。Telegram 写入成功后完成个人配额记账，再写入本地索引及请求中的 `folder_id`；失败/取消释放尚未完成的预约并清理临时文件。
 5. 普通用户公开请求写入 `requested_visibility=public`、`review_status=pending`、实际 `visibility=private`；管理员公开请求直接为 `approved/public`。
-6. 上传任务包含 `owner_user_id`、`submitter_telegram_user_id`、`requested_visibility`、`review_status`、`batch_id`、`upload_source`；媒体索引保存所有者、来源和 `upload_batch_id`。任务读取/取消只允许所有者或管理员。
+6. 上传任务包含 `owner_user_id`、`submitter_telegram_user_id`、`requested_visibility`、`review_status`、`batch_id`、`upload_source`、`folder_id`；媒体索引保存所有者、来源和 `upload_batch_id`。任务读取/取消只允许所有者或管理员。
 
 WebUI 与 Helper Bot 的个人额度共用 TeleBox `bridge.db`：
 

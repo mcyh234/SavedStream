@@ -38,11 +38,47 @@ const apiMock = vi.hoisted(() => {
     if (url.startsWith("/api/notifications/unread-count")) return { count: 0 };
     if (url.startsWith("/api/notifications")) return { items: [], next_cursor: null, has_more: false, unread: 0 };
     if (url.startsWith("/api/media/timeline")) return { years: [], index: { status: "ready" } };
+    if (url.startsWith("/api/uploads/")) return { id: "job-test", status: "completed", phase: "completed", progress: 100, requested_visibility: "private", review_status: "not_required" };
     if (url.startsWith("/api/media")) return { items: [item], next_cursor: null, has_more: false };
     return { ok: true };
   });
   return { api, calls };
 });
+
+const uploadUrls: string[] = [];
+let uploadResponseStatus = 202;
+
+class FakeUploadRequest {
+  static readonly DONE = 4;
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  withCredentials = false;
+  status = 0;
+  responseText = "";
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  onload: (() => void) | null = null;
+  private url = "";
+
+  open(_method: string, url: string) {
+    this.url = url;
+    uploadUrls.push(url);
+  }
+
+  setRequestHeader() {}
+
+  send(file: File) {
+    this.upload.onprogress?.({ lengthComputable: true, loaded: file.size, total: file.size } as ProgressEvent);
+    this.status = uploadResponseStatus;
+    this.responseText = uploadResponseStatus === 202
+      ? JSON.stringify({ id: "job-test", progress: 1 })
+      : JSON.stringify({ detail: { message: "Telegram upload failed" } });
+    this.onload?.();
+  }
+
+  abort() {
+    this.onabort?.();
+  }
+}
 
 vi.mock("./api", () => ({
   api: apiMock.api,
@@ -81,7 +117,10 @@ describe("gallery upload and square interactions", () => {
     (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
     window.localStorage.clear();
     apiMock.calls.length = 0;
+    uploadUrls.length = 0;
+    uploadResponseStatus = 202;
     apiMock.api.mockClear();
+    vi.stubGlobal("XMLHttpRequest", FakeUploadRequest);
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -95,6 +134,8 @@ describe("gallery upload and square interactions", () => {
     act(() => root.unmount());
     container.remove();
     vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("shows a full-page drop affordance and defaults every dropped file to private", async () => {
@@ -111,6 +152,7 @@ describe("gallery upload and square interactions", () => {
     expect(dialog?.textContent).toContain("two.jpg");
     const selects = [...container.querySelectorAll<HTMLSelectElement>(".web-upload-row select")];
     expect(selects.map((select) => select.value)).toEqual(["private", "private"]);
+    expect(dialog?.textContent).toMatch(/自动分配入库账号|automatically assigns an ingestion account/);
 
     const publicButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => /全部公开|All public/.test(button.textContent || ""));
     await act(async () => publicButton?.click());
@@ -124,6 +166,10 @@ describe("gallery upload and square interactions", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
     expect(apiMock.calls.some((url) => url.startsWith("/api/media?") && url.includes("view=square"))).toBe(true);
+    await act(async () => dispatchFileDrag("drop", [new File(["public"], "square.bin")]));
+    expect(container.querySelector<HTMLSelectElement>(".web-upload-row select")?.value).toBe("public");
+    const closeUpload = container.querySelector<HTMLButtonElement>(".upload-dialog .viewer-topbar .icon-button");
+    await act(async () => closeUpload?.click());
     const reportButton = [...container.querySelectorAll<HTMLButtonElement>(".media-card-social button")].find((button) => /举报|Report/.test(button.textContent || ""));
     expect(reportButton).toBeTruthy();
     await act(async () => reportButton?.click());
@@ -148,5 +194,46 @@ describe("gallery upload and square interactions", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
     expect(apiMock.calls.some((url) => url.startsWith("/api/media?") && url.includes("view=square"))).toBe(true);
+  });
+
+  it("animates completed rows into a success check and closes after five seconds", async () => {
+    vi.useFakeTimers();
+    await act(async () => dispatchFileDrag("drop", [new File(["done"], "done.bin")]));
+    const start = [...container.querySelectorAll<HTMLButtonElement>(".upload-dialog-actions button")]
+      .find((button) => /开始上传|Start upload/.test(button.textContent || ""));
+    await act(async () => {
+      start?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(uploadUrls[0]).toContain("visibility=private");
+    expect(uploadUrls[0]).not.toContain("account=");
+
+    await act(async () => {
+      vi.advanceTimersByTime(1200);
+      await Promise.resolve();
+    });
+    expect(container.querySelector(".upload-success-card")?.textContent).toMatch(/上传完成|Upload complete/);
+    expect(container.querySelector(".upload-success-card")?.textContent).toMatch(/5 秒|5 seconds/);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+    expect(container.querySelector(".upload-dialog")).toBeNull();
+  });
+
+  it("keeps failed files visible with a red failure icon", async () => {
+    uploadResponseStatus = 500;
+    await act(async () => dispatchFileDrag("drop", [new File(["bad"], "bad.bin")]));
+    const start = [...container.querySelectorAll<HTMLButtonElement>(".upload-dialog-actions button")]
+      .find((button) => /开始上传|Start upload/.test(button.textContent || ""));
+    await act(async () => {
+      start?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector(".web-upload-failure-icon")).toBeTruthy();
+    expect(container.querySelector(".web-upload-row")?.textContent).toContain("Telegram upload failed");
+    expect(container.querySelector(".upload-success-card")).toBeNull();
   });
 });

@@ -375,6 +375,39 @@ async def test_web_upload_preserves_filename_owner_batch_and_task_isolation(feat
 
 
 @pytest.mark.asyncio
+async def test_folder_upload_is_assigned_and_hidden_from_root_until_search(feature_api) -> None:
+    client, database, auth, _telegram, current = feature_api
+    owner = await create_user(auth, "folderowner", "350")
+    current["principal"] = principal_for(owner)
+    folder = await database.create_folder("项目文件", parent_id=0)
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Upload-Filename": encoded_filename("inside-folder.bin"),
+        "Content-Length": "6",
+    }
+    created = await client.post(
+        f"/api/uploads?visibility=private&folder_id={folder['id']}",
+        content=b"folder",
+        headers=headers,
+    )
+    assert created.status_code == 202
+    job = await wait_for_upload(database, created.json()["id"])
+    assert int(job["folder_id"]) == int(folder["id"])
+
+    root = await client.get("/api/media?view=private")
+    assert root.status_code == 200
+    assert all(item["id"] != int(job["message_id"]) for item in root.json()["items"])
+
+    folder_page = await client.get(f"/api/media?view=private&folder_id={folder['id']}")
+    assert folder_page.status_code == 200
+    assert [item["id"] for item in folder_page.json()["items"]] == [int(job["message_id"])]
+
+    search = await client.get("/api/media?view=private&q=inside-folder")
+    assert search.status_code == 200
+    assert [item["id"] for item in search.json()["items"]] == [int(job["message_id"])]
+
+
+@pytest.mark.asyncio
 async def test_admin_public_upload_is_direct_and_named_admin_sanctions_still_apply(feature_api) -> None:
     client, database, auth, telegram, current = feature_api
     admin = await create_user(auth, "namedadmin", "400", role="admin")
@@ -387,7 +420,8 @@ async def test_admin_public_upload_is_direct_and_named_admin_sanctions_still_app
     created = await client.post("/api/uploads?visibility=public&account=beta", content=b"admin", headers=headers)
     assert created.status_code == 202
     job = await wait_for_upload(database, created.json()["id"])
-    indexed = await database.get_media_index("beta", int(job["message_id"]), include_provenance=True)
+    assert job["account_id"] == "alpha"
+    indexed = await database.get_media_index("alpha", int(job["message_id"]), include_provenance=True)
     assert indexed and indexed["visibility"] == "public" and indexed["review_status"] == "approved"
     assert telegram.reserved == []
 

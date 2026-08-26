@@ -2413,8 +2413,6 @@ function MediaIndexPanel({ settings, onRefresh }: { settings: AdminSettings; onR
 
 function UploadPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {
   const { tr } = useI18n();
-  const authenticatedAccounts = settings.accounts.filter((item) => item.state === "authenticated");
-  const [account, setAccount] = useState(authenticatedAccounts[0]?.id || "");
   const [file, setFile] = useState<File | null>(null);
   const [browserProgress, setBrowserProgress] = useState(0);
   const [job, setJob] = useState<UploadJob | null>(null);
@@ -2422,14 +2420,8 @@ function UploadPanel({ settings, onRefresh }: { settings: AdminSettings; onRefre
   const [error, setError] = useState("");
   const xhrRef = useRef<XMLHttpRequest | null>(null);
 
-  useEffect(() => {
-    if (!authenticatedAccounts.some((item) => item.id === account)) {
-      setAccount(authenticatedAccounts[0]?.id || "");
-    }
-  }, [account, authenticatedAccounts]);
-
   async function upload() {
-    if (!file || !account) return;
+    if (!file) return;
     setBusy(true);
     setError("");
     setBrowserProgress(0);
@@ -2439,7 +2431,7 @@ function UploadPanel({ settings, onRefresh }: { settings: AdminSettings; onRefre
     await new Promise<void>((resolve) => {
       const xhr = new XMLHttpRequest();
       xhrRef.current = xhr;
-      xhr.open("POST", `/api/admin/uploads?account=${encodeURIComponent(account)}`);
+      xhr.open("POST", "/api/admin/uploads");
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable) setBrowserProgress((event.loaded / event.total) * 100);
       };
@@ -2509,15 +2501,12 @@ function UploadPanel({ settings, onRefresh }: { settings: AdminSettings; onRefre
     <section className="admin-section upload-section" aria-labelledby="upload-heading">
       <div className="admin-section-heading">
         <div className="section-icon" aria-hidden="true"><Upload size={22} /></div>
-        <div><h2 id="upload-heading">{tr("私人相册上传", "Private album upload")}</h2><p>{tr("文件通过指定 userbot 写入 Saved Messages，默认保持私人。", "Files are written to Saved Messages through the selected userbot and remain private by default.")}</p></div>
+        <div><h2 id="upload-heading">{tr("私人相册上传", "Private album upload")}</h2><p>{tr("系统自动选择当前活动的入库账号并写入 Saved Messages，默认保持私人。", "The server automatically selects the active ingestion account, writes to Saved Messages, and keeps the file private by default.")}</p></div>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="upload-controls">
-        <select value={account} onChange={(event) => setAccount(event.target.value)} aria-label={tr("上传到账号", "Upload to account")}>
-          {authenticatedAccounts.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-        </select>
         <input type="file" onChange={(event) => setFile(event.target.files?.[0] || null)} />
-        <button className="button primary" disabled={busy || !file || !account} onClick={() => void upload()} type="button">
+        <button className="button primary" disabled={busy || !file} onClick={() => void upload()} type="button">
           {busy ? <LoaderCircle className="spin" size={18} /> : <Upload size={18} />}{tr("上传并入库", "Upload and ingest")}
         </button>
         {busy && !job && <button className="button danger-ghost" onClick={() => void cancelUpload()} type="button"><X size={16} />{tr("取消上传", "Cancel upload")}</button>}

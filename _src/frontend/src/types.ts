@@ -213,6 +213,7 @@ export interface UploadJob {
   requested_visibility?: "public" | "private";
   review_status?: "not_required" | "pending" | "approved" | "rejected" | "revoked";
   batch_id?: string | null;
+  folder_id?: number | null;
   created_at: string;
   updated_at: string;
 }

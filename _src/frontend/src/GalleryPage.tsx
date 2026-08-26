@@ -6,6 +6,7 @@ import {
   Bell,
   CalendarDays,
   Check,
+  CheckCircle2,
   ChevronRight,
   Download,
   EyeOff,
@@ -34,6 +35,7 @@ import {
   Siren,
   Trash2,
   X,
+  XCircle,
 } from "lucide-react";
 import { api, browserId, errorMessage } from "./api";
 import { useMediaCrypto } from "./MediaCrypto";
@@ -111,12 +113,15 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
   const [bulkBusy, setBulkBusy] = useState(false);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadEntries, setUploadEntries] = useState<UploadEntry[]>([]);
+  const [uploadFolderId, setUploadFolderId] = useState<number | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const dragDepthRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadRequestsRef = useRef<Map<string, XMLHttpRequest>>(new Map());
   const [reportDraft, setReportDraft] = useState<ReportDraft | null>(null);
   const [reportBusy, setReportBusy] = useState(false);
+  const uploadContextRef = useRef({ view, folderId });
+  uploadContextRef.current = { view, folderId };
 
   useEffect(() => setScope(isAdmin ? "all" : "public"), [isAdmin]);
 
@@ -126,10 +131,12 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
       setError(tr("不能上传空文件。", "Empty files cannot be uploaded."));
       return;
     }
+    const context = uploadContextRef.current;
+    setUploadFolderId(context.folderId);
     setUploadEntries(accepted.map((file) => ({
       id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
       file,
-      visibility: "private",
+      visibility: context.view === "square" ? "public" : "private",
       status: "ready",
       progress: 0,
     })));
@@ -161,7 +168,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
     return new Promise((resolve) => {
       updateUploadEntry(entry.id, { status: "receiving", progress: 0, error: undefined });
       const params = new URLSearchParams({ visibility: entry.visibility });
-      if (isAdmin && account && account !== "all") params.set("account", account);
+      if (uploadFolderId !== null) params.set("folder_id", String(uploadFolderId));
       const xhr = new XMLHttpRequest();
       uploadRequestsRef.current.set(entry.id, xhr);
       xhr.open("POST", `/api/uploads?${params}`);
@@ -562,6 +569,10 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
 
   const folderPath = useMemo(() => folderChain(folders, folderId), [folderId, folders]);
   const currentFolderName = folderPath && folderPath.length > 0 ? folderPath[folderPath.length - 1].name : null;
+  const uploadFolderName = useMemo(() => {
+    const path = folderChain(folders, uploadFolderId);
+    return path.length > 0 ? path[path.length - 1].name : null;
+  }, [folders, uploadFolderId]);
 
   function selectFolder(nextFolderId: number | null) {
     setFolderId(nextFolderId);
@@ -875,8 +886,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
       {dragActive && <div className="upload-drop-overlay" role="status"><SquareArrowUp size={54} /><strong>{tr("松手即可添加文件", "Drop files to add them")}</strong><span>{tr("随后可为每个文件选择公开或私人", "Choose public or private for each file next")}</span></div>}
       {uploadDialogOpen && <UploadDialog
         entries={uploadEntries}
-        isAdmin={isAdmin}
-        account={account}
+        targetFolderName={uploadFolderName}
         onClose={() => setUploadDialogOpen(false)}
         onVisibility={(id, visibility) => updateUploadEntry(id, { visibility })}
         onBulkVisibility={(visibility) => setUploadEntries((current) => current.map((entry) => entry.status === "ready" ? { ...entry, visibility } : entry))}
@@ -898,8 +908,7 @@ export function encodeUtf8Base64Url(value: string): string {
 
 function UploadDialog({
   entries,
-  isAdmin,
-  account,
+  targetFolderName,
   onClose,
   onVisibility,
   onBulkVisibility,
@@ -908,8 +917,7 @@ function UploadDialog({
   onCancel,
 }: {
   entries: UploadEntry[];
-  isAdmin: boolean;
-  account: string;
+  targetFolderName: string | null;
   onClose: () => void;
   onVisibility: (id: string, visibility: "public" | "private") => void;
   onBulkVisibility: (visibility: "public" | "private") => void;
@@ -918,8 +926,42 @@ function UploadDialog({
   onCancel: (entry: UploadEntry) => void;
 }) {
   const { tr } = useI18n();
+  const [started, setStarted] = useState(false);
+  const [leavingIds, setLeavingIds] = useState<Set<string>>(new Set());
+  const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
+  const [showSuccess, setShowSuccess] = useState(false);
+  const [closeCountdown, setCloseCountdown] = useState(5);
+  const completionStartedRef = useRef(false);
   const running = entries.some((entry) => ["receiving", "telegram_upload", "indexing"].includes(entry.status));
   const ready = entries.some((entry) => entry.status === "ready");
+  const successStatuses: UploadEntry["status"][] = ["completed", "pending_review"];
+  const allSucceeded = entries.length > 0 && entries.every((entry) => successStatuses.includes(entry.status));
+  useEffect(() => {
+    if (!started || !allSucceeded || completionStartedRef.current) return;
+    completionStartedRef.current = true;
+    const timers: number[] = [];
+    entries.forEach((entry, index) => {
+      const delay = index * 170;
+      timers.push(window.setTimeout(() => {
+        setLeavingIds((current) => new Set(current).add(entry.id));
+      }, delay));
+      timers.push(window.setTimeout(() => {
+        setHiddenIds((current) => new Set(current).add(entry.id));
+      }, delay + 360));
+    });
+    timers.push(window.setTimeout(() => setShowSuccess(true), Math.max(420, entries.length * 170 + 300)));
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [allSucceeded, entries, started]);
+  useEffect(() => {
+    if (!showSuccess) return;
+    setCloseCountdown(5);
+    const interval = window.setInterval(() => setCloseCountdown((value) => Math.max(0, value - 1)), 1000);
+    const closeTimer = window.setTimeout(onClose, 5000);
+    return () => {
+      window.clearInterval(interval);
+      window.clearTimeout(closeTimer);
+    };
+  }, [onClose, showSuccess]);
   const statusLabel = (entry: UploadEntry) => ({
     ready: tr("等待上传", "Ready"),
     receiving: tr("正在接收", "Receiving"),
@@ -933,25 +975,31 @@ function UploadDialog({
   return (
     <div className="viewer-backdrop upload-dialog-backdrop" role="presentation">
       <section className="upload-dialog" role="dialog" aria-modal="true" aria-labelledby="web-upload-title">
-        <div className="viewer-topbar"><h2 id="web-upload-title">{tr("上传文件到 Telegram 收藏夹", "Upload files to Telegram Saved Messages")}</h2><button className="icon-button" disabled={running} onClick={onClose} aria-label={tr("关闭", "Close")} type="button"><X size={21} /></button></div>
-        <p className="muted">{isAdmin
-          ? account && account !== "all"
-            ? `${tr("目标账号", "Target account")}: ${account}。${tr("文件名保持浏览器提供的原始名称。", "Browser-provided filenames are preserved.")}`
-            : tr("管理员上传前必须在主页面选择一个已连接的目标账号。", "Administrators must select one connected target account before uploading.")
-          : tr("普通用户会上传到自己的绑定账号。文件名保持浏览器提供的原始名称。", "Files are uploaded to your linked account and keep their browser-provided names.")}</p>
+        <div className="viewer-topbar"><h2 id="web-upload-title">{showSuccess ? tr("全部文件已成功入库", "All files ingested successfully") : tr("上传文件到 Telegram 收藏夹", "Upload files to Telegram Saved Messages")}</h2><button className="icon-button" disabled={running} onClick={onClose} aria-label={tr("关闭", "Close")} type="button"><X size={21} /></button></div>
+        {showSuccess ? (
+          <div className="upload-success-card" role="status">
+            <CheckCircle2 size={92} strokeWidth={1.7} />
+            <strong>{tr("上传完成", "Upload complete")}</strong>
+            <p>{tr(`该卡片将在 ${closeCountdown} 秒后关闭。`, `This card will close in ${closeCountdown} seconds.`)}</p>
+          </div>
+        ) : <>
+        <p className="muted">{targetFolderName
+          ? tr(`系统将自动分配入库账号，并把文件放入「${targetFolderName}」文件夹。文件名保持不变。`, `The server will assign an ingestion account automatically and place the files in “${targetFolderName}”. Filenames are preserved.`)
+          : tr("系统会根据用户绑定与当前活动账号自动分配入库账号。文件名保持浏览器提供的原始名称。", "The server automatically assigns an ingestion account from the user binding and current active account. Browser-provided filenames are preserved.")}</p>
         <div className="upload-bulk-actions"><button className="button secondary" disabled={running} onClick={() => onBulkVisibility("private")} type="button"><Shield size={15} />{tr("全部私人", "All private")}</button><button className="button secondary" disabled={running} onClick={() => onBulkVisibility("public")} type="button"><Globe2 size={15} />{tr("全部公开", "All public")}</button></div>
         <div className="web-upload-list">
-          {entries.map((entry) => (
-            <div className={`web-upload-row status-${entry.status}`} key={entry.id}>
+          {entries.filter((entry) => !hiddenIds.has(entry.id)).map((entry) => (
+            <div className={`web-upload-row status-${entry.status}${leavingIds.has(entry.id) ? " is-leaving" : ""}`} key={entry.id}>
               <span className="web-upload-file"><strong title={entry.file.name}>{entry.file.name}</strong><small>{formatBytes(entry.file.size)} · {entry.file.type || "application/octet-stream"}</small></span>
               <select value={entry.visibility} disabled={entry.status !== "ready"} onChange={(event) => onVisibility(entry.id, event.target.value as "public" | "private")} aria-label={`${tr("可见性", "Visibility")} ${entry.file.name}`}><option value="private">{tr("私人相册", "Private album")}</option><option value="public">{tr("公开访问", "Public access")}</option></select>
               <span className="web-upload-progress"><span style={{ width: `${Math.max(0, Math.min(100, entry.progress))}%` }} /><small>{statusLabel(entry)}{entry.progress > 0 && entry.progress < 100 ? ` · ${entry.progress.toFixed(0)}%` : ""}</small></span>
-              <span className="web-upload-actions">{entry.status === "failed" || entry.status === "cancelled" ? <button className="button ghost" onClick={() => onRetry(entry)} type="button">{tr("重试", "Retry")}</button> : ["receiving", "telegram_upload", "indexing"].includes(entry.status) ? <button className="button danger-ghost" onClick={() => onCancel(entry)} type="button">{tr("取消", "Cancel")}</button> : null}</span>
+              <span className="web-upload-actions">{entry.status === "failed" || entry.status === "cancelled" ? <><XCircle className="web-upload-failure-icon" size={24} aria-label={tr("入库失败", "Ingestion failed")} /><button className="button ghost" onClick={() => { setStarted(true); onRetry(entry); }} type="button">{tr("重试", "Retry")}</button></> : ["receiving", "telegram_upload", "indexing"].includes(entry.status) ? <button className="button danger-ghost" onClick={() => onCancel(entry)} type="button">{tr("取消", "Cancel")}</button> : null}</span>
               {entry.error && <small className="form-error web-upload-error">{entry.error}</small>}
             </div>
           ))}
         </div>
-        <div className="upload-dialog-actions"><button className="button ghost" disabled={running} onClick={onClose} type="button">{tr("关闭", "Close")}</button><button className="button primary" disabled={!ready || running || (isAdmin && (!account || account === "all"))} onClick={onStart} type="button"><SquareArrowUp size={17} />{tr("开始上传", "Start upload")}</button></div>
+        <div className="upload-dialog-actions"><button className="button ghost" disabled={running} onClick={onClose} type="button">{tr("关闭", "Close")}</button><button className="button primary" disabled={!ready || running} onClick={() => { setStarted(true); onStart(); }} type="button"><SquareArrowUp size={17} />{tr("开始上传", "Start upload")}</button></div>
+        </>}
       </section>
     </div>
   );

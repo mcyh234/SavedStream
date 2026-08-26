@@ -4352,6 +4352,25 @@ video {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface-subtle);
+  max-height: 220px;
+  overflow: hidden;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition:
+    opacity 320ms ease,
+    transform 320ms cubic-bezier(.22, 1, .36, 1),
+    max-height 360ms cubic-bezier(.4, 0, .2, 1),
+    padding 360ms cubic-bezier(.4, 0, .2, 1),
+    border-width 360ms ease;
+}
+
+.web-upload-row.is-leaving {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-width: 0;
+  opacity: 0;
+  transform: translateY(-12px) scale(.975);
 }
 
 .web-upload-row.status-completed,
@@ -4359,7 +4378,8 @@ video {
   border-color: color-mix(in srgb, var(--success) 40%, var(--border));
 }
 
-.web-upload-row.status-failed {
+.web-upload-row.status-failed,
+.web-upload-row.status-cancelled {
   border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
 }
 
@@ -4425,7 +4445,53 @@ video {
 
 .web-upload-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 8px;
+}
+
+.web-upload-failure-icon {
+  flex: 0 0 auto;
+  color: var(--danger);
+  filter: drop-shadow(0 4px 10px color-mix(in srgb, var(--danger) 28%, transparent));
+}
+
+.upload-success-card {
+  display: grid;
+  min-height: 360px;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  padding: 42px 24px 54px;
+  text-align: center;
+  animation: upload-success-enter 520ms cubic-bezier(.22, 1, .36, 1) both;
+}
+
+.upload-success-card svg {
+  color: var(--success);
+  filter: drop-shadow(0 12px 28px color-mix(in srgb, var(--success) 38%, transparent));
+  animation: upload-success-check 620ms cubic-bezier(.34, 1.56, .64, 1) both;
+}
+
+.upload-success-card strong {
+  color: var(--text);
+  font-size: clamp(24px, 4vw, 36px);
+}
+
+.upload-success-card p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+@keyframes upload-success-enter {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes upload-success-check {
+  from { opacity: 0; transform: scale(.45) rotate(-12deg); }
+  to { opacity: 1; transform: scale(1) rotate(0); }
 }
 
 .web-upload-error {

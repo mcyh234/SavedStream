@@ -191,11 +191,32 @@ async def test_folder_items_and_media_filter(database: Database) -> None:
     )
     assert [item["id"] for item in items] == [1]
 
-    removed = await database.remove_folder_items(int(folder["id"]), [{"account_id": "alpha", "message_id": 1}])
+    root_items, _, _ = await database.list_media_index(
+        account_id=None, limit=10, cursor=None, order="newest", kind="all", query="",
+        visibility="all", folder_id=None,
+    )
+    assert [item["id"] for item in root_items] == [2]
+
+    search_items, _, _ = await database.list_media_index(
+        account_id=None, limit=10, cursor=None, order="newest", kind="all", query="media 1",
+        visibility="all", folder_id=None,
+    )
+    assert [item["id"] for item in search_items] == [1]
+
+    other = await database.create_folder("其他", parent_id=0)
+    moved = await database.set_folder_items(int(other["id"]), [{"account_id": "alpha", "message_id": 1}])
+    assert moved == 1
+    old_folder_items, _, _ = await database.list_media_index(
+        account_id=None, limit=10, cursor=None, order="newest", kind="all", query="",
+        visibility="all", folder_id=int(folder["id"]),
+    )
+    assert old_folder_items == []
+
+    removed = await database.remove_folder_items(int(other["id"]), [{"account_id": "alpha", "message_id": 1}])
     assert removed == 1
     items, _, _ = await database.list_media_index(
         account_id=None, limit=10, cursor=None, order="newest", kind="all", query="",
-        visibility="all", folder_id=int(folder["id"]),
+        visibility="all", folder_id=int(other["id"]),
     )
     assert items == []
 
@@ -315,7 +336,8 @@ async def test_admin_folder_routes(api_client) -> None:
     assert media_page.status_code == 200
     assert [item["id"] for item in media_page.json()["items"]] == [1]
 
-    removed = await client.delete(
+    removed = await client.request(
+        "DELETE",
         f"/api/admin/folders/{folder_id}/items",
         json={"items": [{"account_id": "alpha", "message_id": 1}]},
     )

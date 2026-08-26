@@ -1106,6 +1106,59 @@ async def account_filter(
     return requested
 
 
+async def automatic_upload_account(
+    principal: AccessPrincipal,
+    telegram: TeleBoxClient,
+    database: Database,
+) -> tuple[str, str | None]:
+    """Choose the physical Saved Messages account without a WebUI selector.
+
+    Regular users keep their logical binding.  Administrators prefer the
+    configured/default logical group's active account, then any authenticated
+    active group, and finally the first authenticated standalone account.
+    """
+    payload = await telegram.accounts()
+    accounts = list(payload.get("items", []))
+    authenticated = {
+        str(item.get("id")): item
+        for item in accounts
+        if str(item.get("state")) == "authenticated" and item.get("id")
+    }
+    if not principal.is_admin:
+        bound_account = str(principal.account_id or "").strip()
+        if not bound_account:
+            raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+        group = await database.account_group_for_account(bound_account)
+        group_id = str(group.get("id")) if group else None
+        selected = str(group.get("active_account_id") or bound_account) if group else bound_account
+        if selected not in authenticated:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE", "account_group_id": group_id, "account_id": selected},
+            )
+        return selected, group_id
+
+    preferred = str(settings.telebox_default_account or "").strip()
+    if preferred:
+        preferred_group = await database.account_group_for_account(preferred)
+        if preferred_group:
+            active = str(preferred_group.get("active_account_id") or preferred)
+            if active in authenticated:
+                return active, str(preferred_group.get("id"))
+        if preferred in authenticated:
+            group = await database.account_group_for_account(preferred)
+            return preferred, str(group.get("id")) if group else None
+    for group in await database.list_account_groups():
+        active = str(group.get("active_account_id") or "")
+        if active in authenticated:
+            return active, str(group.get("id"))
+    if authenticated:
+        selected = next(iter(authenticated))
+        group = await database.account_group_for_account(selected)
+        return selected, str(group.get("id")) if group else None
+    raise HTTPException(status_code=409, detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE"})
+
+
 async def indexed_media_for_principal(
     database: Database,
     account_id: str,
@@ -3774,7 +3827,13 @@ async def _process_upload_job(
             upload_batch_id=str(job.get("batch_id") or "") or None,
             account_group_id=str(job.get("account_group_id") or "") or None,
         )
-        await database.rebuild_timeline(str(job["account_id"]))
+        if job.get("folder_id") is not None:
+            await database.set_folder_items(
+                int(job["folder_id"]),
+                [{"account_id": str(job["account_id"]), "message_id": int(item["id"])}],
+            )
+        else:
+            await database.rebuild_timeline(str(job["account_id"]))
         await database.complete_upload_job(job_id, message_id=int(item["id"]))
         if replication:
             try:
@@ -3959,6 +4018,7 @@ async def create_user_upload(
     request: Request,
     visibility: str = Query(default="private", pattern="^(public|private)$"),
     account: str | None = Query(default=None, min_length=1, max_length=40),
+    folder_id: int | None = Query(default=None, ge=1),
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
     indexer: MediaIndexer = Depends(get_indexer),
@@ -3966,27 +4026,14 @@ async def create_user_upload(
     principal: AccessPrincipal = Depends(require_upload_access),
     replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict[str, Any]:
-    account_group_id: str | None = None
-    if principal.is_admin:
-        account_id = await telegram.resolve_account(account)
-        group = await database.account_group_for_account(account_id)
-        account_group_id = str(group.get("id")) if group else None
-    else:
-        account_id = str(principal.account_id or "").strip()
-        if not account_id:
-            raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
-        if account and account != account_id:
-            raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
-        group = await database.account_group_for_account(account_id)
-        if group:
-            account_group_id = str(group.get("id"))
-            account_id = str(group.get("active_account_id") or account_id)
-        accounts = (await telegram.accounts()).get("items", [])
-        if not any(str(item.get("id")) == account_id and str(item.get("state")) == "authenticated" for item in accounts):
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "ACTIVE_ACCOUNT_UNAVAILABLE", "account_group_id": account_group_id, "account_id": account_id},
-            )
+    # The account query remains accepted for old clients, but the WebUI and
+    # server always route uploads automatically.  A regular user still cannot
+    # smuggle a different binding through a legacy query parameter.
+    if account and not principal.is_admin and account != str(principal.account_id or ""):
+        raise HTTPException(status_code=403, detail={"code": "ACCOUNT_ACCESS_DENIED"})
+    account_id, account_group_id = await automatic_upload_account(principal, telegram, database)
+    if folder_id is not None and not await database.get_folder(folder_id):
+        raise HTTPException(status_code=404, detail={"code": "FOLDER_NOT_FOUND"})
     try:
         expected_size = int(request.headers.get("content-length") or "0")
     except ValueError as exc:
@@ -4058,6 +4105,7 @@ async def create_user_upload(
             batch_id=batch_id,
             upload_source="web",
             quota_reservation_key=reservation_key,
+            folder_id=folder_id,
         )
     except Exception:
         temp_path.unlink(missing_ok=True)
@@ -4121,9 +4169,9 @@ async def create_upload(
     principal: AccessPrincipal = Depends(require_upload_access),
     replication: DisasterRecoveryManager = Depends(get_replication),
 ) -> dict:
-    account_id = await telegram.resolve_account(account)
-    group = await database.account_group_for_account(account_id)
-    account_group_id = str(group.get("id")) if group else None
+    # Legacy admin endpoint now follows the same automatic account routing as
+    # the drag-and-drop WebUI.  `account` is retained only for wire compatibility.
+    account_id, account_group_id = await automatic_upload_account(principal, telegram, database)
     staging_dir = settings.data_dir / "upload-staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import binascii
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -321,6 +322,7 @@ class Database:
                     message_id INTEGER,
                     error TEXT,
                     temp_path TEXT,
+                    folder_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -696,6 +698,7 @@ class Database:
                 ("upload_source", "TEXT NOT NULL DEFAULT 'web'"),
                 ("quota_reservation_key", "TEXT"),
                 ("account_group_id", "TEXT"),
+                ("folder_id", "INTEGER"),
             ):
                 if column_name not in upload_columns:
                     await db.execute(f"ALTER TABLE upload_jobs ADD COLUMN {column_name} {definition}")
@@ -1659,18 +1662,28 @@ class Database:
             # Administrators browsing every album see hidden rows with the
             # mapped hidden visibility; other scopes still exclude them.
             pass
+        clean_query = query.strip().lower()
         folder_join = ""
         if folder_id is not None:
             folder_join = "JOIN media_folder_items fi ON fi.account_id=m.account_id AND fi.message_id=m.message_id"
             clauses.append("fi.folder_id=?")
             params.append(int(folder_id))
+        elif not clean_query:
+            # A media item assigned to a folder lives in that folder instead of
+            # being duplicated on the root "All files" page.  A root search
+            # deliberately skips this exclusion so folder contents are expanded
+            # into the search result automatically.
+            clauses.append(
+                "NOT EXISTS(SELECT 1 FROM media_folder_items root_fi "
+                "WHERE root_fi.account_id=m.account_id AND root_fi.message_id=m.message_id)"
+            )
         if kind != "all":
             clauses.append("m.kind=?")
             params.append(kind)
-        clean_query = query.strip().lower()
         fts_join = ""
         if clean_query:
-            fts_query = clean_query.replace('"', " ").replace("'", " ").replace(":", " ").strip()
+            fts_terms = [term for term in re.split(r"[^\w]+", clean_query, flags=re.UNICODE) if term]
+            fts_query = " ".join(f'"{term}"' for term in fts_terms)
             if self._fts_available and fts_query:
                 fts_join = "JOIN media_index_fts f ON f.account_id=m.account_id AND f.message_id=m.message_id"
                 clauses.append("f.media_index_fts MATCH ?")
@@ -1738,6 +1751,10 @@ class Database:
                        date_year,date_month,date_day,COUNT(*),MIN(message_id),MAX(message_id)
                 FROM media_index
                 WHERE account_id=? AND deleted=0 AND hidden=0
+                  AND NOT EXISTS(
+                    SELECT 1 FROM media_folder_items fi
+                    WHERE fi.account_id=media_index.account_id AND fi.message_id=media_index.message_id
+                  )
                 GROUP BY account_id,visibility,date_year,date_month,date_day
                 """,
                 (account_id,),
@@ -1756,7 +1773,8 @@ class Database:
         collection: str | None = None,
         viewer_user_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        if account_id and collection is None and not owner_telegram_user_id and kind == "all" and not query.strip() and visibility in {"public", "private"}:
+        clean_query = query.strip().lower()
+        if account_id and collection is None and not owner_telegram_user_id and kind == "all" and not clean_query and visibility in {"public", "private"}:
             clauses = ["account_id=?"]
             params: list[Any] = [account_id]
             clauses.append("visibility=?")
@@ -1815,13 +1833,18 @@ class Database:
                 "(m.submitter_telegram_user_id=? AND m.hidden=0))"
             )
             params.append(owner_telegram_user_id)
+        if not clean_query:
+            clauses.append(
+                "NOT EXISTS(SELECT 1 FROM media_folder_items root_fi "
+                "WHERE root_fi.account_id=m.account_id AND root_fi.message_id=m.message_id)"
+            )
         if kind != "all":
             clauses.append("m.kind=?")
             params.append(kind)
-        clean_query = query.strip().lower()
         fts_join = ""
         if clean_query:
-            fts_query = clean_query.replace('"', " ").replace("'", " ").replace(":", " ").strip()
+            fts_terms = [term for term in re.split(r"[^\w]+", clean_query, flags=re.UNICODE) if term]
+            fts_query = " ".join(f'"{term}"' for term in fts_terms)
             if self._fts_available and fts_query:
                 fts_join = "JOIN media_index_fts f ON f.account_id=m.account_id AND f.message_id=m.message_id"
                 clauses.append("f.media_index_fts MATCH ?")
@@ -2370,6 +2393,7 @@ class Database:
         batch_id: str | None = None,
         upload_source: str = "web",
         quota_reservation_key: str | None = None,
+        folder_id: int | None = None,
     ) -> dict[str, Any]:
         if requested_visibility not in {"public", "private"}:
             raise ValueError("invalid requested visibility")
@@ -2377,8 +2401,8 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT INTO upload_jobs(id,account_id,account_group_id,filename,mime_type,size,status,phase,progress,bytes_sent,temp_path,"
-                "owner_user_id,submitter_telegram_user_id,requested_visibility,review_status,batch_id,upload_source,quota_reservation_key,created_at,updated_at) "
-                "VALUES(?,?,?,? ,? ,?,'queued','receiving',0,0,?,?,?,?,?,?,?,?, ?,?)",
+                "owner_user_id,submitter_telegram_user_id,requested_visibility,review_status,batch_id,upload_source,quota_reservation_key,folder_id,created_at,updated_at) "
+                "VALUES(?,?,?,? ,? ,?,'queued','receiving',0,0,?,?,?,?,?,?,?,?,?, ?,?)",
                 (
                     job_id,
                     account_id,
@@ -2394,6 +2418,7 @@ class Database:
                     batch_id,
                     str(upload_source)[:40],
                     quota_reservation_key,
+                    int(folder_id) if folder_id is not None else None,
                     now,
                     now,
                 ),
@@ -3521,10 +3546,18 @@ class Database:
             if not ids:
                 return 0
             placeholders = ",".join("?" for _ in ids)
+            account_cursor = await db.execute(
+                f"SELECT DISTINCT account_id FROM media_folder_items WHERE folder_id IN ({placeholders})",
+                ids,
+            )
+            affected_accounts = [str(row[0]) for row in await account_cursor.fetchall()]
             await db.execute(f"DELETE FROM media_folder_items WHERE folder_id IN ({placeholders})", ids)
             cursor = await db.execute(f"DELETE FROM media_folders WHERE id IN ({placeholders})", ids)
             await db.commit()
-            return int(cursor.rowcount or 0)
+            deleted = int(cursor.rowcount or 0)
+        for account_id in affected_accounts:
+            await self.rebuild_timeline(account_id)
+        return deleted
 
     async def list_folders(
         self,
@@ -3558,7 +3591,7 @@ class Database:
             return [dict(row) for row in await cursor.fetchall()]
 
     async def set_folder_items(self, folder_id: int, entries: Iterable[dict[str, Any]]) -> int:
-        """Add media to a folder.  A file can live in several folders."""
+        """Move media into one folder, replacing any previous folder location."""
         if not await self.get_folder(folder_id):
             raise ValueError("folder does not exist")
         values = [
@@ -3567,13 +3600,22 @@ class Database:
         ]
         if not values:
             return 0
+        media_keys = [(account_id, message_id) for _, account_id, message_id, _ in values]
+        affected_accounts = {account_id for account_id, _ in media_keys}
         async with aiosqlite.connect(self.path) as db:
+            await db.executemany(
+                "DELETE FROM media_folder_items WHERE account_id=? AND message_id=?",
+                media_keys,
+            )
             cursor = await db.executemany(
                 "INSERT OR IGNORE INTO media_folder_items(folder_id,account_id,message_id,created_at) VALUES(?,?,?,?)",
                 values,
             )
             await db.commit()
-            return int(cursor.rowcount or 0)
+            changed = int(cursor.rowcount or 0)
+        for account_id in affected_accounts:
+            await self.rebuild_timeline(account_id)
+        return changed
 
     async def remove_folder_items(self, folder_id: int, entries: Iterable[dict[str, Any]]) -> int:
         values = [
@@ -3582,13 +3624,17 @@ class Database:
         ]
         if not values:
             return 0
+        affected_accounts = {account_id for _, account_id, _ in values}
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.executemany(
                 "DELETE FROM media_folder_items WHERE folder_id=? AND account_id=? AND message_id=?",
                 values,
             )
             await db.commit()
-            return int(cursor.rowcount or 0)
+            changed = int(cursor.rowcount or 0)
+        for account_id in affected_accounts:
+            await self.rebuild_timeline(account_id)
+        return changed
 
     # ------------------------------------------------------------------
     # Notifications (per-user mailbox)
