@@ -121,7 +121,10 @@ export default function App() {
       mode={status.admin_authenticated ? "persistent" : "session"}
       sessionId={status.media_session_id || ""}
     >
-      <GalleryPage isAdmin={status.admin_authenticated} />
+      <GalleryPage
+        isAdmin={status.admin_authenticated}
+        canUsePersonalFeatures={status.personal_features_available}
+      />
     </MediaEncryptionGate>
   );
 }

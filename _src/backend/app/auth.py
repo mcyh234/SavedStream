@@ -13,6 +13,7 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 PASSWORD_MIN_LENGTH = 12
 CHALLENGE_TTL_SECONDS = 15 * 60
 TRUSTED_DEVICE_TTL_SECONDS = 30 * 24 * 60 * 60
+RECOVERY_ADMIN_USERNAME = "$savedstream-recovery-admin"
 
 
 def now_iso() -> str:
@@ -80,7 +81,11 @@ class AuthStore:
             return [dict(row) for row in await cursor.fetchall()]
 
     async def admin_count(self) -> int:
-        row = await self._row("SELECT COUNT(*) AS count FROM auth_users WHERE role IN ('admin','superadmin')")
+        row = await self._row(
+            "SELECT COUNT(*) AS count FROM auth_users "
+            "WHERE role IN ('admin','superadmin') AND username_normalized<>?",
+            (RECOVERY_ADMIN_USERNAME,),
+        )
         return int(row["count"] if row else 0)
 
     async def superadmin_count(self) -> int:
@@ -101,8 +106,42 @@ class AuthStore:
             "SELECT id,username_normalized,username_display,password_hash,role,status,"
             "telegram_user_id,telegram_username,display_name,account_id,binding_sync_status,"
             "legacy_claim_required,ban_reason,created_at,approved_at,last_login_at,password_changed_at "
-            "FROM auth_users ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC"
+            "FROM auth_users WHERE username_normalized<>? "
+            "ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC",
+            (RECOVERY_ADMIN_USERNAME,),
         )
+
+    async def get_or_create_recovery_admin(self) -> dict[str, Any]:
+        existing = await self._row(
+            "SELECT * FROM auth_users WHERE username_normalized=?",
+            (RECOVERY_ADMIN_USERNAME,),
+        )
+        if existing:
+            return existing
+        now = now_iso()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "SELECT id FROM auth_users WHERE username_normalized=?",
+                    (RECOVERY_ADMIN_USERNAME,),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    user_id = int(row[0])
+                else:
+                    cursor = await db.execute(
+                        "INSERT INTO auth_users(username_normalized,username_display,password_hash,role,status,"
+                        "display_name,binding_sync_status,legacy_claim_required,created_at,approved_at) "
+                        "VALUES(?,?,NULL,'admin','approved',?,'not_required',0,?,?)",
+                        (RECOVERY_ADMIN_USERNAME, "Recovery administrator", "Recovery administrator", now, now),
+                    )
+                    user_id = int(cursor.lastrowid)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return (await self.get_user(user_id)) or {}
 
     async def create_admin(self, username: str, password: str, *, role: str = "superadmin") -> dict[str, Any]:
         normalized = validate_username(username)

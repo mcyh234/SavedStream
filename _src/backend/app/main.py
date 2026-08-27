@@ -915,23 +915,36 @@ async def optional_access_principal(
     admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE),
     auth_cookie: str | None = Cookie(default=None, alias=AUTH_COOKIE),
 ) -> AccessPrincipal | None:
-    if signer.verify(admin_cookie, "admin", "control"):
-        return AccessPrincipal(is_admin=True, role="superadmin", user_status="approved", binding_sync_status="ready")
     user = await auth.get_session(auth_cookie)
-    if not user:
-        return None
-    is_admin = str(user.get("role")) in {"admin", "superadmin"} and str(user.get("status")) == "approved"
-    return AccessPrincipal(
-        is_admin=is_admin,
-        user_id=int(user["id"]),
-        username=str(user.get("username_display") or user.get("username_normalized") or "") or None,
-        role=str(user.get("role") or "user"),
-        telegram_user_id=str(user["telegram_user_id"]),
-        account_id=str(user["account_id"]) if user.get("account_id") else None,
-        user_status=str(user["status"]),
-        binding_sync_status=str(user.get("binding_sync_status") or "pending"),
-        public_authenticated=True,
-    )
+    if user:
+        is_admin = str(user.get("role")) in {"admin", "superadmin"} and str(user.get("status")) == "approved"
+        # Prefer a real administrator portal session over the recovery-key
+        # cookie.  Both may exist after an administrator signs in again; the
+        # portal identity is required to attribute likes and mailbox items.
+        if is_admin or not signer.verify(admin_cookie, "admin", "control"):
+            return AccessPrincipal(
+                is_admin=is_admin,
+                user_id=int(user["id"]),
+                username=str(user.get("username_display") or user.get("username_normalized") or "") or None,
+                role=str(user.get("role") or "user"),
+                telegram_user_id=str(user["telegram_user_id"]) if user.get("telegram_user_id") else None,
+                account_id=str(user["account_id"]) if user.get("account_id") else None,
+                user_status=str(user["status"]),
+                binding_sync_status=str(user.get("binding_sync_status") or "pending"),
+                public_authenticated=True,
+            )
+    if signer.verify(admin_cookie, "admin", "control"):
+        recovery = await auth.get_or_create_recovery_admin()
+        return AccessPrincipal(
+            is_admin=True,
+            user_id=int(recovery["id"]),
+            username=str(recovery.get("username_display") or "Recovery administrator"),
+            role="superadmin",
+            user_status="approved",
+            binding_sync_status="ready",
+            public_authenticated=True,
+        )
+    return None
 
 
 async def require_admin(
@@ -1281,6 +1294,7 @@ async def public_status(
         "public_album_enabled": public_enabled,
         "public_key_configured": bool(public_key_hash),
         "public_authenticated": media_authenticated,
+        "personal_features_available": bool(principal and principal.user_id is not None),
         "media_session_id": media_session_id,
         "registration_enabled": registration_enabled,
         "registration_requires_approval": registration_requires_approval,

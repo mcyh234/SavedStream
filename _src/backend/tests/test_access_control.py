@@ -235,6 +235,64 @@ async def test_admin_can_see_all_accounts_and_viewer_password_is_not_authorized(
 
 
 @pytest.mark.asyncio
+async def test_portal_admin_session_keeps_personal_mailbox_and_like_identity(access_client) -> None:
+    client, database = access_client
+    auth = AuthStore(database.path)
+    admin = await auth.create_admin("moderator", "correct-horse-battery", role="admin")
+    await database.upsert_media_index(
+        {
+            "account_id": "alpha",
+            "id": 801,
+            "kind": "image",
+            "mime_type": "image/jpeg",
+            "size": 4,
+            "filename": "public.jpg",
+            "original_title": "Public",
+            "caption": "",
+            "date": "2026-08-27T00:00:00+00:00",
+            "has_thumbnail": True,
+        },
+        visibility="public",
+        requested_visibility="public",
+        review_status="approved",
+    )
+    # A recovery cookie can coexist with the portal session.  The real portal
+    # user must win so social actions have a stable owner.
+    client.cookies.set(ADMIN_COOKIE, signer.issue("admin", "control", 60))
+    logged_in = await client.post(
+        "/api/admin/login",
+        json={"username": "moderator", "password": "correct-horse-battery"},
+    )
+    assert logged_in.status_code == 200
+
+    status = (await client.get("/api/status")).json()
+    assert status["admin_authenticated"] is True
+    assert status["personal_features_available"] is True
+    assert status["admin_user"]["id"] == admin["id"]
+    assert (await client.get("/api/notifications?limit=30")).status_code == 200
+
+    like = await client.put("/api/media/801/like?account=alpha")
+    assert like.status_code == 200
+    assert like.json() == {"like_count": 1, "liked_by_me": True}
+
+
+@pytest.mark.asyncio
+async def test_recovery_admin_has_hidden_personal_identity(access_client) -> None:
+    client, database = access_client
+    client.cookies.set(ADMIN_COOKIE, signer.issue("admin", "control", 60))
+
+    status = (await client.get("/api/status")).json()
+    assert status["admin_authenticated"] is True
+    assert status["personal_features_available"] is True
+    assert status["admin_user"]["id"] is not None
+    assert (await client.get("/api/notifications?limit=30")).status_code == 200
+
+    auth = AuthStore(database.path)
+    assert await auth.admin_count() == 0
+    assert await auth.list_users() == []
+
+
+@pytest.mark.asyncio
 async def test_public_album_requires_account_login_and_admin_approval(access_client) -> None:
     client, database = access_client
     await database.set_setting("public_album_key_hash", _hash_public_key("public-key"))

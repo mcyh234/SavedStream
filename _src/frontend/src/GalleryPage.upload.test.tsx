@@ -38,6 +38,7 @@ const apiMock = vi.hoisted(() => {
     if (url.startsWith("/api/notifications/unread-count")) return { count: 0 };
     if (url.startsWith("/api/notifications")) return { items: [], next_cursor: null, has_more: false, unread: 0 };
     if (url.startsWith("/api/media/timeline")) return { years: [], index: { status: "ready" } };
+    if (url.includes("/like")) return { like_count: 4, liked_by_me: true };
     if (url.startsWith("/api/uploads/")) return { id: "job-test", status: "completed", phase: "completed", progress: 100, requested_visibility: "private", review_status: "not_required" };
     if (url.startsWith("/api/media")) return { items: [item], next_cursor: null, has_more: false };
     return { ok: true };
@@ -194,6 +195,27 @@ describe("gallery upload and square interactions", () => {
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
     expect(apiMock.calls.some((url) => url.startsWith("/api/media?") && url.includes("view=square"))).toBe(true);
+    const likeButton = container.querySelector<HTMLButtonElement>(".media-card-social button");
+    expect(likeButton).toBeTruthy();
+    await act(async () => likeButton?.click());
+    expect(apiMock.calls.some((url) => url === "/api/media/77/like?account=alpha")).toBe(true);
+  });
+
+  it("does not query a personal mailbox from a recovery-only administrator session", async () => {
+    apiMock.calls.length = 0;
+    await act(async () => {
+      root.render(<I18nProvider><GalleryPage isAdmin canUsePersonalFeatures={false} /></I18nProvider>);
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(apiMock.calls.some((url) => url.startsWith("/api/notifications"))).toBe(false);
+
+    const squareButton = [...container.querySelectorAll<HTMLButtonElement>(".sidebar-view-nav button")]
+      .find((button) => /广场|Square/.test(button.textContent || ""));
+    await act(async () => {
+      squareButton?.click();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(container.querySelector(".media-card-social")).toBeNull();
   });
 
   it("animates completed rows into a success check and closes after five seconds", async () => {

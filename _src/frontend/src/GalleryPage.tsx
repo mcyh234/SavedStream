@@ -76,7 +76,13 @@ type UploadEntry = {
 
 type ReportDraft = { item: MediaItem; reasonCode: string; details: string };
 
-export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) {
+export default function GalleryPage({
+  isAdmin = false,
+  canUsePersonalFeatures = true,
+}: {
+  isAdmin?: boolean;
+  canUsePersonalFeatures?: boolean;
+}) {
   const { tr } = useI18n();
   const mediaCrypto = useMediaCrypto();
   const [accounts, setAccounts] = useState<AccountStatus[]>([]);
@@ -654,7 +660,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
           </button>
           <ThemeSelector />
           <LanguageSelector compact />
-          <MailboxBell />
+          <MailboxBell enabled={canUsePersonalFeatures} />
           <a className="icon-button" href="/admin" aria-label={tr("管理员设置", "Administrator settings")} title={tr("管理员设置", "Administrator settings")}>
             <Settings size={21} />
           </a>
@@ -825,7 +831,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
               onVisibility={setItemVisibility}
               onLike={toggleLike}
               onReport={(item) => setReportDraft({ item, reasonCode: "illegal", details: "" })}
-              socialEnabled={!isAdmin && (view === "square" || view === "liked")}
+              socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
               busy={bulkBusy}
             />
             {hasMore && cursor && (
@@ -857,7 +863,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
                           onToggleSelect={() => toggleSelect(item)}
                           onLike={() => void toggleLike(item)}
                           onReport={() => setReportDraft({ item, reasonCode: "illegal", details: "" })}
-                          socialEnabled={!isAdmin && (view === "square" || view === "liked")}
+                          socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
                         />
                       );
                     })}
@@ -881,7 +887,7 @@ export default function GalleryPage({ isAdmin = false }: { isAdmin?: boolean }) 
         onClose={() => setSelected(null)}
         onLike={() => void toggleLike(selected)}
         onReport={() => setReportDraft({ item: selected, reasonCode: "illegal", details: "" })}
-        socialEnabled={!isAdmin && (view === "square" || view === "liked")}
+        socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
       />}
       {dragActive && <div className="upload-drop-overlay" role="status"><SquareArrowUp size={54} /><strong>{tr("松手即可添加文件", "Drop files to add them")}</strong><span>{tr("随后可为每个文件选择公开或私人", "Choose public or private for each file next")}</span></div>}
       {uploadDialogOpen && <UploadDialog
@@ -1290,7 +1296,7 @@ function MoveToFolderPicker({ folders, disabled, onPick }: { folders: FolderItem
   );
 }
 
-function MailboxBell() {
+function MailboxBell({ enabled }: { enabled: boolean }) {
   const { tr } = useI18n();
   const [open, setOpen] = useState(false);
   const [unread, setUnread] = useState(0);
@@ -1301,19 +1307,21 @@ function MailboxBell() {
   const [error, setError] = useState("");
 
   const refreshUnread = useCallback(async () => {
+    if (!enabled) return;
     try {
       const result = await api<{ count: number }>("/api/notifications/unread-count");
       setUnread(result.count);
     } catch {
       // The mailbox is only available after signing in; keep the last count.
     }
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     void refreshUnread();
     const timer = window.setInterval(() => void refreshUnread(), 25_000);
     return () => window.clearInterval(timer);
-  }, [refreshUnread]);
+  }, [enabled, refreshUnread]);
 
   const load = useCallback(async (cursor: number | null) => {
     setLoading(true);
@@ -1336,8 +1344,8 @@ function MailboxBell() {
   }, []);
 
   useEffect(() => {
-    if (open) void load(null);
-  }, [open, load]);
+    if (enabled && open) void load(null);
+  }, [enabled, open, load]);
 
   async function remove(id: number) {
     try {
@@ -1347,6 +1355,8 @@ function MailboxBell() {
       setError(errorMessage(reason));
     }
   }
+
+  if (!enabled) return null;
 
   return (
     <div className="mailbox">

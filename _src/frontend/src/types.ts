@@ -17,6 +17,7 @@ export interface PublicStatus {
   public_album_enabled: boolean;
   public_key_configured: boolean;
   public_authenticated: boolean;
+  personal_features_available: boolean;
   media_session_id: string | null;
   registration_enabled: boolean;
   registration_requires_approval: boolean;
