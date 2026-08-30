@@ -15,9 +15,15 @@ import { boundWebLoginIdentity, consumeWebLoginCode } from "./web-login";
 import {
   decodeBase64UrlHeader,
   distributeUploadBytes,
+  inferMediaKind,
   moderationMessage,
+  normalizeMediaMimeType,
+  preferredExtensionForMime,
   SavedStreamModeration,
+  shouldForceDocument,
+  supportsTelegramStreaming,
   syncPaginationCursor,
+  timelineDate,
   uploadBodyMatchesLength,
 } from "./bridge-media";
 
@@ -584,23 +590,100 @@ function formatBytes(value: number): string {
 }
 
 function sourceMediaInfo(message: any): { size: number; filename: string; mimeType: string } {
+  const messageId = Number(message?.message_id ?? message?.id ?? 0);
+  const file = message?.file;
   const media = message?.document || message?.video || message?.audio;
-  if (media) {
+  if (file) {
+    const rawMime = file.mimeType || media?.mime_type || media?.mimeType || "application/octet-stream";
+    const filename = String(
+      file.name
+      || media?.file_name
+      || `telegram-${messageId}${file.ext || preferredExtensionForMime(rawMime)}`,
+    );
     return {
-      size: Number(media.file_size || 0),
-      filename: String(media.file_name || `telegram-${message.message_id}`),
-      mimeType: String(media.mime_type || "application/octet-stream"),
+      size: Number(file.size || media?.file_size || media?.size || 0),
+      filename,
+      mimeType: normalizeMediaMimeType(filename, rawMime),
+    };
+  }
+  if (media) {
+    const rawMime = media.mime_type || media.mimeType || "application/octet-stream";
+    const filename = String(
+      media.file_name || `telegram-${messageId}${preferredExtensionForMime(rawMime)}`,
+    );
+    return {
+      size: Number(media.file_size || media.size || 0),
+      filename,
+      mimeType: normalizeMediaMimeType(filename, rawMime),
     };
   }
   const photo = Array.isArray(message?.photo) ? message.photo[message.photo.length - 1] : undefined;
   if (photo) {
     return {
       size: Number(photo.file_size || 0),
-      filename: `photo-${message.message_id}.jpg`,
+      filename: `photo-${messageId}.jpg`,
       mimeType: "image/jpeg",
     };
   }
-  return { size: 0, filename: `telegram-${message.message_id}`, mimeType: "application/octet-stream" };
+  return { size: 0, filename: `telegram-${messageId}`, mimeType: "application/octet-stream" };
+}
+
+function documentMediaAttributes(
+  kind: "image" | "video" | "audio" | "file",
+  supportsStreaming: boolean,
+  sourceMessage?: any,
+): any[] | undefined {
+  const sourceAttributes = sourceMessage?.media?.document?.attributes || [];
+  if (kind === "video") {
+    const source = sourceAttributes.find(
+      (attribute: any) => attribute?.className === "DocumentAttributeVideo",
+    );
+    return [new Api.DocumentAttributeVideo({
+      roundMessage: false,
+      supportsStreaming,
+      duration: Math.max(0, Number(source?.duration || 0)),
+      w: Math.max(1, Number(source?.w || 1)),
+      h: Math.max(1, Number(source?.h || 1)),
+    })];
+  }
+  if (kind === "image") {
+    const source = sourceAttributes.find(
+      (attribute: any) => attribute?.className === "DocumentAttributeImageSize",
+    );
+    const photoSizes = sourceMessage?.media?.photo?.sizes || [];
+    const photoSize = [...photoSizes]
+      .reverse()
+      .find((item: any) => Number(item?.w || 0) > 0 && Number(item?.h || 0) > 0);
+    const width = Number(source?.w || photoSize?.w || 0);
+    const height = Number(source?.h || photoSize?.h || 0);
+    if (width > 0 && height > 0) {
+      return [new Api.DocumentAttributeImageSize({ w: width, h: height })];
+    }
+  }
+  return undefined;
+}
+
+async function sendSavedDocument(
+  account: Account,
+  filePath: string,
+  filename: string,
+  mimeType: string,
+  caption: string,
+  sourceMessage?: any,
+): Promise<any> {
+  const stat = fs.statSync(filePath);
+  const normalizedMime = normalizeMediaMimeType(filename, mimeType);
+  const kind = inferMediaKind(filename, normalizedMime);
+  const supportsStreaming = kind === "video"
+    && supportsTelegramStreaming(filename, normalizedMime);
+  const file = new CustomFile(filename, stat.size, filePath);
+  return await account.client.sendFile("me", {
+    file,
+    caption,
+    forceDocument: shouldForceDocument(stat.size, filename, normalizedMime),
+    supportsStreaming,
+    attributes: documentMediaAttributes(kind, supportsStreaming, sourceMessage),
+  } as any);
 }
 
 class AccountManager {
@@ -874,13 +957,49 @@ class AccountManager {
       .run(Date.now(), job.id);
     if (claimed.changes === 0) return;
     try {
-      const saved = await account.client.forwardMessages("me", {
-        messages: message,
-        fromPeer: message.peerId,
-      });
+      const sourceInfo = sourceMediaInfo(message);
+      const rawMimeType = String(
+        job.source_mime_type || sourceInfo.mimeType || "application/octet-stream",
+      );
+      let filename = String(job.source_filename || sourceInfo.filename || `telegram-${job.id}`).slice(0, 500);
+      if (!path.extname(filename)) {
+        filename = `${filename}${preferredExtensionForMime(rawMimeType)}`.slice(0, 500);
+      }
+      const mimeType = normalizeMediaMimeType(filename, rawMimeType);
+      const relayAttributes = message.media?.document?.attributes || [];
+      const kind = relayAttributes.some(
+        (attribute: any) => attribute?.className === "DocumentAttributeVideo",
+      )
+        ? "video"
+        : inferMediaKind(filename, mimeType, message.media?.className);
+      let savedMessageId = 0;
+      if (kind === "image" || kind === "video") {
+        const spool = path.join(UPLOAD_SPOOL, `helper-${crypto.randomBytes(16).toString("hex")}`);
+        try {
+          await account.client.downloadMedia(message, { outputFile: spool });
+          const saved = await sendSavedDocument(
+            account,
+            spool,
+            filename,
+            mimeType,
+            relayMarker(job.id),
+            message,
+          );
+          savedMessageId = Number(saved?.id || 0);
+        } finally {
+          try { fs.unlinkSync(spool); } catch {}
+        }
+      } else {
+        const saved = await account.client.forwardMessages("me", {
+          messages: message,
+          fromPeer: message.peerId,
+        });
+        savedMessageId = Number(saved[0]?.id || 0);
+      }
+      if (!savedMessageId) throw new Error("Telegram returned no Saved Messages id");
       db.prepare(
         "UPDATE jobs SET status='completed', saved_message_id=?, error=NULL, updated_at=? WHERE id=?",
-      ).run(Number(saved[0]?.id || 0), Date.now(), job.id);
+      ).run(savedMessageId, Date.now(), job.id);
       if (job.rate_reservation_key) completeHelperRateIfFinished(job.rate_reservation_key);
       try {
         await message.delete({ revoke: true });
@@ -1693,7 +1812,11 @@ function serializeMessage(message: any): any | null {
   const file = message?.file;
   const size = Number(file?.size || 0);
   if (!message?.media || !file || size <= 0) return null;
-  const mime = String(file.mimeType || "application/octet-stream");
+  const filename = String(
+    file.name
+    || `saved-${message.id}${file.ext || preferredExtensionForMime(file.mimeType)}`,
+  );
+  const mime = normalizeMediaMimeType(filename, file.mimeType);
   const attributes = message.media?.document?.attributes || [];
   const videoAttribute = attributes.find(
     (attribute: any) => attribute?.className === "DocumentAttributeVideo",
@@ -1704,25 +1827,28 @@ function serializeMessage(message: any): any | null {
   const imageAttribute = attributes.find(
     (attribute: any) => attribute?.className === "DocumentAttributeImageSize",
   );
-  const kind =
-    mime.startsWith("video/")
-      ? "video"
-      : message.media?.className === "MessageMediaPhoto" || mime.startsWith("image/")
+  const kind = videoAttribute
+    ? "video"
+    : audioAttribute
+      ? "audio"
+      : imageAttribute
         ? "image"
-        : mime.startsWith("audio/")
-          ? "audio"
-          : "file";
+        : inferMediaKind(filename, mime, message.media?.className);
   const caption = String(message.message || "").trim();
+  const telegramDate = Number(message.date || 0);
+  const capturedAt = (
+    kind === "image" || kind === "video" ? timelineDate(filename, telegramDate) : null
+  ) || new Date(telegramDate * 1000);
   return {
     id: Number(message.id),
     kind,
     mime_type: mime,
     size,
-    filename: file.name || `saved-${message.id}${file.ext || ""}`,
+    filename,
     original_title:
-      caption.split(/\r?\n/)[0] || file.name || `saved-${message.id}`,
+      caption.split(/\r?\n/)[0] || filename || `saved-${message.id}`,
     caption,
-    date: new Date(Number(message.date || 0) * 1000).toISOString(),
+    date: capturedAt.toISOString(),
     duration:
       videoAttribute?.duration == null && audioAttribute?.duration == null
         ? null
@@ -1842,20 +1968,23 @@ async function uploadMedia(
   if (!Number.isSafeInteger(total) || total <= 0)
     return send(res, 411, { detail: "content-length is required" });
   const filename = decodeBase64UrlHeader(String(req.headers["x-upload-filename"] || "")) || `upload-${Date.now()}`;
-  const mimeType = String(req.headers["x-upload-mime"] || "application/octet-stream").slice(0, 200);
+  const mimeType = normalizeMediaMimeType(
+    filename,
+    String(req.headers["x-upload-mime"] || "application/octet-stream").slice(0, 200),
+  );
   const caption = decodeBase64UrlHeader(String(req.headers["x-upload-caption"] || ""));
   const spool = path.join(UPLOAD_SPOOL, `${crypto.randomBytes(16).toString("hex")}-${path.basename(filename)}`);
   try {
     await pipeline(req, fs.createWriteStream(spool, { mode: 0o600 }));
     const actualSize = fs.statSync(spool).size;
     if (!uploadBodyMatchesLength(actualSize, total)) throw new Error("uploaded body length does not match content-length");
-    const message: any = await account.client.sendFile("me", {
-      file: new CustomFile(filename, actualSize, spool),
+    const message: any = await sendSavedDocument(
+      account,
+      spool,
+      filename,
+      mimeType,
       caption,
-      forceDocument: false,
-      supportsStreaming: mimeType.startsWith("video/"),
-      attributes: mimeType ? undefined : [],
-    } as any);
+    );
     const item = serializeMessage(message);
     if (!item) throw new Error("Telegram returned a message without supported media");
     return send(res, 201, item);
@@ -1974,12 +2103,18 @@ async function replicationCopy(payload: any): Promise<any> {
     const sha256 = replicationHash(spool);
     const caption = String(payload?.caption || "").slice(0, 4096);
     const filename = String(payload?.filename || sourceInfo.filename || `saved-${sourceMessageId}`).slice(0, 500);
-    const sent: any = await target.client.sendFile("me", {
-      file: new CustomFile(filename, stat.size, spool),
+    const mimeType = normalizeMediaMimeType(
+      filename,
+      String(payload?.mime_type || sourceInfo.mimeType || "application/octet-stream").slice(0, 200),
+    );
+    const sent: any = await sendSavedDocument(
+      target,
+      spool,
+      filename,
+      mimeType,
       caption,
-      forceDocument: false,
-      supportsStreaming: String(payload?.mime_type || sourceInfo.mimeType).startsWith("video/"),
-    } as any);
+      sourceMessage,
+    );
     const targetMessageId = Number(sent?.id || 0);
     if (!targetMessageId) throw new Error("Telegram returned no replica message id");
     db.prepare("INSERT INTO replication_idempotency(idempotency_key,source_account_id,target_account_id,logical_media_id,fingerprint,target_message_id,size,content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?)").run(

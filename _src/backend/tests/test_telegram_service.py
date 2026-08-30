@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -89,3 +90,34 @@ async def test_oldest_cursor_uses_min_id(tmp_path):
         limit=20, cursor=12, order="oldest", kind="all", query=""
     )
     assert service.client.calls[0][1]["min_id"] == 12
+
+
+def test_document_camera_file_is_serialized_as_timeline_image(tmp_path):
+    settings = Settings(1, "hash", "admin", tmp_path, False, 30)
+    service = TelegramService(settings)
+    message = SimpleNamespace(
+        id=91,
+        media=SimpleNamespace(document=SimpleNamespace(thumbs=[]), sizes=None),
+        file=SimpleNamespace(
+            size=11 * 1024 * 1024,
+            mime_type="application/octet-stream",
+            name="IMG_20250923_003303_054.jpg",
+            ext=".jpg",
+            duration=None,
+            width=4032,
+            height=3024,
+        ),
+        video=None,
+        photo=None,
+        audio=None,
+        raw_text="",
+        date=datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc),
+    )
+
+    item = service._serialize_message(message)
+
+    assert item is not None
+    assert item["kind"] == "image"
+    assert item["mime_type"] == "image/jpeg"
+    assert item["filename"] == "IMG_20250923_003303_054.jpg"
+    assert item["date"] == "2025-09-23T00:33:03.054000+00:00"

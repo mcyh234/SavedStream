@@ -634,6 +634,7 @@ Helper Bot 收到的媒体会创建 `jobs` 记录，主要状态流转：
 4. 服务端按用户绑定、逻辑账号组和当前活动账号自动分配目标账号，后台任务调用 Bridge 上传到 Saved Messages。Telegram 写入成功后完成个人配额记账，再写入本地索引及请求中的 `folder_id`；失败/取消释放尚未完成的预约并清理临时文件。
 5. 普通用户公开请求写入 `requested_visibility=public`、`review_status=pending`、实际 `visibility=private`；管理员公开请求直接为 `approved/public`。
 6. 上传任务包含 `owner_user_id`、`submitter_telegram_user_id`、`requested_visibility`、`review_status`、`batch_id`、`upload_source`、`folder_id`；媒体索引保存所有者、来源和 `upload_batch_id`。任务读取/取消只允许所有者或管理员。
+7. WebUI、Helper Bot 和容灾复制中的图片、视频通过 Bridge 的 `forceDocument` 路径写入 Saved Messages，保留原始文件名和字节；10 MiB 以上文件不会被 Telegram 当作 photo 处理。视频 document 保留宽高/时长属性，仅 MP4/M4V 使用 Telegram streaming 标记。Bridge 与后端索引均使用 MIME + 扩展名双重识别，并优先从 `IMG_YYYYMMDD_HHMMSS_序号.ext` 等相机文件名解析有效时间线日期，失败时回退消息时间。
 
 WebUI 与 Helper Bot 的个人额度共用 TeleBox `bridge.db`：
 

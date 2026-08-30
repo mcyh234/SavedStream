@@ -65,7 +65,6 @@ async def test_helper_provenance_promotes_existing_row_once_and_preserves_admin_
     item = media("alpha", 9, "2026-08-19T10:00:00+00:00", "helper")
     await database.upsert_media_index(item)
     assert (await database.get_media_index("alpha", 9))["visibility"] == "private"
-
     await database.upsert_media_index(
         item,
         visibility="public",
@@ -82,3 +81,105 @@ async def test_helper_provenance_promotes_existing_row_once_and_preserves_admin_
         submitter_telegram_user_id="100",
     )
     assert (await database.get_media_index("alpha", 9))["visibility"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_document_backed_camera_media_uses_filename_capture_time_in_timeline(database: Database) -> None:
+    await database.upsert_media_index({
+        "account_id": "alpha",
+        "id": 81,
+        "kind": "file",
+        "mime_type": "application/octet-stream",
+        "size": 12 * 1024 * 1024,
+        "filename": "IMG_20250923_003303_054.jpg",
+        "original_title": "IMG_20250923_003303_054.jpg",
+        "caption": "",
+        "date": "2026-08-30T12:00:00+00:00",
+        "has_thumbnail": True,
+    })
+    await database.upsert_media_index({
+        "account_id": "alpha",
+        "id": 82,
+        "kind": "file",
+        "mime_type": "application/octet-stream",
+        "size": 20 * 1024 * 1024,
+        "filename": "VID_20251004_231122_987.MOV",
+        "original_title": "VID_20251004_231122_987.MOV",
+        "caption": "",
+        "date": "2026-08-30T12:00:00+00:00",
+        "has_thumbnail": True,
+    })
+    await database.rebuild_timeline("alpha")
+
+    image = await database.get_media_index("alpha", 81)
+    video = await database.get_media_index("alpha", 82)
+    assert image and image["kind"] == "image"
+    assert image["mime_type"] == "image/jpeg"
+    assert image["date"] == "2025-09-23T00:33:03.054000+00:00"
+    assert video and video["kind"] == "video"
+    assert video["mime_type"] == "video/quicktime"
+    assert video["date"] == "2025-10-04T23:11:22.987000+00:00"
+
+    timeline = await database.list_timeline(account_id="alpha", visibility="private")
+    days = [
+        day["day"]
+        for year in timeline
+        for month in year["months"]
+        for day in month["days"]
+    ]
+    assert days == ["2025-10-04", "2025-09-23"]
+
+
+@pytest.mark.asyncio
+async def test_initialize_backfills_legacy_camera_documents_without_full_rescan(database: Database) -> None:
+    import aiosqlite
+
+    async with aiosqlite.connect(database.path) as db:
+        await db.execute(
+            """
+            INSERT INTO media_index(
+                account_id,message_id,kind,mime_type,size,filename,original_title,
+                caption,message_date,date_year,date_month,date_day,duration,width,
+                height,has_thumbnail,visibility,hidden,deleted,indexed_at,last_seen_at,
+                requested_visibility,review_status
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "legacy",
+                901,
+                "file",
+                "application/octet-stream",
+                15 * 1024 * 1024,
+                "IMG_20241231_235959_321.jpg",
+                "IMG_20241231_235959_321.jpg",
+                "",
+                "2026-08-30T12:00:00+00:00",
+                2026,
+                "2026-08",
+                "2026-08-30",
+                None,
+                None,
+                None,
+                1,
+                "private",
+                0,
+                0,
+                "2026-08-30T12:00:00+00:00",
+                "2026-08-30T12:00:00+00:00",
+                "private",
+                "not_required",
+            ),
+        )
+        await db.execute(
+            "DELETE FROM settings WHERE key='media_filename_metadata_version'"
+        )
+        await db.commit()
+
+    await database.initialize()
+
+    item = await database.get_media_index("legacy", 901)
+    assert item and item["kind"] == "image"
+    assert item["mime_type"] == "image/jpeg"
+    assert item["date"] == "2024-12-31T23:59:59.321000+00:00"
+    timeline = await database.list_timeline(account_id="legacy", visibility="private")
+    assert timeline[0]["months"][0]["days"][0]["day"] == "2024-12-31"

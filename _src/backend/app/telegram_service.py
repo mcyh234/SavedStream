@@ -13,6 +13,7 @@ from telethon.errors import (
 )
 
 from .config import Settings
+from .media_metadata import infer_media_kind, normalize_media_mime_type, preferred_media_date
 
 
 TELEGRAM_CHUNK_SIZE = 512 * 1024
@@ -414,12 +415,15 @@ class TelegramService:
         size = int(getattr(file_info, "size", 0) or 0)
         if size <= 0:
             return None
-        mime_type = str(getattr(file_info, "mime_type", "") or "application/octet-stream")
         filename = str(getattr(file_info, "name", "") or "").strip()
-        kind = self._media_kind(message, mime_type)
         if not filename:
             extension = str(getattr(file_info, "ext", "") or "")
             filename = f"saved-{message.id}{extension}"
+        mime_type = normalize_media_mime_type(
+            str(getattr(file_info, "mime_type", "") or "application/octet-stream"),
+            filename,
+        )
+        kind = self._media_kind(message, mime_type, filename)
         caption = (getattr(message, "raw_text", "") or "").strip()
         first_line = caption.splitlines()[0].strip() if caption else ""
         original_title = first_line or filename
@@ -429,6 +433,11 @@ class TelegramService:
         date = getattr(message, "date", None) or datetime.now(timezone.utc)
         if date.tzinfo is None:
             date = date.replace(tzinfo=timezone.utc)
+        resolved_date = preferred_media_date(filename, date, kind)
+        if isinstance(resolved_date, datetime):
+            date_value = resolved_date.astimezone(timezone.utc).isoformat()
+        else:
+            date_value = str(resolved_date or date.astimezone(timezone.utc).isoformat())
         media = message.media
         has_thumbnail = bool(
             message.photo
@@ -443,7 +452,7 @@ class TelegramService:
             "filename": filename,
             "original_title": original_title[:300],
             "caption": caption[:2000],
-            "date": date.astimezone(timezone.utc).isoformat(),
+            "date": date_value,
             "duration": int(duration) if duration is not None else None,
             "width": int(width) if width is not None else None,
             "height": int(height) if height is not None else None,
@@ -451,14 +460,17 @@ class TelegramService:
         }
 
     @staticmethod
-    def _media_kind(message: Any, mime_type: str) -> str:
-        if message.video or mime_type.startswith("video/"):
-            return "video"
-        if message.photo or mime_type.startswith("image/"):
-            return "image"
-        if message.audio or mime_type.startswith("audio/"):
-            return "audio"
-        return "file"
+    def _media_kind(message: Any, mime_type: str, filename: str = "") -> str:
+        transport_kind = (
+            "video"
+            if getattr(message, "video", None)
+            else "image"
+            if getattr(message, "photo", None)
+            else "audio"
+            if getattr(message, "audio", None)
+            else "file"
+        )
+        return infer_media_kind(transport_kind, mime_type, filename)
 
     def _delete_session_files(self) -> None:
         base = Path(f"{self.settings.telegram_session_path}.session")

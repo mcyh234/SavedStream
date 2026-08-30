@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 import aiosqlite
 
+from .media_metadata import infer_media_kind, normalize_media_mime_type, preferred_media_date
+
 
 DEFAULT_CACHE_BYTES = 20 * 1024 * 1024 * 1024
 TRAFFIC_GB_BYTES = 1000**3
@@ -807,6 +809,90 @@ class Database:
                     ("registration_key_fingerprint", ""),
                 ],
             )
+            # One-time upgrade for media indexed before document-backed camera
+            # files were classified by filename. Existing deployments normally
+            # resume with an incremental Telegram cursor, so relying on a future
+            # full rescan would leave old IMG_/VID_ rows in the wrong gallery
+            # kind and timeline indefinitely.
+            metadata_version_cursor = await db.execute(
+                "SELECT value FROM settings WHERE key='media_filename_metadata_version'"
+            )
+            metadata_version_row = await metadata_version_cursor.fetchone()
+            if not metadata_version_row or str(metadata_version_row[0]) != "1":
+                affected_accounts: set[str] = set()
+                media_cursor = await db.execute(
+                    "SELECT account_id,message_id,kind,mime_type,filename,message_date "
+                    "FROM media_index WHERE deleted=0"
+                )
+                while True:
+                    rows = await media_cursor.fetchmany(500)
+                    if not rows:
+                        break
+                    for row in rows:
+                        account_id = str(row[0])
+                        message_id = int(row[1])
+                        old_kind = str(row[2] or "file")
+                        old_mime = str(row[3] or "application/octet-stream")
+                        filename = str(row[4] or f"saved-{message_id}")
+                        old_date = str(row[5] or "")
+                        mime_type = normalize_media_mime_type(old_mime, filename)
+                        kind = infer_media_kind(old_kind, mime_type, filename)
+                        canonical_date, year, month, day = _date_parts(
+                            preferred_media_date(filename, old_date, kind)
+                        )
+                        if (
+                            kind == old_kind
+                            and mime_type == old_mime
+                            and canonical_date == old_date
+                        ):
+                            continue
+                        await db.execute(
+                            "UPDATE media_index SET kind=?,mime_type=?,message_date=?,"
+                            "date_year=?,date_month=?,date_day=? "
+                            "WHERE account_id=? AND message_id=?",
+                            (
+                                kind,
+                                mime_type,
+                                canonical_date,
+                                year,
+                                month,
+                                day,
+                                account_id,
+                                message_id,
+                            ),
+                        )
+                        affected_accounts.add(account_id)
+                for account_id in affected_accounts:
+                    await db.execute(
+                        "DELETE FROM media_timeline_buckets WHERE account_id=?",
+                        (account_id,),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO media_timeline_buckets(
+                            account_id,visibility,date_year,date_month,date_day,
+                            item_count,first_message_id,last_message_id
+                        )
+                        SELECT account_id,
+                               CASE WHEN visibility='public' AND review_status='approved'
+                                    THEN 'public' ELSE 'private' END,
+                               date_year,date_month,date_day,COUNT(*),
+                               MIN(message_id),MAX(message_id)
+                        FROM media_index
+                        WHERE account_id=? AND deleted=0 AND hidden=0
+                          AND NOT EXISTS(
+                            SELECT 1 FROM media_folder_items fi
+                            WHERE fi.account_id=media_index.account_id
+                              AND fi.message_id=media_index.message_id
+                          )
+                        GROUP BY account_id,visibility,date_year,date_month,date_day
+                        """,
+                        (account_id,),
+                    )
+                await db.execute(
+                    "INSERT INTO settings(key,value) VALUES('media_filename_metadata_version','1') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
             # Existing installations used the public album key before account
             # authentication existed.  Reuse its hash only as the initial
             # registration key; normal media access no longer accepts it.
@@ -1368,7 +1454,12 @@ class Database:
     ) -> dict[str, Any]:
         account_id = str(item["account_id"])
         message_id = int(item["id"])
-        canonical_date, year, month, day = _date_parts(item.get("date"))
+        filename = str(item.get("filename") or f"saved-{message_id}")
+        mime_type = normalize_media_mime_type(item.get("mime_type"), filename)
+        kind = infer_media_kind(item.get("kind"), mime_type, filename)
+        canonical_date, year, month, day = _date_parts(
+            preferred_media_date(filename, item.get("date"), kind)
+        )
         now = _now()
         effective_visibility = visibility or str(item.get("visibility") or "private")
         if effective_visibility not in {"public", "private"}:
@@ -1475,11 +1566,11 @@ class Database:
                 (
                     account_id,
                     message_id,
-                    str(item.get("kind") or "file"),
-                    str(item.get("mime_type") or "application/octet-stream"),
+                    kind,
+                    mime_type,
                     int(item.get("size") or 0),
-                    str(item.get("filename") or f"saved-{message_id}"),
-                    str(item.get("original_title") or item.get("filename") or f"saved-{message_id}"),
+                    filename,
+                    str(item.get("original_title") or filename),
                     str(item.get("caption") or ""),
                     canonical_date,
                     year,
@@ -2430,6 +2521,7 @@ class Database:
     ) -> dict[str, Any]:
         if requested_visibility not in {"public", "private"}:
             raise ValueError("invalid requested visibility")
+        mime_type = normalize_media_mime_type(mime_type, filename)
         now = _now()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(

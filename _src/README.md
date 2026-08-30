@@ -23,6 +23,8 @@ SavedStream 使用 Telegram MTProto 登录当前用户，直接读取 `Saved Mes
 
 WebUI 上传由服务端根据用户绑定和逻辑账号组的当前活动账号自动路由，不需要选择物理 Telegram 账号。在文件夹内上传会自动归入当前文件夹，归档媒体不重复显示在根级“全部文件”，但搜索会包含文件夹内容；在“广场”上传默认申请公开，普通用户仍必须经过管理员审核。
 
+图片和视频通过 WebUI、Helper Bot 入库及容灾复制时统一按 Telegram document 发送并保留原文件名；超过 10 MiB 的媒体不会按 photo 发送。索引会结合 MIME 与文件扩展名识别常见图片/视频格式，并从 `IMG_YYYYMMDD_HHMMSS_序号.ext` 一类相机文件名提取时间线日期，非法或不匹配的名称回退到 Telegram 消息日期。
+
 ## 使用前准备
 
 - 一台安装了 Docker Engine 24+ 和 Docker Compose v2 的 Linux 主机

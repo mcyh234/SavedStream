@@ -5,6 +5,12 @@
 > 本文档汇总最近一次功能迭代的全部变更：媒体库视图与管理员操作、文件夹、信箱通知、管理后台分页、主题切换，以及随后的修复与运维能力（缩略图流量优化、部署备份管理、存储感知告警）。
 > 项目整体结构、架构与原有功能说明见 [PROJECT.md](PROJECT.md)。
 
+## 相机文件名、图片/视频文档入库与时间线识别
+
+- 支持从 `IMG_20250923_003303_054.jpg` 等相机文件名解析拍摄日期与时间；时间线优先使用文件名中的有效时间，无法解析或日期非法时回退到 Telegram 消息时间。
+- 图片与视频同时根据 MIME 和扩展名识别，覆盖 JPG/JPEG/PNG/GIF/WebP/HEIC/HEIF/AVIF 以及 MP4/MOV/MKV/WebM/AVI/MTS/M2TS 等常见格式；即使 Telegram 返回 `application/octet-stream`，索引仍保持正确的图片/视频类型。
+- WebUI、Helper Bot 入库和容灾复制中的图片、视频统一按 Telegram document（文件）发送，保留原始文件名与原始字节；超过 10 MiB 的文件明确强制走 document 路径，避免 Telegram photo 大小限制导致入库失败。视频文件同时保留时长与宽高属性，MKV/AVI 等容器不会错误启用 Telegram streaming 标记。
+
 ## 服务端配置灾备备份
 
 - 新增加密 `.ssbak` 归档、cron 定时上传 Telegram 收藏夹、失败重试和临时文件清理。
