@@ -19,6 +19,12 @@
 - 图片与视频同时根据 MIME 和扩展名识别，覆盖 JPG/JPEG/PNG/GIF/WebP/HEIC/HEIF/AVIF 以及 MP4/MOV/MKV/WebM/AVI/MTS/M2TS 等常见格式；即使 Telegram 返回 `application/octet-stream`，索引仍保持正确的图片/视频类型。
 - WebUI、Helper Bot 入库和容灾复制中的图片、视频统一按 Telegram document（文件）发送，保留原始文件名与原始字节；超过 10 MiB 的文件明确强制走 document 路径，避免 Telegram photo 大小限制导致入库失败。视频文件同时保留时长与宽高属性，MKV/AVI 等容器不会错误启用 Telegram streaming 标记。
 
+## 文件名敏感词与 `/bind` 邀请码限流
+
+- 管理员可在“安全策略”上传多个逐行 TXT 敏感词库；WebUI、Helper Bot 和 Bridge 在文件入库前拒绝命中文件名，管理员修改本地标题时再次检查。
+- 命名命中尝试写入 SQLite 滚动窗口，超过配置次数返回 429 与 Retry-After，避免攻击者反复改名触发审核占满服务器。
+- `/bind` 支持普通用户生成邀请码；管理员可开关此能力，并设置 24 小时全局新绑定数量和单用户邀请码生成数量。管理员生成邀请码保持独立额度。
+
 ## 服务端配置灾备备份
 
 - 新增加密 `.ssbak` 归档、cron 定时上传 Telegram 收藏夹、失败重试和临时文件清理。

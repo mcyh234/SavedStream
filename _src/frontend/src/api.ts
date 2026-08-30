@@ -100,6 +100,10 @@ export function errorMessage(error: unknown): string {
     if (error.code === "SELF_REPORT_FORBIDDEN") return translateNow("不能举报自己上传的资源", "You cannot report your own upload");
     if (error.code === "REPORT_ALREADY_OPEN") return translateNow("你已经举报过该资源，请等待管理员处理", "You already reported this media. Wait for moderation");
     if (error.code === "UPLOAD_LENGTH_MISMATCH") return translateNow("上传内容长度与文件大小不一致，请重试", "The uploaded content length does not match the file size");
+    if (error.code === "FILENAME_SENSITIVE_WORD") return translateNow("文件名包含敏感词，上传或改名被拒绝", "The filename contains a blocked word and was rejected");
+    if (error.code === "FILENAME_RENAME_RATE_LIMITED") return translateNow("改名触发次数过多，请稍后再试", "Too many blocked rename attempts. Try again later");
+    if (error.code === "BIND_INVITES_DISABLED") return translateNow("管理员已关闭普通用户邀请码功能", "Regular-user invite generation is disabled by the administrator");
+    if (error.code === "BIND_INVITE_RATE_LIMITED") return translateNow("邀请码生成或绑定达到 24 小时限额，请稍后再试", "The 24-hour invite generation or binding limit has been reached");
     if (error.code === "TRAFFIC_LIMIT_EXCEEDS_CAPACITY") return translateNow("允许流量不能超过服务器月容量", "The traffic limit cannot exceed the server's monthly capacity");
     if (error.code === "TELEGRAM_UNAVAILABLE") return error.message;
     return error.message;

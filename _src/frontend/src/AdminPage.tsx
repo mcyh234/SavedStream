@@ -69,12 +69,14 @@ import type {
   UserSanction,
   ContentDeletionJob,
   TelegramAccountGroup,
+  FilenameSensitiveSettings,
+  BindInviteSettings,
 } from "./types";
 import ThemeSelector from "./ThemeSelector";
 
 type AdminPhase = "checking" | "guest" | "ready" | "error";
 
-type AdminTab = "dashboard" | "telegram" | "review" | "reports" | "users" | "album" | "media" | "upload" | "traffic" | "cache" | "rate" | "mailbox" | "backups" | "storage";
+type AdminTab = "dashboard" | "telegram" | "review" | "reports" | "users" | "album" | "media" | "upload" | "traffic" | "cache" | "rate" | "mailbox" | "backups" | "security" | "storage";
 
 const ADMIN_TABS: Array<{ id: AdminTab; zh: string; en: string; icon: typeof Gauge }> = [
   { id: "dashboard", zh: "仪表盘", en: "Dashboard", icon: Gauge },
@@ -90,6 +92,7 @@ const ADMIN_TABS: Array<{ id: AdminTab; zh: string; en: string; icon: typeof Gau
   { id: "rate", zh: "Bot 限流", en: "Bot limits", icon: Bot },
   { id: "mailbox", zh: "站内信", en: "Mailbox", icon: Mail },
   { id: "backups", zh: "备份管理", en: "Backups", icon: Archive },
+  { id: "security", zh: "安全策略", en: "Security", icon: Shield },
   { id: "storage", zh: "存储", en: "Storage", icon: Server },
 ];
 
@@ -439,6 +442,7 @@ export default function AdminPage({ onSessionChanged }: AdminPageProps) {
         {tab === "cache" && <CacheSettingsPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "mailbox" && <MailboxAdminPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "backups" && <><BackupAdminPanel /><SystemBackupAdminPanel settings={settings} /></>}
+        {tab === "security" && <SecurityPolicyPanel settings={settings} onRefresh={refreshSettings} />}
         {tab === "storage" && <StorageAdminPanel onGoToBackups={() => setTab("backups")} />}
 
         {tab === "media" && <MediaLibraryPanel settings={settings} onRefresh={refreshSettings} />}
@@ -2364,6 +2368,78 @@ function PublicAlbumPanel({ settings, onRefresh }: { settings: AdminSettings; on
       </div>
     </section>
   );
+}
+
+function SecurityPolicyPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {
+  const { tr } = useI18n();
+  const [sensitive, setSensitive] = useState<FilenameSensitiveSettings>(settings.filename_sensitive || { items: [], settings: { max_attempts_10m: 10, cooldown_seconds: 30 } });
+  const [bindInvites, setBindInvites] = useState<BindInviteSettings>(settings.bind_invites || { enabled: true, global_joins_24h: 100, per_user_generation_24h: 1 });
+  const [files, setFiles] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (settings.filename_sensitive) setSensitive(settings.filename_sensitive);
+    if (settings.bind_invites) setBindInvites(settings.bind_invites);
+  }, [settings.filename_sensitive, settings.bind_invites]);
+
+  async function uploadLists() {
+    if (!files.length) return;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const form = new FormData();
+      files.forEach((file) => form.append("files", file));
+      await api("/api/admin/filename-sensitive", { method: "POST", body: form });
+      setFiles([]);
+      setNotice(tr("敏感词库已上传并立即生效。", "Sensitive filename lists uploaded and are active now."));
+      await onRefresh();
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(false); }
+  }
+
+  async function removeList(id: string) {
+    setBusy(true); setError("");
+    try { await api(`/api/admin/filename-sensitive/${encodeURIComponent(id)}`, { method: "DELETE" }); await onRefresh(); }
+    catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(false); }
+  }
+
+  async function saveSensitiveSettings() {
+    setBusy(true); setError("");
+    try {
+      await api("/api/admin/filename-sensitive/settings", { method: "PUT", body: JSON.stringify(sensitive.settings) });
+      setNotice(tr("文件名改名限流已保存。", "Filename rename throttling saved."));
+      await onRefresh();
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(false); }
+  }
+
+  async function saveBindSettings() {
+    setBusy(true); setError("");
+    try {
+      await api("/api/admin/bind-invites", { method: "PUT", body: JSON.stringify(bindInvites) });
+      setNotice(tr("/bind 邀请码策略已保存。", "/bind invite policy saved."));
+      await onRefresh();
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(false); }
+  }
+
+  return <>
+    <AdminSectionCard storageKey="filename-sensitive" title={tr("文件名敏感词库", "Sensitive filename lists")} summary={tr("上传前和改名时匹配所有启用的 TXT 词库；命中会拒绝操作。", "Enabled TXT dictionaries are matched before upload and rename; matches are rejected.")} icon={<Shield size={22} />}>
+      {error && <p className="form-error" role="alert"><CircleAlert size={17} />{error}</p>}
+      {notice && <p className="form-success" role="status"><Check size={17} />{notice}</p>}
+      <div className="backup-upload-row"><input type="file" accept=".txt,text/plain" multiple onChange={(event) => setFiles(Array.from(event.target.files || []))} /><button className="button secondary" disabled={busy || !files.length} onClick={() => void uploadLists()} type="button"><Upload size={17} />{tr("上传词库", "Upload lists")}</button></div>
+      <div className="coordination-list">{sensitive.items.length ? sensitive.items.map((item) => <div className="coordination-row" key={item.id}><span><strong>{item.filename}</strong><small>{item.word_count} {tr("个词", "words")} · {item.sha256.slice(0, 12)}</small></span><button className="icon-button" disabled={busy} onClick={() => void removeList(item.id)} title={tr("删除词库", "Delete list")} aria-label={tr("删除词库", "Delete list")} type="button"><Trash2 size={16} /></button></div>) : <p className="muted">{tr("尚未上传词库。", "No dictionaries uploaded yet.")}</p>}</div>
+      <div className="traffic-number-grid"><label><span>{tr("10 分钟最多命中次数", "Max matches / 10 min")}</span><input type="number" min={1} max={1000} value={sensitive.settings.max_attempts_10m} onChange={(e) => setSensitive({ ...sensitive, settings: { ...sensitive.settings, max_attempts_10m: Number(e.target.value) } })} /></label><label><span>{tr("改名冷却（秒）", "Rename cooldown (seconds)")}</span><input type="number" min={1} max={3600} value={sensitive.settings.cooldown_seconds} onChange={(e) => setSensitive({ ...sensitive, settings: { ...sensitive.settings, cooldown_seconds: Number(e.target.value) } })} /></label></div>
+      <button className="button primary" disabled={busy} onClick={() => void saveSensitiveSettings()} type="button"><Save size={17} />{tr("保存文件名策略", "Save filename policy")}</button>
+    </AdminSectionCard>
+    <AdminSectionCard storageKey="bind-invites" title={tr("/bind 邀请码策略", "/bind invite policy")} summary={tr("允许普通用户生成绑定邀请码，并限制 24 小时生成与加入数量。", "Allow regular users to generate binding invites with rolling 24-hour limits.")} icon={<KeyRound size={22} />}>
+      <label className="toggle-control"><span><strong>{tr("允许普通用户生成邀请码", "Allow regular users to generate invites")}</strong><small>{tr("关闭后仅管理员可以创建邀请码。", "When disabled, only administrators can create invites.")}</small></span><input type="checkbox" checked={bindInvites.enabled} onChange={(e) => setBindInvites({ ...bindInvites, enabled: e.target.checked })} /><span className="toggle-track"><span /></span></label>
+      <div className="traffic-number-grid"><label><span>{tr("24 小时全局新绑定数", "Global new bindings / 24h")}</span><input type="number" min={1} value={bindInvites.global_joins_24h} onChange={(e) => setBindInvites({ ...bindInvites, global_joins_24h: Number(e.target.value) })} /></label><label><span>{tr("每用户 24 小时可生成数", "Invites per user / 24h")}</span><input type="number" min={1} value={bindInvites.per_user_generation_24h} onChange={(e) => setBindInvites({ ...bindInvites, per_user_generation_24h: Number(e.target.value) })} /></label></div>
+      <button className="button primary" disabled={busy} onClick={() => void saveBindSettings()} type="button"><Save size={17} />{tr("保存邀请码策略", "Save invite policy")}</button>
+    </AdminSectionCard>
+  </>;
 }
 
 function MediaIndexPanel({ settings, onRefresh }: { settings: AdminSettings; onRefresh: () => Promise<void> }) {

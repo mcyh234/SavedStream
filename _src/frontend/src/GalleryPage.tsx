@@ -21,6 +21,7 @@ import {
   Heart,
   Home,
   Image as ImageIcon,
+  KeyRound,
   LayoutGrid,
   List,
   LoaderCircle,
@@ -106,6 +107,7 @@ export default function GalleryPage({
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
   const [selected, setSelected] = useState<MediaItem | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
   const [viewMode, setViewMode] = useState<"grid" | "list">(() => {
@@ -164,6 +166,20 @@ export default function GalleryPage({
     })));
     setUploadDialogOpen(true);
     setError("");
+  }
+
+  async function generateBindInvite() {
+    setInviteBusy(true);
+    setError("");
+    try {
+      const result = await api<{ code: string; expires_at: number }>("/api/bind/invite", { method: "POST" });
+      setNotice(`${tr("邀请码", "Invite code")}: ${result.code} · ${new Date(result.expires_at).toLocaleString()}`);
+      try { await navigator.clipboard?.writeText(result.code); } catch { /* clipboard permissions are optional */ }
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setInviteBusy(false);
+    }
   }
 
   function updateUploadEntry(id: string, patch: Partial<UploadEntry>) {
@@ -764,6 +780,7 @@ export default function GalleryPage({
           <button className="icon-button" onClick={() => fileInputRef.current?.click()} aria-label={tr("选择文件上传", "Choose files to upload")} title={tr("上传文件", "Upload files")} type="button">
             <SquareArrowUp size={20} />
           </button>
+          {!isAdmin && canUsePersonalFeatures && <button className="icon-button" disabled={inviteBusy} onClick={() => void generateBindInvite()} aria-label={tr("生成绑定邀请码", "Generate binding invite")} title={tr("生成绑定邀请码", "Generate binding invite")} type="button"><KeyRound size={19} /></button>}
           <ThemeSelector />
           <LanguageSelector compact />
           <MailboxBell enabled={canUsePersonalFeatures} />

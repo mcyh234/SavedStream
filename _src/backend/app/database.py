@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import binascii
+import json
 import re
 import sqlite3
 import uuid
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -643,6 +645,30 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS filename_sensitive_lists (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    sha256 TEXT NOT NULL UNIQUE,
+                    words_json TEXT NOT NULL DEFAULT '[]',
+                    word_count INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS filename_sensitive_lists_enabled_idx
+                ON filename_sensitive_lists(enabled, created_at);
+
+                CREATE TABLE IF NOT EXISTS filename_rename_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_key TEXT NOT NULL,
+                    matched_word TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS filename_rename_attempts_actor_idx
+                ON filename_rename_attempts(actor_key, created_at);
+
                 INSERT OR IGNORE INTO media_metadata_v2(account_id, message_id, local_title, updated_at)
                 SELECT 'default', message_id, local_title, updated_at FROM media_metadata;
                 """
@@ -807,6 +833,11 @@ class Database:
                     ("registration_key_hash", ""),
                     ("registration_key_version", "1"),
                     ("registration_key_fingerprint", ""),
+                    ("filename_rename_max_attempts_10m", "10"),
+                    ("filename_rename_cooldown_seconds", "30"),
+                    ("bind_invites_enabled", "1"),
+                    ("bind_invites_global_joins_24h", "100"),
+                    ("bind_invites_per_user_generation_24h", "1"),
                 ],
             )
             # One-time upgrade for media indexed before document-backed camera
@@ -974,6 +1005,161 @@ class Database:
                 (key, value),
             )
             await db.commit()
+
+    async def list_filename_sensitive_lists(self, *, include_disabled: bool = True) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            where = "" if include_disabled else " WHERE enabled=1"
+            cursor = await db.execute(
+                "SELECT id,filename,sha256,word_count,enabled,created_at,updated_at FROM filename_sensitive_lists"
+                + where + " ORDER BY created_at DESC"
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+        for row in rows:
+            row["enabled"] = bool(row.get("enabled"))
+            row["word_count"] = int(row.get("word_count") or 0)
+        return rows
+
+    async def add_filename_sensitive_list(self, filename: str, content: bytes) -> dict[str, Any]:
+        """Store a UTF-8 newline-delimited filename word list idempotently."""
+        digest = hashlib.sha256(content).hexdigest()
+        words: list[str] = []
+        seen: set[str] = set()
+        for raw in content.decode("utf-8", errors="replace").splitlines():
+            word = unicodedata.normalize("NFKC", raw.strip().lstrip("\ufeff")).casefold()
+            if not word or word.startswith("#"):
+                continue
+            # A dictionary line is a substring pattern; keep it bounded so a
+            # malformed upload cannot consume unbounded memory or CPU.
+            word = word[:200]
+            if word not in seen:
+                seen.add(word)
+                words.append(word)
+        words = words[:100_000]
+        safe_filename = re.split(r"[\\/]", str(filename or "sensitive-words.txt"))[-1][:240] or "sensitive-words.txt"
+        now = _now()
+        list_id = uuid.uuid4().hex
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            existing = await (await db.execute(
+                "SELECT * FROM filename_sensitive_lists WHERE sha256=?", (digest,)
+            )).fetchone()
+            if existing:
+                return {
+                    **dict(existing),
+                    "enabled": bool(existing["enabled"]),
+                    "word_count": int(existing["word_count"] or 0),
+                    "duplicate": True,
+                }
+            total_cursor = await db.execute("SELECT COALESCE(SUM(word_count),0) FROM filename_sensitive_lists WHERE enabled=1")
+            total_words = int((await total_cursor.fetchone())[0] or 0)
+            if total_words + len(words) > 500_000:
+                raise ValueError("sensitive filename dictionaries exceed the 500000-word limit")
+            await db.execute(
+                "INSERT INTO filename_sensitive_lists(id,filename,sha256,words_json,word_count,enabled,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (list_id, safe_filename, digest,
+                 json.dumps(words, ensure_ascii=False), len(words), 1, now, now),
+            )
+            await db.commit()
+        return {
+            "id": list_id,
+            "filename": safe_filename,
+            "sha256": digest,
+            "word_count": len(words),
+            "enabled": True,
+            "created_at": now,
+            "updated_at": now,
+            "duplicate": False,
+        }
+
+    async def delete_filename_sensitive_list(self, list_id: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("DELETE FROM filename_sensitive_lists WHERE id=?", (str(list_id),))
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def set_filename_sensitive_list_enabled(self, list_id: str, enabled: bool) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "UPDATE filename_sensitive_lists SET enabled=?,updated_at=? WHERE id=?",
+                (1 if enabled else 0, _now(), str(list_id)),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def sensitive_filename_matches(self, filename: str) -> list[str]:
+        """Return enabled dictionary words contained in a sanitized filename."""
+        candidate = unicodedata.normalize("NFKC", re.split(r"[\\/]", str(filename or ""))[-1].strip()).casefold()
+        if not candidate:
+            return []
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("SELECT words_json FROM filename_sensitive_lists WHERE enabled=1")
+            rows = await cursor.fetchall()
+        matches: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                words = json.loads(str(row[0] or "[]"))
+            except (TypeError, ValueError):
+                words = []
+            if not isinstance(words, list):
+                continue
+            for raw in words:
+                word = str(raw or "").strip().casefold()
+                if word and word in candidate and word not in seen:
+                    seen.add(word)
+                    matches.append(word)
+                    if len(matches) >= 20:
+                        return matches
+        return matches
+
+    async def consume_filename_rename_rate(self, actor_key: str, *, matched_word: str | None = None) -> dict[str, Any]:
+        """Record a rename attempt and return a durable rolling-window decision."""
+        try:
+            max_attempts = max(1, int(await self.get_setting("filename_rename_max_attempts_10m", "10")))
+        except ValueError:
+            max_attempts = 10
+        try:
+            cooldown = max(1, int(await self.get_setting("filename_rename_cooldown_seconds", "30")))
+        except ValueError:
+            cooldown = 30
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(minutes=10)).isoformat()
+        key = str(actor_key or "anonymous")[:200]
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM filename_rename_attempts WHERE created_at<?", (cutoff,))
+            count_cursor = await db.execute(
+                "SELECT COUNT(*) FROM filename_rename_attempts WHERE actor_key=? AND created_at>=?",
+                (key, cutoff),
+            )
+            count = int((await count_cursor.fetchone())[0] or 0)
+            oldest_cursor = await db.execute(
+                "SELECT created_at FROM filename_rename_attempts WHERE actor_key=? ORDER BY id ASC LIMIT 1",
+                (key,),
+            )
+            oldest_row = await oldest_cursor.fetchone()
+            oldest_at = str(oldest_row[0]) if oldest_row else ""
+            allowed = count < max_attempts
+            retry_after = 0
+            if not allowed and oldest_at:
+                try:
+                    elapsed = (now - datetime.fromisoformat(oldest_at.replace("Z", "+00:00"))).total_seconds()
+                    retry_after = max(cooldown, int(600 - elapsed))
+                except ValueError:
+                    retry_after = cooldown
+            if allowed:
+                await db.execute(
+                    "INSERT INTO filename_rename_attempts(actor_key,matched_word,created_at) VALUES(?,?,?)",
+                    (key, str(matched_word or "")[:200] or None, now.isoformat()),
+                )
+            await db.commit()
+        return {
+            "allowed": allowed,
+            "count": count + (1 if allowed else 0),
+            "limit": max_attempts,
+            "retry_after_seconds": max(retry_after, 0),
+        }
 
     async def get_system_backup_settings(self) -> dict[str, Any]:
         async with aiosqlite.connect(self.path) as db:

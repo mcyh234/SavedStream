@@ -162,6 +162,10 @@ class TelegramChallengeClaimPayload(BaseModel):
     chat_type: str = Field(default="private", max_length=32)
 
 
+class FilenameCheckPayload(BaseModel):
+    filename: str = Field(min_length=1, max_length=500)
+
+
 class DeviceKeyPayload(BaseModel):
     device_public_key: str = Field(min_length=300, max_length=4096)
     key_format: str = Field(pattern="^spki-rsa-oaep-v1$")
@@ -317,6 +321,17 @@ class HelperRateLimitPayload(BaseModel):
     global_files_per_minute: int = Field(ge=1, le=100000)
     max_album_items: int = Field(ge=1, le=1000)
     max_album_bytes: int = Field(ge=1, le=10 * 1024**4)
+
+
+class FilenameSensitiveSettingsPayload(BaseModel):
+    max_attempts_10m: int = Field(default=10, ge=1, le=1000)
+    cooldown_seconds: int = Field(default=30, ge=1, le=3600)
+
+
+class BindInviteSettingsPayload(BaseModel):
+    enabled: bool = True
+    global_joins_24h: int = Field(default=100, ge=1, le=1_000_000)
+    per_user_generation_24h: int = Field(default=1, ge=1, le=100)
 
 
 class TrafficSettingsPayload(BaseModel):
@@ -1648,6 +1663,20 @@ async def internal_user_moderation(
     }
 
 
+@app.post("/api/internal/moderation/filename")
+async def internal_filename_moderation(
+    payload: FilenameCheckPayload,
+    authorization: str | None = Header(default=None),
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    expected = settings.savedstream_internal_token or settings.telebox_api_token
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not expected or not supplied or not constant_time_equal(supplied, expected):
+        raise HTTPException(status_code=401, detail={"code": "INTERNAL_AUTH_REQUIRED"})
+    matches = await _filename_sensitive_matches(database, payload.filename)
+    return {"allowed": not matches, "matches": matches[:5]}
+
+
 @app.get("/api/public/status")
 async def public_album_status(
     database: Database = Depends(get_database),
@@ -2317,6 +2346,14 @@ async def admin_settings(
         "upload_jobs": [_public_upload_job(item) for item in await database.list_upload_jobs()],
         "traffic": await _traffic_summary(database, traffic),
         "helper_rate_limit": helper_rate_limit,
+        "filename_sensitive": {
+            "items": await database.list_filename_sensitive_lists(include_disabled=True),
+            "settings": {
+                "max_attempts_10m": await _integer_setting(database, "filename_rename_max_attempts_10m", 10),
+                "cooldown_seconds": await _integer_setting(database, "filename_rename_cooldown_seconds", 30),
+            },
+        },
+        "bind_invites": await _bind_invite_settings(database),
     }
 
 
@@ -2449,6 +2486,132 @@ async def update_registration_key(
         "enabled": False,
         "generated": generated,
     }
+
+
+@app.get("/api/admin/filename-sensitive", dependencies=[Depends(require_admin)])
+@app.get("/api/admin/sensitive-words", dependencies=[Depends(require_admin)])
+@app.get("/api/admin/filename-sensitive-lists", dependencies=[Depends(require_admin)])
+async def admin_filename_sensitive_lists(
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    try:
+        max_attempts = int(await database.get_setting("filename_rename_max_attempts_10m", "10"))
+    except ValueError:
+        max_attempts = 10
+    try:
+        cooldown = int(await database.get_setting("filename_rename_cooldown_seconds", "30"))
+    except ValueError:
+        cooldown = 30
+    return {
+        "items": await database.list_filename_sensitive_lists(include_disabled=True),
+        "settings": {
+            "max_attempts_10m": max_attempts,
+            "cooldown_seconds": cooldown,
+        },
+    }
+
+
+@app.post("/api/admin/filename-sensitive", dependencies=[Depends(require_admin)])
+@app.post("/api/admin/sensitive-words", dependencies=[Depends(require_admin)])
+@app.post("/api/admin/filename-sensitive-lists", dependencies=[Depends(require_admin)])
+async def upload_filename_sensitive_lists(
+    files: list[UploadFile] = File(...),
+    database: Database = Depends(get_database),
+) -> dict[str, Any]:
+    if not files:
+        raise HTTPException(status_code=422, detail={"code": "SENSITIVE_WORD_FILE_REQUIRED"})
+    results: list[dict[str, Any]] = []
+    try:
+        for upload in files[:50]:
+            name = Path(upload.filename or "sensitive-words.txt").name
+            if not name.lower().endswith(".txt"):
+                raise HTTPException(status_code=422, detail={"code": "SENSITIVE_WORD_FILE_TYPE", "message": "敏感词库必须是 txt 文件"})
+            content = await upload.read()
+            if len(content) > 10 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail={"code": "SENSITIVE_WORD_FILE_TOO_LARGE"})
+            if not content:
+                raise HTTPException(status_code=422, detail={"code": "SENSITIVE_WORD_FILE_EMPTY", "filename": name})
+            try:
+                results.append(await database.add_filename_sensitive_list(name, content))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail={"code": "SENSITIVE_WORD_LIMIT", "message": str(exc)}) from exc
+    finally:
+        for upload in files:
+            await upload.close()
+    return {"items": results}
+
+
+@app.delete("/api/admin/filename-sensitive/{list_id}", dependencies=[Depends(require_admin)])
+@app.delete("/api/admin/sensitive-words/{list_id}", dependencies=[Depends(require_admin)])
+@app.delete("/api/admin/filename-sensitive-lists/{list_id}", dependencies=[Depends(require_admin)])
+async def delete_filename_sensitive_list(
+    list_id: str,
+    database: Database = Depends(get_database),
+) -> dict[str, bool]:
+    if not await database.delete_filename_sensitive_list(list_id):
+        raise HTTPException(status_code=404, detail={"code": "SENSITIVE_WORD_LIST_NOT_FOUND"})
+    return {"ok": True}
+
+
+@app.put("/api/admin/filename-sensitive/settings", dependencies=[Depends(require_admin)])
+@app.put("/api/admin/sensitive-words/settings", dependencies=[Depends(require_admin)])
+async def update_filename_sensitive_settings(
+    payload: FilenameSensitiveSettingsPayload,
+    database: Database = Depends(get_database),
+) -> dict[str, int]:
+    await database.set_setting("filename_rename_max_attempts_10m", str(payload.max_attempts_10m))
+    await database.set_setting("filename_rename_cooldown_seconds", str(payload.cooldown_seconds))
+    return payload.model_dump()
+
+
+@app.get("/api/admin/bind-invites", dependencies=[Depends(require_admin)])
+@app.get("/api/admin/bind-invite-settings", dependencies=[Depends(require_admin)])
+async def admin_bind_invite_settings(database: Database = Depends(get_database)) -> dict[str, Any]:
+    return await _bind_invite_settings(database)
+
+
+@app.put("/api/admin/bind-invites", dependencies=[Depends(require_admin)])
+@app.put("/api/admin/bind-invite-settings", dependencies=[Depends(require_admin)])
+async def update_bind_invite_settings(
+    payload: BindInviteSettingsPayload,
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+) -> dict[str, Any]:
+    updater = getattr(telegram, "set_bind_invite_settings", None)
+    if updater is not None:
+        try:
+            await updater(payload.model_dump())
+        except TelegramUnavailable as exc:
+            raise HTTPException(status_code=503, detail={"code": "BIND_INVITE_SETTINGS_UNAVAILABLE", "message": str(exc)}) from exc
+    await database.set_setting("bind_invites_enabled", "1" if payload.enabled else "0")
+    await database.set_setting("bind_invites_global_joins_24h", str(payload.global_joins_24h))
+    await database.set_setting("bind_invites_per_user_generation_24h", str(payload.per_user_generation_24h))
+    return await _bind_invite_settings(database)
+
+
+@app.post("/api/bind/invite", status_code=201)
+async def create_user_bind_invite(
+    database: Database = Depends(get_database),
+    telegram: TeleBoxClient = Depends(get_telegram),
+    principal: AccessPrincipal = Depends(require_media_access),
+) -> dict[str, Any]:
+    if principal.is_admin or not principal.telegram_user_id:
+        raise HTTPException(status_code=403, detail={"code": "TELEGRAM_IDENTITY_REQUIRED"})
+    config = await _bind_invite_settings(database)
+    if not config["enabled"]:
+        raise HTTPException(status_code=403, detail={"code": "BIND_INVITES_DISABLED"})
+    account_id, _ = await automatic_upload_account(principal, telegram, database)
+    creator = getattr(telegram, "create_user_invite", None)
+    if creator is None:
+        raise HTTPException(status_code=503, detail={"code": "BIND_INVITE_UNAVAILABLE"})
+    try:
+        return await creator(account_id, principal.telegram_user_id)
+    except UploadQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail={"code": "BIND_INVITE_RATE_LIMITED", "message": str(exc)}) from exc
+    except TelegramUnavailable as exc:
+        message = str(exc)
+        code = "BIND_INVITE_RATE_LIMITED" if "limit" in message.lower() or "quota" in message.lower() else "BIND_INVITE_UNAVAILABLE"
+        raise HTTPException(status_code=429 if code.endswith("LIMITED") else 503, detail={"code": code, "message": message}) from exc
 
 
 @app.get("/api/admin/reports", dependencies=[Depends(require_admin)])
@@ -4031,6 +4194,73 @@ def _decode_upload_filename(value: str | None, fallback: str) -> str:
     return (decoded or fallback)[:240]
 
 
+async def _filename_sensitive_matches(database: Database, filename: str) -> list[str]:
+    try:
+        return await database.sensitive_filename_matches(filename)
+    except AttributeError:
+        # Compatibility with older test doubles/databases during rolling
+        # deployments.  The normal Database implementation always exposes it.
+        return []
+
+
+async def _reject_sensitive_filename(
+    database: Database,
+    filename: str,
+    *,
+    actor_key: str | None = None,
+    rename: bool = False,
+) -> None:
+    matches = await _filename_sensitive_matches(database, filename)
+    if not matches:
+        return
+    if rename and actor_key:
+        decision = await database.consume_filename_rename_rate(actor_key, matched_word=matches[0])
+        if not decision.get("allowed"):
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "FILENAME_RENAME_RATE_LIMITED",
+                    "retry_after_seconds": int(decision.get("retry_after_seconds") or 60),
+                    "message": "文件名修改尝试过于频繁，请稍后再试",
+                },
+                headers={"Retry-After": str(int(decision.get("retry_after_seconds") or 60))},
+            )
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": "FILENAME_SENSITIVE_WORD",
+            "message": "文件名包含敏感词，无法上传或改名",
+            "matches": matches[:5],
+        },
+    )
+
+
+async def _bind_invite_settings(database: Database) -> dict[str, Any]:
+    def integer(key: str, fallback: int) -> int:
+        try:
+            return max(1, int(value_cache.get(key, str(fallback))))
+        except (TypeError, ValueError):
+            return fallback
+
+    value_cache = {
+        "enabled": await database.get_setting("bind_invites_enabled", "1"),
+        "global": await database.get_setting("bind_invites_global_joins_24h", "100"),
+        "per_user": await database.get_setting("bind_invites_per_user_generation_24h", "1"),
+    }
+    return {
+        "enabled": value_cache["enabled"] == "1",
+        "global_joins_24h": min(1_000_000, integer("global", 100)),
+        "per_user_generation_24h": min(100, integer("per_user", 1)),
+    }
+
+
+async def _integer_setting(database: Database, key: str, fallback: int) -> int:
+    try:
+        return int(await database.get_setting(key, str(fallback)))
+    except (TypeError, ValueError):
+        return fallback
+
+
 async def _release_upload_reservation(telegram: TeleBoxClient, reservation_key: str | None) -> None:
     if reservation_key and hasattr(telegram, "release_upload_quota"):
         try:
@@ -4091,6 +4321,7 @@ async def create_user_upload(
     job_id = uuid.uuid4().hex
     batch_id = (request.headers.get("x-upload-batch-id") or uuid.uuid4().hex).strip()[:80]
     filename = _decode_upload_filename(request.headers.get("x-upload-filename"), f"upload-{job_id}")
+    await _reject_sensitive_filename(database, filename)
     mime_type = (request.headers.get("x-upload-mime") or request.headers.get("content-type") or "application/octet-stream").strip()[:200]
     reservation_key: str | None = None
     if not principal.is_admin:
@@ -4229,6 +4460,7 @@ async def create_upload(
     raw_filename = str(file.filename or "")
     encoded_filename = base64.urlsafe_b64encode(raw_filename.encode("utf-8")).decode("ascii").rstrip("=")
     filename = _decode_upload_filename(encoded_filename, f"upload-{job_id}")
+    await _reject_sensitive_filename(database, filename)
     mime_type = (file.content_type or "application/octet-stream").strip()[:200]
     temp_path = staging_dir / f"{job_id}.upload"
     size = 0
@@ -4611,10 +4843,17 @@ async def update_media_title(
     database: Database = Depends(get_database),
     telegram: TeleBoxClient = Depends(get_telegram),
     replication: DisasterRecoveryManager = Depends(get_replication),
+    principal: AccessPrincipal = Depends(require_admin),
 ) -> dict[str, bool]:
     account = await telegram.resolve_account(account)
     if not await database.get_media_index(account, message_id):
         raise HTTPException(status_code=404, detail={"code": "MEDIA_INDEX_NOT_FOUND"})
+    await _reject_sensitive_filename(
+        database,
+        payload.title,
+        actor_key=f"user:{principal.user_id or 'recovery'}",
+        rename=True,
+    )
     await database.set_local_title(message_id, payload.title, account)
     await _queue_replication_mutation(replication, account, message_id, "caption", caption=payload.title)
     return {"ok": True}

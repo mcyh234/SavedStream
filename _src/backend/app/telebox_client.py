@@ -224,6 +224,21 @@ class TeleBoxClient:
     async def create_invite(self, account_id: str) -> dict[str, Any]:
         return (await self._request("POST", f"/v1/accounts/{quote(account_id)}/invites")).json()
 
+    async def create_user_invite(self, account_id: str, creator_telegram_user_id: str) -> dict[str, Any]:
+        return (
+            await self._request(
+                "POST",
+                "/v1/invites",
+                json={"account_id": str(account_id), "creator_telegram_user_id": str(creator_telegram_user_id)},
+            )
+        ).json()
+
+    async def bind_invite_settings(self) -> dict[str, Any]:
+        return (await self._request("GET", "/v1/bind-invites/settings")).json()
+
+    async def set_bind_invite_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return (await self._request("PUT", "/v1/bind-invites/settings", json=payload)).json()
+
     async def bindings(self) -> dict[str, Any]:
         return (await self._request("GET", "/v1/bindings")).json()
 

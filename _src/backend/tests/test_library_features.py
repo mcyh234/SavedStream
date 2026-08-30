@@ -248,6 +248,46 @@ async def test_regular_user_folder_listing_hides_other_users_private_folder_name
     assert visible[1]["item_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_sensitive_filename_lists_match_upload_names_and_throttle_rename_attempts(database: Database) -> None:
+    added = await database.add_filename_sensitive_list("blocked.txt", "Secret\nmalware\n".encode())
+    assert added["word_count"] == 2
+    assert await database.sensitive_filename_matches("IMG_Secret_001.jpg") == ["secret"]
+    assert await database.sensitive_filename_matches("holiday.jpg") == []
+    await database.set_setting("filename_rename_max_attempts_10m", "2")
+    assert (await database.consume_filename_rename_rate("user:1", matched_word="secret"))["allowed"] is True
+    assert (await database.consume_filename_rename_rate("user:1", matched_word="secret"))["allowed"] is True
+    limited = await database.consume_filename_rename_rate("user:1", matched_word="secret")
+    assert limited["allowed"] is False
+    assert limited["retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_admin_sensitive_filename_api_accepts_multiple_txt_lists(database: Database) -> None:
+    telegram = FakeTeleBox()
+    app.dependency_overrides[get_database] = lambda: database
+    app.dependency_overrides[get_telegram] = lambda: telegram
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+            client.cookies.set(ADMIN_COOKIE, signer.issue("admin", "control", 60))
+            response = await client.post(
+                "/api/admin/sensitive-words",
+                files=[("files", ("one.txt", b"alpha\n")), ("files", ("two.txt", b"beta\n"))],
+            )
+            assert response.status_code == 200
+            assert len(response.json()["items"]) == 2
+            assert (await client.get("/api/admin/filename-sensitive")).json()["items"][0]["word_count"] == 1
+            updated = await client.put(
+                "/api/admin/sensitive-words/settings",
+                json={"max_attempts_10m": 3, "cooldown_seconds": 45},
+            )
+            assert updated.status_code == 200
+            assert updated.json()["cooldown_seconds"] == 45
+    finally:
+        app.dependency_overrides.clear()
+
+
 # ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------

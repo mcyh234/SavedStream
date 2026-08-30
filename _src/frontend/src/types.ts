@@ -487,4 +487,27 @@ export interface AdminSettings {
   traffic: TrafficSummary;
   helper_rate_limit: HelperRateLimit;
   account_groups?: TelegramAccountGroup[];
+  filename_sensitive?: FilenameSensitiveSettings;
+  bind_invites?: BindInviteSettings;
+}
+
+export interface FilenameSensitiveList {
+  id: string;
+  filename: string;
+  sha256: string;
+  word_count: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FilenameSensitiveSettings {
+  items: FilenameSensitiveList[];
+  settings: { max_attempts_10m: number; cooldown_seconds: number };
+}
+
+export interface BindInviteSettings {
+  enabled: boolean;
+  global_joins_24h: number;
+  per_user_generation_24h: number;
 }

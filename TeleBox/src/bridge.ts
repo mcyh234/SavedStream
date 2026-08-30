@@ -105,12 +105,20 @@ fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(MEDIA_CACHE, { recursive: true });
 fs.mkdirSync(UPLOAD_SPOOL, { recursive: true, mode: 0o700 });
 let db = new Database(DB_FILE);
-db.exec(`CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, account_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
+db.exec(`CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, account_id TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, creator_telegram_user_id TEXT, created_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS bindings (telegram_user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, created_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS bind_invite_settings (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 1, global_joins_24h INTEGER NOT NULL DEFAULT 100, per_user_generation_24h INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS bind_invite_redemptions (code TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, redeemed_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, source_chat_id TEXT NOT NULL, source_message_id INTEGER NOT NULL, relay_message_id INTEGER, saved_message_id INTEGER, status TEXT NOT NULL, status_message_id INTEGER, error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, requested_visibility TEXT NOT NULL DEFAULT 'private', review_status TEXT NOT NULL DEFAULT 'not_required', review_reason TEXT, reviewed_at INTEGER, reviewed_by TEXT, review_batch_id TEXT, source_file_size INTEGER NOT NULL DEFAULT 0, source_filename TEXT, source_mime_type TEXT, file_count INTEGER NOT NULL DEFAULT 1, choice_expires_at INTEGER, rate_reservation_key TEXT, UNIQUE(account_id, source_chat_id, source_message_id));
 CREATE TABLE IF NOT EXISTS web_login_codes (code_hash TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, account_id TEXT NOT NULL, username TEXT, display_name TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
 CREATE TABLE IF NOT EXISTS relay_pairs (account_id TEXT PRIMARY KEY, telegram_user_id TEXT NOT NULL, paired_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS helper_bans (telegram_user_id TEXT PRIMARY KEY, reason TEXT, banned_at INTEGER NOT NULL, banned_by TEXT NOT NULL);`);
+db.prepare("INSERT OR IGNORE INTO bind_invite_settings(id,enabled,global_joins_24h,per_user_generation_24h,updated_at) VALUES(1,1,100,1,?)").run(Date.now());
+const inviteColumns = new Set((db.prepare("PRAGMA table_info(invites)").all() as Array<{ name: string }>).map((column) => column.name));
+if (!inviteColumns.has("creator_telegram_user_id")) db.exec("ALTER TABLE invites ADD COLUMN creator_telegram_user_id TEXT");
+if (!inviteColumns.has("created_at")) db.exec("ALTER TABLE invites ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0");
+db.prepare("UPDATE invites SET created_at=COALESCE(NULLIF(created_at,0),expires_at-86400000) WHERE created_at IS NULL OR created_at=0").run();
+db.exec("CREATE INDEX IF NOT EXISTS invites_creator_idx ON invites(creator_telegram_user_id,created_at,used_at); CREATE INDEX IF NOT EXISTS bind_invite_redemptions_time_idx ON bind_invite_redemptions(redeemed_at);");
 db.exec(`CREATE TABLE IF NOT EXISTS replication_idempotency (
   idempotency_key TEXT PRIMARY KEY,
   source_account_id TEXT NOT NULL,
@@ -420,6 +428,87 @@ class HelperRateLimitError extends Error {
     this.name = "HelperRateLimitError";
     this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+class BindInviteRateLimitError extends Error {
+  retryAfterSeconds: number;
+  constructor(message: string, retryAfterSeconds = 3600) {
+    super(message);
+    this.name = "BindInviteRateLimitError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+type BindInviteSettings = {
+  enabled: boolean;
+  global_joins_24h: number;
+  per_user_generation_24h: number;
+};
+
+function readBindInviteSettings(): BindInviteSettings {
+  const row = db.prepare("SELECT * FROM bind_invite_settings WHERE id=1").get() as any;
+  const bounded = (raw: unknown, fallback: number, max: number): number => {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.max(1, Math.min(max, Math.floor(parsed))) : fallback;
+  };
+  return {
+    enabled: Boolean(Number(row?.enabled ?? 1)),
+    global_joins_24h: bounded(row?.global_joins_24h || 100, 100, 1_000_000),
+    per_user_generation_24h: bounded(row?.per_user_generation_24h || 1, 1, 100),
+  };
+}
+
+function writeBindInviteSettings(value: Partial<BindInviteSettings>): BindInviteSettings {
+  const current = readBindInviteSettings();
+  const bounded = (raw: unknown, fallback: number, max: number): number => {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? Math.max(1, Math.min(max, Math.floor(parsed))) : fallback;
+  };
+  const next: BindInviteSettings = {
+    enabled: value.enabled == null ? current.enabled : Boolean(value.enabled),
+    global_joins_24h: bounded(value.global_joins_24h ?? current.global_joins_24h, current.global_joins_24h, 1_000_000),
+    per_user_generation_24h: bounded(value.per_user_generation_24h ?? current.per_user_generation_24h, current.per_user_generation_24h, 100),
+  };
+  db.prepare("UPDATE bind_invite_settings SET enabled=?,global_joins_24h=?,per_user_generation_24h=?,updated_at=? WHERE id=1")
+    .run(next.enabled ? 1 : 0, next.global_joins_24h, next.per_user_generation_24h, Date.now());
+  return next;
+}
+
+function generateBindInvite(accountId: string, creatorTelegramUserId: string | null, isAdmin = false): any {
+  const settings = readBindInviteSettings();
+  if (!isAdmin && !settings.enabled) throw new BindInviteRateLimitError("管理员已关闭邀请码绑定", 3600);
+  const now = Date.now();
+  if (!isAdmin && creatorTelegramUserId) {
+    const cutoff = now - 24 * 60 * 60 * 1000;
+    const count = db.prepare(
+      "SELECT COUNT(*) AS count FROM invites WHERE creator_telegram_user_id=? AND created_at>=?",
+    ).get(String(creatorTelegramUserId), cutoff) as any;
+    const usable = db.prepare(
+      "SELECT 1 FROM invites WHERE creator_telegram_user_id=? AND used_at IS NULL AND expires_at>? LIMIT 1",
+    ).get(String(creatorTelegramUserId), now);
+    if (Number(count?.count || 0) >= settings.per_user_generation_24h || usable) {
+      throw new BindInviteRateLimitError("每个用户 24 小时只能生成一个可用邀请码", 24 * 60 * 60);
+    }
+  }
+  const code = crypto.randomBytes(6).toString("hex");
+  const expires = now + 24 * 60 * 60 * 1000;
+  db.prepare(
+    "INSERT INTO invites(code,account_id,expires_at,used_at,creator_telegram_user_id,created_at) VALUES(?,?,?,NULL,?,?)",
+  ).run(code, accountId, expires, creatorTelegramUserId, now);
+  return { code, account_id: accountId, expires_at: expires, creator_telegram_user_id: creatorTelegramUserId };
+}
+
+async function checkSensitiveFilename(filename: string): Promise<{ allowed: boolean; matches?: string[] }> {
+  if (!SAVEDSTREAM_INTERNAL_URL || !SAVEDSTREAM_INTERNAL_TOKEN) return { allowed: true };
+  const response = await fetch(`${SAVEDSTREAM_INTERNAL_URL}/api/internal/moderation/filename`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${SAVEDSTREAM_INTERNAL_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: String(filename || "") }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(String(payload?.detail?.message || payload?.detail?.code || `HTTP ${response.status}`));
+  return payload as { allowed: boolean; matches?: string[] };
 }
 
 function readRateLimitSettings(): RateLimitSettings {
@@ -1163,6 +1252,17 @@ class AccountManager {
       return;
     }
     const media = sourceMediaInfo(m);
+    try {
+      const filenameCheck = await checkSensitiveFilename(media.filename);
+      if (!filenameCheck.allowed) {
+        await ctx.reply(`❌ 文件名包含敏感词，无法入库：${(filenameCheck.matches || []).slice(0, 3).join(", ")}`);
+        return;
+      }
+    } catch (error) {
+      console.error("[MODERATION] filename check failed", error);
+      await ctx.reply("❌ 文件名审核服务暂时不可用，请稍后重试");
+      return;
+    }
     const existing = db.prepare(
       "SELECT * FROM jobs WHERE account_id=? AND source_chat_id=? AND source_message_id=?",
     ).get(String(binding.account_id), String(ctx.chat.id), Number(m.message_id)) as Job | undefined;
@@ -1396,12 +1496,36 @@ class AccountManager {
         .get(String(ctx.from.id)) as { reason?: string } | undefined;
       if (banned) return ctx.reply("该账号已被禁止使用上传功能，请联系管理员。");
       const code = String(ctx.message.text || "").split(/\s+/)[1] || "";
+      if (!code) {
+        try {
+          const binding = db.prepare("SELECT account_id FROM bindings WHERE telegram_user_id=? AND enabled=1").get(String(ctx.from.id)) as any;
+          const accountId = String(binding?.account_id || DEFAULT_ACCOUNT);
+          const account = manager.get(accountId);
+          if (account.state !== "authenticated" || !account.me) throw new Error("目标托管账号当前未连接");
+          const generated = generateBindInvite(accountId, String(ctx.from.id), false);
+          return ctx.reply(`你的邀请码：${generated.code}\n有效期至：${new Date(generated.expires_at).toLocaleString()}\n请将此邀请码交给需要绑定该托管账号的用户。`);
+        } catch (error) {
+          if (error instanceof BindInviteRateLimitError) {
+            return ctx.reply(`❌ ${error.message}，请约 ${Math.ceil(error.retryAfterSeconds / 3600)} 小时后再试`);
+          }
+          return ctx.reply(`❌ 邀请码生成失败：${String((error as any)?.message || error)}`);
+        }
+      }
       const invite = db
         .prepare(
           "SELECT * FROM invites WHERE code=? AND used_at IS NULL AND expires_at>?",
         )
         .get(code, Date.now()) as any;
       if (!invite) return ctx.reply("邀请码无效或已过期");
+      const inviteSettings = readBindInviteSettings();
+      if (!inviteSettings.enabled) return ctx.reply("管理员已关闭邀请码绑定");
+      const existingBinding = db.prepare("SELECT * FROM bindings WHERE telegram_user_id=? AND enabled=1").get(String(ctx.from.id)) as any;
+      if (!existingBinding) {
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const joins = db.prepare("SELECT COUNT(*) AS count FROM bind_invite_redemptions WHERE redeemed_at>=?").get(cutoff) as any;
+        if (Number(joins?.count || 0) >= inviteSettings.global_joins_24h)
+          return ctx.reply("过去 24 小时的新用户绑定数量已达到管理员设置的上限，请稍后再试");
+      }
       db.prepare(
         "INSERT INTO bindings(telegram_user_id,account_id,created_at,enabled) VALUES(?,?,?,1) ON CONFLICT(telegram_user_id) DO UPDATE SET account_id=excluded.account_id, enabled=1",
       ).run(String(ctx.from.id), invite.account_id, Date.now());
@@ -1409,6 +1533,10 @@ class AccountManager {
         Date.now(),
         code,
       );
+      if (!existingBinding) {
+        db.prepare("INSERT OR IGNORE INTO bind_invite_redemptions(code,telegram_user_id,redeemed_at) VALUES(?,?,?)")
+          .run(code, String(ctx.from.id), Date.now());
+      }
       return ctx.reply(`绑定成功：${invite.account_id}\n如网页正在等待账号绑定，稍后会自动获得访问权限。`);
     });
     bot.command("web", async (ctx) => {
@@ -1495,6 +1623,20 @@ class AccountManager {
     const now = Date.now();
     const batchId = crypto.randomUUID();
     const jobIds: number[] = [];
+    for (const ctx of contexts) {
+      const media = sourceMediaInfo(ctx.message);
+      try {
+        const filenameCheck = await checkSensitiveFilename(media.filename);
+        if (!filenameCheck.allowed) {
+          await first.reply(`❌ 媒体组中存在敏感文件名，已拒绝入库：${(filenameCheck.matches || []).slice(0, 3).join(", ")}`);
+          return;
+        }
+      } catch (error) {
+        console.error("[MODERATION] filename check failed", error);
+        await first.reply("❌ 文件名审核服务暂时不可用，请稍后重试");
+        return;
+      }
+    }
     for (const ctx of contexts) {
       const media = sourceMediaInfo(ctx.message);
       const duplicate = db.prepare(
@@ -1968,6 +2110,14 @@ async function uploadMedia(
   if (!Number.isSafeInteger(total) || total <= 0)
     return send(res, 411, { detail: "content-length is required" });
   const filename = decodeBase64UrlHeader(String(req.headers["x-upload-filename"] || "")) || `upload-${Date.now()}`;
+  try {
+    const filenameCheck = await checkSensitiveFilename(filename);
+    if (!filenameCheck.allowed)
+      return send(res, 422, { detail: { code: "FILENAME_SENSITIVE_WORD", message: "文件名包含敏感词，无法上传", matches: filenameCheck.matches || [] } });
+  } catch (error) {
+    console.error("[MODERATION] filename check failed", error);
+    return send(res, 503, { detail: { code: "FILENAME_CHECK_UNAVAILABLE", message: "filename moderation service unavailable" } });
+  }
   const mimeType = normalizeMediaMimeType(
     filename,
     String(req.headers["x-upload-mime"] || "application/octet-stream").slice(0, 200),
@@ -2096,13 +2246,16 @@ async function replicationCopy(payload: any): Promise<any> {
   const sourceMessage: any = (await source.client.getMessages("me", { ids: sourceMessageId }))[0];
   if (!sourceMessage?.media) throw new Error("source media not found");
   const sourceInfo = sourceMediaInfo(sourceMessage);
+  const candidateFilename = String(payload?.filename || sourceInfo.filename || `saved-${sourceMessageId}`).slice(0, 500);
+  const filenameCheck = await checkSensitiveFilename(candidateFilename);
+  if (!filenameCheck.allowed) throw new Error(`replica filename rejected by sensitive-word policy: ${(filenameCheck.matches || []).slice(0, 3).join(", ")}`);
   const spool = path.join(UPLOAD_SPOOL, `replica-${crypto.randomBytes(16).toString("hex")}`);
   try {
     await source.client.downloadMedia(sourceMessage, { outputFile: spool });
     const stat = fs.statSync(spool);
     const sha256 = replicationHash(spool);
     const caption = String(payload?.caption || "").slice(0, 4096);
-    const filename = String(payload?.filename || sourceInfo.filename || `saved-${sourceMessageId}`).slice(0, 500);
+    const filename = candidateFilename;
     const mimeType = normalizeMediaMimeType(
       filename,
       String(payload?.mime_type || sourceInfo.mimeType || "application/octet-stream").slice(0, 200),
@@ -2403,16 +2556,27 @@ const server = http.createServer(async (req, res) => {
     const invite = u.pathname.match(/^\/v1\/accounts\/([^/]+)\/invites$/);
     if (invite && req.method === "POST") {
       manager.get(invite[1]);
-      const code = crypto.randomBytes(6).toString("hex");
-      const expires = Date.now() + 86400000;
-      db.prepare(
-        "INSERT INTO invites(code,account_id,expires_at) VALUES(?,?,?)",
-      ).run(code, invite[1], expires);
-      return send(res, 201, {
-        code,
-        account_id: invite[1],
-        expires_at: expires,
-      });
+      return send(res, 201, generateBindInvite(invite[1], null, true));
+    }
+    if (u.pathname === "/v1/invites" && req.method === "POST") {
+      const p = await body(req);
+      const accountId = String(p.account_id || DEFAULT_ACCOUNT);
+      const creatorTelegramUserId = String(p.creator_telegram_user_id || "").trim();
+      if (!creatorTelegramUserId) return send(res, 422, { detail: { code: "TELEGRAM_IDENTITY_REQUIRED" } });
+      manager.get(accountId);
+      try {
+        return send(res, 201, generateBindInvite(accountId, creatorTelegramUserId, false));
+      } catch (error) {
+        if (error instanceof BindInviteRateLimitError)
+          return send(res, 429, { detail: { code: "BIND_INVITE_RATE_LIMITED", message: error.message, retry_after_seconds: error.retryAfterSeconds } });
+        throw error;
+      }
+    }
+    if (u.pathname === "/v1/bind-invites/settings" && req.method === "GET")
+      return send(res, 200, readBindInviteSettings());
+    if (u.pathname === "/v1/bind-invites/settings" && req.method === "PUT") {
+      const p = await body(req);
+      return send(res, 200, writeBindInviteSettings(p));
     }
     if (u.pathname === "/v1/bindings" && req.method === "GET")
       return send(res, 200, {
