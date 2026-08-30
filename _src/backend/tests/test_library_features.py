@@ -221,6 +221,33 @@ async def test_folder_items_and_media_filter(database: Database) -> None:
     assert items == []
 
 
+@pytest.mark.asyncio
+async def test_regular_user_folder_listing_hides_other_users_private_folder_names(database: Database) -> None:
+    private_root = await database.create_folder("我的相册", parent_id=0)
+    private_child = await database.create_folder("我的子相册", parent_id=int(private_root["id"]))
+    other_folder = await database.create_folder("手机相册", parent_id=0)
+
+    await database.upsert_media_index(
+        media(31),
+        submitter_telegram_user_id="100",
+        requested_visibility="private",
+        review_status="not_required",
+    )
+    await database.upsert_media_index(
+        media(32),
+        submitter_telegram_user_id="200",
+        requested_visibility="private",
+        review_status="not_required",
+    )
+    await database.set_folder_items(int(private_child["id"]), [{"account_id": "alpha", "message_id": 31}])
+    await database.set_folder_items(int(other_folder["id"]), [{"account_id": "alpha", "message_id": 32}])
+
+    visible = await database.list_folders(owner_telegram_user_id="100")
+    assert [folder["name"] for folder in visible] == ["我的相册", "我的子相册"]
+    assert visible[0]["item_count"] == 0
+    assert visible[1]["item_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------

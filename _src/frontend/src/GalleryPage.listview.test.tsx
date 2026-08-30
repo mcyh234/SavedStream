@@ -40,7 +40,7 @@ vi.mock("./MediaCrypto", () => ({
 const apiMock = vi.hoisted(() => {
   let folders: FolderItem[] = [];
   let timelineYears: TimelineYear[] = [];
-  const api = vi.fn(async (url: string) => {
+  const api = vi.fn(async (url: string, _options?: RequestInit) => {
     if (url.startsWith("/api/accounts")) return { items: [], default_account: "" };
     if (url.startsWith("/api/notifications/unread-count")) return { count: 0 };
     if (url.startsWith("/api/notifications")) return { items: [], next_cursor: null, has_more: false, unread: 0 };
@@ -122,11 +122,11 @@ describe("list view loop regression", () => {
     vi.unstubAllGlobals();
   });
 
-  async function mount() {
+  async function mount(isAdmin = false) {
     await act(async () => {
       root.render(
         <I18nProvider>
-          <GalleryPage isAdmin={false} />
+          <GalleryPage isAdmin={isAdmin} />
         </I18nProvider>,
       );
     });
@@ -186,7 +186,7 @@ describe("list view loop regression", () => {
     ]);
     await mount();
     expect(container.querySelector(".folder-panel")).toBeNull();
-    const cards = Array.from(container.querySelectorAll(".folder-card"));
+    const cards = Array.from(container.querySelectorAll(".folder-media-card"));
     expect(cards.length).toBe(2);
     expect(container.textContent).toContain("相册A");
     expect(container.textContent).not.toContain("子相册B");
@@ -198,7 +198,7 @@ describe("list view loop regression", () => {
     for (let i = 0; i < 6; i++) {
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
     }
-    expect(container.querySelectorAll(".folder-card").length).toBe(1);
+    expect(container.querySelectorAll(".folder-media-card").length).toBe(1);
     expect(container.textContent).toContain("子相册B");
     const pathText = container.querySelector(".folder-breadcrumb")!.textContent || "";
     expect(pathText.includes("全部文件") || pathText.includes("All files")).toBe(true);
@@ -214,9 +214,80 @@ describe("list view loop regression", () => {
     for (let i = 0; i < 6; i++) {
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
     }
-    const rows = Array.from(container.querySelectorAll(".folder-list-row"));
+    const rows = Array.from(container.querySelectorAll(".folder-media-list-row"));
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("相册A");
+    const unifiedList = container.querySelector(".media-list-view");
+    expect(unifiedList).toBeTruthy();
+    expect(unifiedList!.querySelector(".folder-media-list-row")).toBe(rows[0]);
+    expect(Array.from(unifiedList!.querySelectorAll(".media-list-row")).indexOf(rows[0])).toBe(0);
+  });
+
+  it("never renders private folder names in the public square", async () => {
+    apiMock.setFolders([folder(1, 0, "手机相册", 16)]);
+    await mount();
+    expect(container.querySelectorAll(".folder-media-card").length).toBe(1);
+    const squareButton = Array.from(container.querySelectorAll<HTMLButtonElement>(".sidebar-view-nav button"))
+      .find((button) => /广场|Square/.test(button.textContent || ""));
+    expect(squareButton).toBeTruthy();
+    await act(async () => { squareButton!.click(); });
+    for (let i = 0; i < 6; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+    }
+    expect(container.querySelector(".folder-media-card")).toBeNull();
+    expect(container.querySelector(".folder-media-list-row")).toBeNull();
+  });
+
+  it("creates a nested folder in the currently opened folder", async () => {
+    apiMock.setFolders([folder(1, 0, "相册A", 3)]);
+    await mount(true);
+    clickButton("相册A");
+    for (let i = 0; i < 6; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+    }
+    const createButton = container.querySelector(".folder-list-create-button") as HTMLButtonElement | null;
+    expect(createButton).toBeTruthy();
+    act(() => { createButton!.click(); });
+    const input = container.querySelector('input[aria-label="文件夹名称"], input[aria-label="Folder name"]') as HTMLInputElement | null;
+    expect(input).toBeTruthy();
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, "子文件夹");
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const form = input!.closest("form");
+    expect(form).toBeTruthy();
+    await act(async () => { form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    const createCall = apiMock.api.mock.calls.find(([url, options]) => url === "/api/admin/folders" && options?.method === "POST");
+    expect(createCall).toBeTruthy();
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({ name: "子文件夹", parent_id: 1 });
+  });
+
+  it("requests column sorting and exposes a download quick action", async () => {
+    await mount();
+    const sorting = container.querySelector('select[aria-label="文件排序"], select[aria-label="File sorting"]') as HTMLSelectElement | null;
+    expect(sorting).toBeTruthy();
+    await act(async () => {
+      sorting!.value = "title:asc";
+      sorting!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    for (let i = 0; i < 6; i++) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+    }
+    const sortedRequest = apiMock.api.mock.calls
+      .map(([url]) => String(url))
+      .reverse()
+      .find((url: string) => url.startsWith("/api/media?") && url.includes("sort=title") && url.includes("direction=asc"));
+    expect(sortedRequest).toBeTruthy();
+
+    const listButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => (button.getAttribute("aria-label") || "").includes("List view"));
+    await act(async () => { (listButton as HTMLButtonElement).click(); });
+    const downloads = Array.from(container.querySelectorAll("button")).filter((button) => {
+      const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`;
+      return label.includes("下载") || label.includes("Download");
+    });
+    expect(downloads.length).toBeGreaterThan(0);
   });
 
   it("vertical timeline wheel sits between sidebar and main and reacts to wheel input", async () => {

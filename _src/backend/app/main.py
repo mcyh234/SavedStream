@@ -1861,6 +1861,8 @@ async def list_media(
     limit: int = Query(default=36, ge=1, le=72),
     cursor: str | None = Query(default=None),
     order: str = Query(default="newest", pattern="^(newest|oldest)$"),
+    sort_by: str | None = Query(default=None, alias="sort", pattern="^(title|kind|size|date)$"),
+    direction: str | None = Query(default=None, pattern="^(asc|desc)$"),
     kind: str = Query(default="all", pattern="^(all|video|image|audio|file)$"),
     q: str = Query(default="", max_length=100),
     account: str | None = Query(default=None, min_length=1, max_length=40),
@@ -1895,6 +1897,8 @@ async def list_media(
         viewer_user_id=principal.user_id,
         include_provenance=bool(principal.is_admin or view == "my_public"),
         folder_id=folder,
+        sort_by=sort_by,
+        sort_direction=direction,
     )
     for item in items:
         item_account = str(item["account_id"])
@@ -3356,6 +3360,7 @@ async def list_folders(
     principal: AccessPrincipal = Depends(require_media_access),
 ) -> dict[str, Any]:
     folders = await database.list_folders(
+        owner_user_id=None if principal.is_admin else principal.user_id,
         owner_telegram_user_id=None if principal.is_admin else principal.telegram_user_id,
         include_hidden=principal.is_admin,
     )

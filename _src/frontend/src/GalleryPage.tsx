@@ -63,6 +63,8 @@ const filters: Array<{ value: MediaKind; zh: string; en: string; icon: typeof Ho
 ];
 
 const VIEW_MODE_KEY = "savedstream-view-mode";
+type SortField = "title" | "kind" | "size" | "date";
+type SortDirection = "asc" | "desc";
 
 type UploadEntry = {
   id: string;
@@ -94,7 +96,8 @@ export default function GalleryPage({
   const [dateRange, setDateRange] = useState<{ from: string; to: string } | null>(null);
   const [timelinePosition, setTimelinePosition] = useState(0);
   const [kind, setKind] = useState<MediaKind>("all");
-  const [order, setOrder] = useState<"newest" | "oldest">("newest");
+  const [sortField, setSortField] = useState<SortField>("date");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [cursor, setCursor] = useState<string | number | null>(null);
@@ -116,6 +119,11 @@ export default function GalleryPage({
   const [folderId, setFolderId] = useState<number | null>(null);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [foldersVersion, setFoldersVersion] = useState(0);
+  const [folderCreating, setFolderCreating] = useState(false);
+  const [folderEditingId, setFolderEditingId] = useState<number | null>(null);
+  const [folderNameDraft, setFolderNameDraft] = useState("");
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [folderError, setFolderError] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadEntries, setUploadEntries] = useState<UploadEntry[]>([]);
@@ -130,6 +138,14 @@ export default function GalleryPage({
   uploadContextRef.current = { view, folderId };
 
   useEffect(() => setScope(isAdmin ? "all" : "public"), [isAdmin]);
+
+  useEffect(() => {
+    if (view === "private") return;
+    setFolderCreating(false);
+    setFolderEditingId(null);
+    setFolderNameDraft("");
+    setFolderError("");
+  }, [view]);
 
   function queueUploadFiles(files: File[]) {
     const accepted = files.filter((file) => file.size > 0);
@@ -357,7 +373,8 @@ export default function GalleryPage({
       const params = new URLSearchParams({
         limit: "36",
         kind,
-        order,
+        sort: sortField,
+        direction: sortDirection,
         q: debouncedQuery,
         scope: isAdmin ? scope : "public",
       });
@@ -390,7 +407,7 @@ export default function GalleryPage({
       if (!silent) setLoading(false);
       setLoadingMore(false);
     }
-  }, [account, dateRange, debouncedQuery, folderId, isAdmin, kind, order, scope, view]);
+  }, [account, dateRange, debouncedQuery, folderId, isAdmin, kind, scope, sortDirection, sortField, view]);
 
   const loadTimeline = useCallback(async () => {
     if (!account) return;
@@ -445,6 +462,17 @@ export default function GalleryPage({
     }
     return [...groups.entries()];
   }, [items]);
+
+  const folderEntriesEnabled = view === "private";
+  const currentFolders = useMemo(() => {
+    if (!folderEntriesEnabled) return [];
+    const parentId = folderId ?? 0;
+    return sortFolderItems(
+      folders.filter((folder) => folder.parent_id === parentId),
+      sortField,
+      sortDirection,
+    );
+  }, [folderEntriesEnabled, folderId, folders, sortDirection, sortField]);
 
   const itemKey = useCallback((item: MediaItem) => `${item.account_id}:${item.id}`, []);
 
@@ -583,6 +611,84 @@ export default function GalleryPage({
   function selectFolder(nextFolderId: number | null) {
     setFolderId(nextFolderId);
     setDateRange(null);
+    setFolderCreating(false);
+    setFolderEditingId(null);
+    setFolderNameDraft("");
+    setFolderError("");
+  }
+
+  function beginCreateFolder() {
+    setFolderCreating((current) => !current);
+    setFolderEditingId(null);
+    setFolderNameDraft("");
+    setFolderError("");
+  }
+
+  function beginRenameFolder(folder: FolderItem) {
+    setFolderCreating(false);
+    setFolderEditingId(folder.id);
+    setFolderNameDraft(folder.name);
+    setFolderError("");
+  }
+
+  async function createCurrentFolder() {
+    const name = folderNameDraft.trim();
+    if (!name || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError("");
+    try {
+      await api("/api/admin/folders", {
+        method: "POST",
+        body: JSON.stringify({ name, parent_id: folderId ?? 0 }),
+      });
+      setFolderCreating(false);
+      setFolderNameDraft("");
+      await loadFolders();
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  async function renameCurrentFolder(folder: FolderItem) {
+    const name = folderNameDraft.trim();
+    if (!name || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError("");
+    try {
+      await api(`/api/admin/folders/${folder.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name }),
+      });
+      setFolderEditingId(null);
+      setFolderNameDraft("");
+      await loadFolders();
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  async function deleteCurrentFolder(folder: FolderItem) {
+    const confirmed = window.confirm(tr(
+      `确认删除文件夹「${folder.name}」吗？其中的子文件夹也会一并删除，文件本身保留在媒体库中。`,
+      `Delete the folder "${folder.name}"? Subfolders are also removed; the files themselves stay in the library.`,
+    ));
+    if (!confirmed || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError("");
+    try {
+      await api(`/api/admin/folders/${folder.id}`, { method: "DELETE" });
+      setFolderEditingId(null);
+      setFolderNameDraft("");
+      await Promise.all([loadFolders(), loadMedia(null, true)]);
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    } finally {
+      setFolderBusy(false);
+    }
   }
 
   const title = useMemo(() => {
@@ -734,7 +840,7 @@ export default function GalleryPage({
           <div className="library-title-block">
             <FolderBreadcrumb folders={folders} currentId={folderId} onNavigate={selectFolder} />
             <h1>{currentFolderName || heading}</h1>
-            {!loading && <span className="result-count">{items.length} {tr("项", "items")}</span>}
+            {!loading && <span className="result-count">{items.length + currentFolders.length} {tr("项", "items")}</span>}
           </div>
           <div className="view-mode-toggle" role="group" aria-label={tr("视图模式", "View mode")}>
             <button className={viewMode === "grid" ? "active" : ""} onClick={() => setViewMode("grid")} aria-label={tr("网格视图", "Grid view")} title={tr("网格视图", "Grid view")} type="button">
@@ -744,6 +850,16 @@ export default function GalleryPage({
               <List size={17} />
             </button>
           </div>
+          {isAdmin && folderEntriesEnabled && (
+            <button
+              className="button secondary folder-list-create-button"
+              disabled={folderBusy}
+              onClick={beginCreateFolder}
+              type="button"
+            >
+              <FolderPlus size={16} />{tr("新建文件夹", "New folder")}
+            </button>
+          )}
           {isAdmin && (
             <label className="sort-control album-scope-control">
               <Shield size={17} />
@@ -765,11 +881,25 @@ export default function GalleryPage({
             </label>
           )}
           <label className="sort-control">
-            <span className="sr-only">{tr("时间排序", "Sort by time")}</span>
-            {order === "newest" ? <ArrowDownAZ size={17} /> : <ArrowUpAZ size={17} />}
-            <select value={order} onChange={(event) => setOrder(event.target.value as "newest" | "oldest")}>
-              <option value="newest">{tr("最新优先", "Newest first")}</option>
-              <option value="oldest">{tr("最早优先", "Oldest first")}</option>
+            <span className="sr-only">{tr("文件排序", "File sorting")}</span>
+            {sortDirection === "desc" ? <ArrowDownAZ size={17} /> : <ArrowUpAZ size={17} />}
+            <select
+              aria-label={tr("文件排序", "File sorting")}
+              value={`${sortField}:${sortDirection}`}
+              onChange={(event) => {
+                const [field, direction] = event.target.value.split(":") as [SortField, SortDirection];
+                setSortField(field);
+                setSortDirection(direction);
+              }}
+            >
+              <option value="title:asc">{tr("标题 · 升序", "Title · Ascending")}</option>
+              <option value="title:desc">{tr("标题 · 降序", "Title · Descending")}</option>
+              <option value="kind:asc">{tr("类型 · 升序", "Type · Ascending")}</option>
+              <option value="kind:desc">{tr("类型 · 降序", "Type · Descending")}</option>
+              <option value="size:asc">{tr("大小 · 升序", "Size · Ascending")}</option>
+              <option value="size:desc">{tr("大小 · 降序", "Size · Descending")}</option>
+              <option value="date:asc">{tr("日期 · 升序", "Date · Ascending")}</option>
+              <option value="date:desc">{tr("日期 · 降序", "Date · Descending")}</option>
             </select>
           </label>
         </div>
@@ -786,17 +916,7 @@ export default function GalleryPage({
           </div>
         )}
         {notice && <p className="gallery-notice" role="status">{notice}</p>}
-
-        {(isAdmin || view === "private") && (
-          <FolderShelf
-            folders={folders}
-            activeFolderId={folderId}
-            admin={isAdmin}
-            onSelect={selectFolder}
-            onChanged={() => setFoldersVersion((value) => value + 1)}
-            viewMode={viewMode}
-          />
-        )}
+        {folderError && !folderCreating && <p className="form-error folder-browser-error" role="alert">{folderError}</p>}
 
         {loading ? (
           <MediaSkeleton />
@@ -807,7 +927,7 @@ export default function GalleryPage({
             <p>{error}</p>
             <button className="button secondary" onClick={() => loadMedia()} type="button">{tr("重新加载", "Reload")}</button>
           </div>
-        ) : items.length === 0 ? (
+        ) : items.length === 0 && currentFolders.length === 0 && !folderCreating ? (
           <div className="state-block">
             {timeline?.index?.status === "running" ? <LoaderCircle className="spin" size={38} /> : <FolderOpen size={38} />}
             <h2>{timeline?.index?.status === "running" ? tr("正在建立媒体索引", "Building media index") : folderId !== null ? tr("该文件夹是空的", "This folder is empty") : tr("没有找到媒体", "No media found")}</h2>
@@ -823,7 +943,21 @@ export default function GalleryPage({
           <>
             <MediaListView
               items={items}
+              folders={currentFolders}
               isAdmin={isAdmin}
+              creatingFolder={folderCreating}
+              editingFolderId={folderEditingId}
+              folderNameDraft={folderNameDraft}
+              folderBusy={folderBusy}
+              folderError={folderError}
+              onFolderNameDraft={setFolderNameDraft}
+              onCreateFolder={() => void createCurrentFolder()}
+              onCancelCreateFolder={() => { setFolderCreating(false); setFolderNameDraft(""); setFolderError(""); }}
+              onOpenFolder={selectFolder}
+              onBeginRenameFolder={beginRenameFolder}
+              onRenameFolder={(folder) => void renameCurrentFolder(folder)}
+              onCancelRenameFolder={() => { setFolderEditingId(null); setFolderNameDraft(""); setFolderError(""); }}
+              onDeleteFolder={(folder) => void deleteCurrentFolder(folder)}
               selectedKeys={selectedKeys}
               onToggleSelect={toggleSelect}
               onOpen={setSelected}
@@ -845,32 +979,71 @@ export default function GalleryPage({
           </>
         ) : (
           <>
-            <section className="date-album-list" aria-label={tr("按日期分组的收藏夹媒体", "Media grouped by date")}>
-              {groupedItems.map(([day, dayItems]) => (
-                <section className="date-album" key={day}>
-                  <div className="date-album-heading"><CalendarDays size={18} /><h2>{formatDay(day)}</h2><span>{dayItems.length} {tr("项", "items")}</span></div>
-                  <div className="media-grid">
-                    {dayItems.map((item) => {
-                      const key = itemKey(item);
-                      return (
-                        <MediaCard
-                          item={item}
-                          key={key}
-                          onOpen={() => setSelected(item)}
-                          isAdmin={isAdmin}
-                          selectable={isAdmin}
-                          selected={selectedKeys.has(key)}
-                          onToggleSelect={() => toggleSelect(item)}
-                          onLike={() => void toggleLike(item)}
-                          onReport={() => setReportDraft({ item, reasonCode: "illegal", details: "" })}
-                          socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
-                        />
-                      );
-                    })}
-                  </div>
-                </section>
-              ))}
-            </section>
+            {(currentFolders.length > 0 || folderCreating) && (
+              <FolderGridEntries
+                folders={currentFolders}
+                admin={isAdmin}
+                creating={folderCreating}
+                editingId={folderEditingId}
+                nameDraft={folderNameDraft}
+                busy={folderBusy}
+                error={folderError}
+                onNameDraft={setFolderNameDraft}
+                onCreate={() => void createCurrentFolder()}
+                onCancelCreate={() => { setFolderCreating(false); setFolderNameDraft(""); setFolderError(""); }}
+                onOpen={selectFolder}
+                onBeginRename={beginRenameFolder}
+                onRename={(folder) => void renameCurrentFolder(folder)}
+                onCancelRename={() => { setFolderEditingId(null); setFolderNameDraft(""); setFolderError(""); }}
+                onDelete={(folder) => void deleteCurrentFolder(folder)}
+              />
+            )}
+            {sortField === "date" ? (
+              <section className="date-album-list" aria-label={tr("按日期分组的收藏夹媒体", "Media grouped by date")}>
+                {groupedItems.map(([day, dayItems]) => (
+                  <section className="date-album" key={day}>
+                    <div className="date-album-heading"><CalendarDays size={18} /><h2>{formatDay(day)}</h2><span>{dayItems.length} {tr("项", "items")}</span></div>
+                    <div className="media-grid">
+                      {dayItems.map((item) => {
+                        const key = itemKey(item);
+                        return (
+                          <MediaCard
+                            item={item}
+                            key={key}
+                            onOpen={() => setSelected(item)}
+                            isAdmin={isAdmin}
+                            selectable={isAdmin}
+                            selected={selectedKeys.has(key)}
+                            onToggleSelect={() => toggleSelect(item)}
+                            onLike={() => void toggleLike(item)}
+                            onReport={() => setReportDraft({ item, reasonCode: "illegal", details: "" })}
+                            socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
+                          />
+                        );
+                      })}
+                    </div>
+                  </section>
+                ))}
+              </section>
+            ) : (
+              <section className="media-grid sorted-media-grid" aria-label={tr("已排序的收藏夹媒体", "Sorted media")}>
+                {items.map((item) => {
+                  const key = itemKey(item);
+                  return <MediaCard
+                    item={item}
+                    key={key}
+                    onOpen={() => setSelected(item)}
+                    isAdmin={isAdmin}
+                    selectable={isAdmin}
+                    selected={selectedKeys.has(key)}
+                    onToggleSelect={() => toggleSelect(item)}
+                    onLike={() => void toggleLike(item)}
+                    onReport={() => setReportDraft({ item, reasonCode: "illegal", details: "" })}
+                    socialEnabled={canUsePersonalFeatures && (view === "square" || view === "liked")}
+                  />;
+                })}
+              </section>
+            )}
             {hasMore && cursor && (
               <div className="load-more-row">
                 <button className="button secondary" disabled={loadingMore} onClick={() => loadMedia(cursor)} type="button">
@@ -1052,6 +1225,33 @@ function folderChain(folders: FolderItem[], folderId: number | null): FolderItem
   return chain;
 }
 
+export function sortFolderItems(
+  folders: FolderItem[],
+  field: SortField,
+  direction: SortDirection,
+): FolderItem[] {
+  const multiplier = direction === "asc" ? 1 : -1;
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  return folders.slice().sort((left, right) => {
+    let comparison = 0;
+    if (field === "date") {
+      comparison = Date.parse(left.updated_at) - Date.parse(right.updated_at);
+    } else if (field === "kind") {
+      comparison = 0;
+    } else if (field === "size") {
+      // Folders do not have a byte size. Keep them pinned first and use their
+      // title as a stable secondary order instead of presenting item counts as bytes.
+      comparison = 0;
+    } else {
+      comparison = collator.compare(left.name, right.name);
+    }
+    if (!Number.isFinite(comparison) || comparison === 0) {
+      comparison = collator.compare(left.name, right.name);
+    }
+    return comparison * multiplier || (left.id - right.id) * multiplier;
+  });
+}
+
 function FolderBreadcrumb({
   folders,
   currentId,
@@ -1086,174 +1286,107 @@ function FolderBreadcrumb({
   );
 }
 
-function FolderShelf({
+function FolderGridEntries({
   folders,
-  activeFolderId,
   admin,
-  onSelect,
-  onChanged,
-  viewMode,
+  creating,
+  editingId,
+  nameDraft,
+  busy,
+  error,
+  onNameDraft,
+  onCreate,
+  onCancelCreate,
+  onOpen,
+  onBeginRename,
+  onRename,
+  onCancelRename,
+  onDelete,
 }: {
   folders: FolderItem[];
-  activeFolderId: number | null;
   admin: boolean;
-  onSelect: (id: number | null) => void;
-  onChanged: () => void;
-  viewMode: "grid" | "list";
+  creating: boolean;
+  editingId: number | null;
+  nameDraft: string;
+  busy: boolean;
+  error: string;
+  onNameDraft: (value: string) => void;
+  onCreate: () => void;
+  onCancelCreate: () => void;
+  onOpen: (id: number | null) => void;
+  onBeginRename: (folder: FolderItem) => void;
+  onRename: (folder: FolderItem) => void;
+  onCancelRename: () => void;
+  onDelete: (folder: FolderItem) => void;
 }) {
   const { tr } = useI18n();
-  const parentId = activeFolderId ?? 0;
-  const children = useMemo(
-    () => folders.filter((folder) => folder.parent_id === parentId),
-    [folders, parentId],
-  );
-  const [creating, setCreating] = useState(false);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [nameDraft, setNameDraft] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-
-  if (!admin && children.length === 0) return null;
-
-  async function createFolder() {
-    const name = nameDraft.trim();
-    if (!name || busy) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api("/api/admin/folders", { method: "POST", body: JSON.stringify({ name, parent_id: parentId }) });
-      setNameDraft("");
-      setCreating(false);
-      onChanged();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function renameFolder(id: number) {
-    const name = nameDraft.trim();
-    if (!name || busy) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api(`/api/admin/folders/${id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-      setNameDraft("");
-      setEditingId(null);
-      onChanged();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function deleteFolder(id: number) {
-    const folder = folders.find((item) => item.id === id);
-    const confirmed = window.confirm(tr(
-      `确认删除文件夹「${folder?.name || id}」吗？其中的子文件夹也会一并删除，文件本身保留在媒体库中。`,
-      `Delete the folder "${folder?.name || id}"? Subfolders are also removed; the files themselves stay in the library.`,
-    ));
-    if (!confirmed || busy) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api(`/api/admin/folders/${id}`, { method: "DELETE" });
-      if (activeFolderId === id) onSelect(null);
-      onChanged();
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const headVisible = admin || children.length > 0;
   return (
-    <section className="folder-shelf" aria-label={tr("文件夹", "Folders")}>
-      {headVisible && (
-        <div className="folder-shelf-head">
-          <span className="folder-shelf-title"><Folder size={15} />{tr("文件夹", "Folders")}{children.length > 0 && <small>{children.length}</small>}</span>
-          {admin && (
-            <button
-              className="button secondary folder-shelf-add"
-              disabled={busy}
-              onClick={() => { setCreating((current) => !current); setEditingId(null); setNameDraft(""); }}
-              type="button"
-            >
-              <FolderPlus size={15} />{tr("新建文件夹", "New folder")}
-            </button>
+    <section className="media-grid folder-media-grid" aria-label={tr("文件夹", "Folders")}>
+      {creating && (
+        <div className="media-card-wrap folder-media-card folder-create-card">
+          <FolderNameForm
+            name={nameDraft}
+            busy={busy}
+            submitLabel={tr("创建", "Create")}
+            onName={onNameDraft}
+            onSubmit={onCreate}
+            onCancel={onCancelCreate}
+          />
+          {error && <p className="form-error folder-error" role="alert">{error}</p>}
+        </div>
+      )}
+      {folders.map((folder) => (
+        <div className="media-card-wrap folder-media-card" key={`folder:${folder.id}`}>
+          {editingId === folder.id ? (
+            <FolderNameForm
+              name={nameDraft}
+              busy={busy}
+              submitLabel={tr("保存", "Save")}
+              onName={onNameDraft}
+              onSubmit={() => onRename(folder)}
+              onCancel={onCancelRename}
+            />
+          ) : (
+            <>
+              <button className="media-card folder-card-open" onClick={() => onOpen(folder.id)} type="button" title={folder.name}>
+                <div className="media-poster folder-media-poster"><Folder size={52} strokeWidth={1.45} /></div>
+                <div className="media-copy">
+                  <h2 title={folder.name}>{folder.name}</h2>
+                  <p>{folder.item_count} {tr("项", "items")} · {tr("文件夹", "Folder")}</p>
+                </div>
+              </button>
+              {admin && (
+                <span className="folder-card-actions">
+                  <button title={tr("重命名", "Rename")} aria-label={`${tr("重命名", "Rename")} ${folder.name}`} onClick={() => onBeginRename(folder)} type="button"><Pencil size={14} /></button>
+                  <button className="folder-delete" title={tr("删除文件夹", "Delete folder")} aria-label={`${tr("删除文件夹", "Delete folder")} ${folder.name}`} onClick={() => onDelete(folder)} type="button"><Trash2 size={14} /></button>
+                </span>
+              )}
+            </>
           )}
         </div>
-      )}
-      {error && <p className="form-error folder-error" role="alert">{error}</p>}
-      {admin && creating && (
-        <form className="folder-inline-form folder-shelf-form" onSubmit={(event) => { event.preventDefault(); void createFolder(); }}>
-          <input value={nameDraft} maxLength={120} placeholder={tr("文件夹名称", "Folder name")} onChange={(event) => setNameDraft(event.target.value)} autoFocus aria-label={tr("文件夹名称", "Folder name")} />
-          <button className="button secondary" disabled={busy} type="submit" aria-label={tr("创建", "Create")}><Check size={13} /></button>
-          <button className="button ghost" onClick={() => setCreating(false)} type="button" aria-label={tr("取消", "Cancel")}><X size={13} /></button>
-        </form>
-      )}
-      {children.length === 0 ? (
-        admin ? <p className="muted folder-shelf-empty">{tr("还没有文件夹，点击上方新建。", "No folders here yet. Use the new-folder button.")}</p> : null
-      ) : viewMode === "list" ? (
-        <div className="folder-list">
-          {children.map((folder) => (
-            <div className="folder-list-row" key={folder.id}>
-              {editingId === folder.id ? (
-                <form className="folder-inline-form" onSubmit={(event) => { event.preventDefault(); void renameFolder(folder.id); }}>
-                  <input value={nameDraft} maxLength={120} onChange={(event) => setNameDraft(event.target.value)} autoFocus aria-label={tr("文件夹名称", "Folder name")} />
-                  <button className="button secondary" disabled={busy} type="submit" aria-label={tr("保存", "Save")}><Check size={13} /></button>
-                  <button className="button ghost" onClick={() => setEditingId(null)} type="button" aria-label={tr("取消", "Cancel")}><X size={13} /></button>
-                </form>
-              ) : (
-                <>
-                  <button className="folder-list-open" onClick={() => onSelect(folder.id)} type="button" title={folder.name}>
-                    <Folder size={18} />
-                    <span className="folder-list-name"><strong title={folder.name}>{folder.name}</strong><small>{folder.item_count} {tr("项", "items")}</small></span>
-                  </button>
-                  {admin && (
-                    <span className="folder-card-actions">
-                      <button title={tr("重命名", "Rename")} aria-label={tr("重命名", "Rename")} onClick={() => { setEditingId(folder.id); setCreating(false); setNameDraft(folder.name); }} type="button"><Pencil size={14} /></button>
-                      <button className="folder-delete" title={tr("删除文件夹", "Delete folder")} aria-label={tr("删除文件夹", "Delete folder")} onClick={() => void deleteFolder(folder.id)} type="button"><Trash2 size={14} /></button>
-                    </span>
-                  )}
-                </>
-              )}
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="folder-grid">
-          {children.map((folder) => (
-            <div className="folder-card" key={folder.id}>
-              {editingId === folder.id ? (
-                <form className="folder-inline-form folder-card-form" onSubmit={(event) => { event.preventDefault(); void renameFolder(folder.id); }}>
-                  <input value={nameDraft} maxLength={120} onChange={(event) => setNameDraft(event.target.value)} autoFocus aria-label={tr("文件夹名称", "Folder name")} />
-                  <button className="button secondary" disabled={busy} type="submit" aria-label={tr("保存", "Save")}><Check size={13} /></button>
-                  <button className="button ghost" onClick={() => setEditingId(null)} type="button" aria-label={tr("取消", "Cancel")}><X size={13} /></button>
-                </form>
-              ) : (
-                <>
-                  <button className="folder-card-open" onClick={() => onSelect(folder.id)} type="button" title={folder.name}>
-                    <Folder size={30} strokeWidth={1.7} />
-                    <strong title={folder.name}>{folder.name}</strong>
-                    <small>{folder.item_count} {tr("项", "items")}</small>
-                  </button>
-                  {admin && (
-                    <span className="folder-card-actions">
-                      <button title={tr("重命名", "Rename")} aria-label={tr("重命名", "Rename")} onClick={() => { setEditingId(folder.id); setCreating(false); setNameDraft(folder.name); }} type="button"><Pencil size={14} /></button>
-                      <button className="folder-delete" title={tr("删除文件夹", "Delete folder")} aria-label={tr("删除文件夹", "Delete folder")} onClick={() => void deleteFolder(folder.id)} type="button"><Trash2 size={14} /></button>
-                    </span>
-                  )}
-                </>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      ))}
     </section>
+  );
+}
+
+function FolderNameForm({ name, busy, submitLabel, onName, onSubmit, onCancel }: {
+  name: string;
+  busy: boolean;
+  submitLabel: string;
+  onName: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const { tr } = useI18n();
+  return (
+    <form className="folder-inline-form folder-media-form" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
+      <span className="folder-form-icon"><FolderPlus size={24} /></span>
+      <input value={name} maxLength={120} placeholder={tr("文件夹名称", "Folder name")} onChange={(event) => onName(event.target.value)} autoFocus aria-label={tr("文件夹名称", "Folder name")} />
+      <span className="folder-form-actions">
+        <button className="button secondary" disabled={busy || !name.trim()} type="submit" aria-label={submitLabel}><Check size={14} />{submitLabel}</button>
+        <button className="button ghost" disabled={busy} onClick={onCancel} type="button" aria-label={tr("取消", "Cancel")}><X size={14} /></button>
+      </span>
+    </form>
   );
 }
 
@@ -1433,7 +1566,21 @@ export function visibilityLabel(visibility: MediaVisibility, tr: (zh: string, en
 
 const MediaListView = memo(function MediaListView({
   items,
+  folders,
   isAdmin,
+  creatingFolder,
+  editingFolderId,
+  folderNameDraft,
+  folderBusy,
+  folderError,
+  onFolderNameDraft,
+  onCreateFolder,
+  onCancelCreateFolder,
+  onOpenFolder,
+  onBeginRenameFolder,
+  onRenameFolder,
+  onCancelRenameFolder,
+  onDeleteFolder,
   selectedKeys,
   onToggleSelect,
   onOpen,
@@ -1445,7 +1592,21 @@ const MediaListView = memo(function MediaListView({
   busy,
 }: {
   items: MediaItem[];
+  folders: FolderItem[];
   isAdmin: boolean;
+  creatingFolder: boolean;
+  editingFolderId: number | null;
+  folderNameDraft: string;
+  folderBusy: boolean;
+  folderError: string;
+  onFolderNameDraft: (value: string) => void;
+  onCreateFolder: () => void;
+  onCancelCreateFolder: () => void;
+  onOpenFolder: (id: number | null) => void;
+  onBeginRenameFolder: (folder: FolderItem) => void;
+  onRenameFolder: (folder: FolderItem) => void;
+  onCancelRenameFolder: () => void;
+  onDeleteFolder: (folder: FolderItem) => void;
   selectedKeys: Set<string>;
   onToggleSelect: (item: MediaItem) => void;
   onOpen: (item: MediaItem) => void;
@@ -1466,8 +1627,37 @@ const MediaListView = memo(function MediaListView({
         <span>{tr("大小", "Size")}</span>
         <span>{tr("日期", "Date")}</span>
         <span>{tr("可见性", "Visibility")}</span>
-        {isAdmin && <span className="media-list-actions-head">{tr("操作", "Actions")}</span>}
+        <span className="media-list-actions-head">{tr("快速操作", "Quick actions")}</span>
       </div>
+      {creatingFolder && (
+        <div className="folder-list-create-row">
+          <FolderNameForm
+            name={folderNameDraft}
+            busy={folderBusy}
+            submitLabel={tr("创建", "Create")}
+            onName={onFolderNameDraft}
+            onSubmit={onCreateFolder}
+            onCancel={onCancelCreateFolder}
+          />
+          {folderError && <p className="form-error folder-error" role="alert">{folderError}</p>}
+        </div>
+      )}
+      {folders.map((folder) => (
+        <FolderMediaListRow
+          folder={folder}
+          key={`folder:${folder.id}`}
+          isAdmin={isAdmin}
+          editing={editingFolderId === folder.id}
+          nameDraft={folderNameDraft}
+          busy={folderBusy}
+          onNameDraft={onFolderNameDraft}
+          onOpen={onOpenFolder}
+          onBeginRename={onBeginRenameFolder}
+          onRename={onRenameFolder}
+          onCancelRename={onCancelRenameFolder}
+          onDelete={onDeleteFolder}
+        />
+      ))}
       {items.map((item) => (
         <MediaListRow
           item={item}
@@ -1484,6 +1674,66 @@ const MediaListView = memo(function MediaListView({
           busy={busy}
         />
       ))}
+    </div>
+  );
+});
+
+const FolderMediaListRow = memo(function FolderMediaListRow({
+  folder,
+  isAdmin,
+  editing,
+  nameDraft,
+  busy,
+  onNameDraft,
+  onOpen,
+  onBeginRename,
+  onRename,
+  onCancelRename,
+  onDelete,
+}: {
+  folder: FolderItem;
+  isAdmin: boolean;
+  editing: boolean;
+  nameDraft: string;
+  busy: boolean;
+  onNameDraft: (value: string) => void;
+  onOpen: (id: number | null) => void;
+  onBeginRename: (folder: FolderItem) => void;
+  onRename: (folder: FolderItem) => void;
+  onCancelRename: () => void;
+  onDelete: (folder: FolderItem) => void;
+}) {
+  const { tr } = useI18n();
+  return (
+    <div className={`media-list-row folder-media-list-row${isAdmin ? "" : " no-check"}`} role="row">
+      {isAdmin && <span className="media-list-check" />}
+      {editing ? (
+        <form className="folder-inline-form folder-row-edit-form" onSubmit={(event) => { event.preventDefault(); onRename(folder); }}>
+          <input value={nameDraft} maxLength={120} onChange={(event) => onNameDraft(event.target.value)} autoFocus aria-label={tr("文件夹名称", "Folder name")} />
+          <button className="button secondary" disabled={busy || !nameDraft.trim()} type="submit" aria-label={tr("保存", "Save")}><Check size={13} /></button>
+          <button className="button ghost" disabled={busy} onClick={onCancelRename} type="button" aria-label={tr("取消", "Cancel")}><X size={13} /></button>
+        </form>
+      ) : (
+        <button className="media-list-title folder-list-title" onClick={() => onOpen(folder.id)} type="button" title={tr("打开文件夹", "Open folder")}>
+          <span className="media-list-thumb folder-list-thumb"><Folder size={25} strokeWidth={1.6} /></span>
+          <span className="media-list-title-copy">
+            <strong title={folder.name}>{folder.name}</strong>
+            <small>{folder.item_count} {tr("项", "items")}</small>
+          </span>
+        </button>
+      )}
+      <span className="media-list-kind"><Folder size={16} /><small>{tr("文件夹", "folder")}</small></span>
+      <span className="media-list-size">—</span>
+      <span className="media-list-date">{formatDate(folder.updated_at)}</span>
+      <span className="media-list-visibility"><span className="visibility-pill folder">{tr("文件夹", "Folder")}</span></span>
+      <span className="media-list-actions" onClick={(event) => event.stopPropagation()}>
+        {isAdmin && !editing && (
+          <>
+            <button className="icon-button" disabled={busy} onClick={() => onBeginRename(folder)} title={tr("重命名", "Rename")} aria-label={`${tr("重命名", "Rename")} ${folder.name}`} type="button"><Pencil size={16} /></button>
+            <button className="icon-button list-delete-button" disabled={busy} onClick={() => onDelete(folder)} title={tr("删除文件夹", "Delete folder")} aria-label={`${tr("删除文件夹", "Delete folder")} ${folder.name}`} type="button"><Trash2 size={16} /></button>
+          </>
+        )}
+      </span>
     </div>
   );
 });
@@ -1535,16 +1785,19 @@ const MediaListRow = memo(function MediaListRow({
         <span className={`visibility-pill ${item.visibility}`}>{visibilityLabel(item.visibility, tr)}</span>
         {socialEnabled && <span className="media-social-actions"><button className={item.liked_by_me ? "liked" : ""} disabled={item.owned_by_me} onClick={() => onLike(item)} title={tr("点赞", "Like")} type="button"><Heart size={15} fill={item.liked_by_me ? "currentColor" : "none"} />{item.like_count || 0}</button><button onClick={() => onReport(item)} title={tr("举报", "Report")} type="button"><Siren size={15} /></button></span>}
       </span>
-      {isAdmin && (
-        <span className="media-list-actions" onClick={(event) => event.stopPropagation()}>
+      <span className="media-list-actions" onClick={(event) => event.stopPropagation()}>
+          <EncryptedDownloadButton item={item} iconOnly />
+        {isAdmin && (
+          <>
           <select value={item.visibility} disabled={busy} onChange={(event) => onVisibility(item, event.target.value as MediaVisibility)} aria-label={`${tr("可见性", "Visibility")} ${item.title}`}>
             <option value="public">{tr("公开", "Public")}</option>
             <option value="private">{tr("私有", "Private")}</option>
             <option value="hidden">{tr("隐藏", "Hidden")}</option>
           </select>
           <button className="icon-button list-delete-button" disabled={busy} onClick={() => onDelete(item)} title={tr("删除", "Delete")} aria-label={`${tr("删除", "Delete")} ${item.title}`} type="button"><Trash2 size={16} /></button>
-        </span>
-      )}
+          </>
+        )}
+      </span>
     </div>
   );
 });

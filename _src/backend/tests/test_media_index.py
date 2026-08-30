@@ -61,6 +61,42 @@ async def test_visibility_filter_and_local_title_are_preserved(database: Databas
 
 
 @pytest.mark.asyncio
+async def test_media_sorting_supports_all_columns_and_stable_pagination(database: Database) -> None:
+    entries = [
+        {**media("alpha", 10, "2026-08-03T10:00:00+00:00", "Zulu"), "kind": "video", "mime_type": "video/mp4", "size": 900},
+        {**media("alpha", 20, "2026-08-01T10:00:00+00:00", "alpha"), "kind": "file", "mime_type": "application/pdf", "size": 100},
+        {**media("alpha", 30, "2026-08-02T10:00:00+00:00", "Bravo"), "kind": "audio", "mime_type": "audio/mpeg", "size": 500},
+    ]
+    for entry in entries:
+        await database.upsert_media_index(entry)
+
+    title_page, title_cursor, title_more = await database.list_media_index(
+        account_id="alpha", limit=2, cursor=None, order="newest", kind="all", query="",
+        visibility="private", sort_by="title", sort_direction="asc",
+    )
+    assert [item["title"] for item in title_page] == ["alpha", "Bravo"]
+    assert all("sort_value" not in item for item in title_page)
+    assert title_more and isinstance(title_cursor, str)
+    title_tail, _, title_tail_more = await database.list_media_index(
+        account_id="alpha", limit=2, cursor=title_cursor, order="newest", kind="all", query="",
+        visibility="private", sort_by="title", sort_direction="asc",
+    )
+    assert [item["title"] for item in title_tail] == ["Zulu"]
+    assert not title_tail_more
+
+    for field, direction, expected in [
+        ("kind", "asc", [30, 20, 10]),
+        ("size", "desc", [10, 30, 20]),
+        ("date", "asc", [20, 30, 10]),
+    ]:
+        sorted_items, _, _ = await database.list_media_index(
+            account_id="alpha", limit=10, cursor=None, order="newest", kind="all", query="",
+            visibility="private", sort_by=field, sort_direction=direction,
+        )
+        assert [item["id"] for item in sorted_items] == expected
+
+
+@pytest.mark.asyncio
 async def test_helper_provenance_promotes_existing_row_once_and_preserves_admin_override(database: Database) -> None:
     item = media("alpha", 9, "2026-08-19T10:00:00+00:00", "helper")
     await database.upsert_media_index(item)

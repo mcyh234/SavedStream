@@ -1408,6 +1408,7 @@ class Database:
         raw["height"] = int(raw["height"]) if raw["height"] is not None else None
         raw["local_title"] = raw.get("local_title") or None
         raw["title"] = raw.get("title") or raw["original_title"]
+        raw.pop("sort_value", None)
         if not include_provenance:
             # Provenance is used for server-side reconciliation and must not
             # leak Telegram user IDs or internal moderation metadata through
@@ -1719,6 +1720,55 @@ class Database:
         except (ValueError, UnicodeDecodeError, binascii.Error):
             raise ValueError("invalid media cursor")
 
+    @staticmethod
+    def _encode_media_sort_cursor(
+        sort_by: str,
+        direction: str,
+        value: str | int,
+        account_id: str,
+        message_id: int,
+    ) -> str:
+        import base64
+        import json
+
+        payload = json.dumps(
+            {
+                "v": 2,
+                "sort": sort_by,
+                "direction": direction,
+                "value": value,
+                "account": account_id,
+                "id": int(message_id),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_media_sort_cursor(cursor: str | int | None) -> dict[str, Any] | None:
+        if cursor is None or cursor == "":
+            return None
+        import base64
+        import json
+
+        try:
+            padded = str(cursor) + "=" * ((4 - len(str(cursor)) % 4) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("v") != 2
+                or payload.get("sort") not in {"title", "kind", "size", "date"}
+                or payload.get("direction") not in {"asc", "desc"}
+                or not isinstance(payload.get("account"), str)
+                or not isinstance(payload.get("id"), int)
+                or not isinstance(payload.get("value"), (str, int))
+            ):
+                raise ValueError
+            return payload
+        except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+            raise ValueError("invalid media sort cursor") from None
+
     async def list_media_index(
         self,
         *,
@@ -1738,6 +1788,8 @@ class Database:
         viewer_user_id: int | None = None,
         include_provenance: bool = False,
         folder_id: int | None = None,
+        sort_by: str | None = None,
+        sort_direction: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | int | None, bool]:
         clauses = ["m.deleted=0"]
         params: list[Any] = []
@@ -1821,20 +1873,52 @@ class Database:
         if date_to:
             clauses.append("m.date_day<=?")
             params.append(date_to)
-        direction = "ASC" if order == "oldest" else "DESC"
-        decoded_cursor = self._decode_media_cursor(cursor, account_id)
-        if decoded_cursor is not None:
-            cursor_id, cursor_account = decoded_cursor
-            direction = "ASC" if order == "oldest" else "DESC"
-            operator = ">" if order == "oldest" else "<"
-            if cursor_account is None:
-                clauses.append(f"m.message_id {operator} ?")
-                params.append(cursor_id)
-            else:
+        legacy_order = sort_by is None
+        resolved_sort = sort_by or "date"
+        resolved_direction = sort_direction or ("asc" if order == "oldest" else "desc")
+        if resolved_sort not in {"title", "kind", "size", "date"}:
+            raise ValueError("invalid media sort field")
+        if resolved_direction not in {"asc", "desc"}:
+            raise ValueError("invalid media sort direction")
+        direction = "ASC" if resolved_direction == "asc" else "DESC"
+        operator = ">" if resolved_direction == "asc" else "<"
+        sort_expressions = {
+            "title": "lower(COALESCE(NULLIF(t.local_title,''),NULLIF(m.original_title,''),m.filename,''))",
+            "kind": "COALESCE(m.kind,'file')",
+            "size": "COALESCE(m.size,0)",
+            "date": "COALESCE(m.message_date,'')",
+        }
+        sort_expression = sort_expressions[resolved_sort]
+        if legacy_order:
+            decoded_cursor = self._decode_media_cursor(cursor, account_id)
+            if decoded_cursor is not None:
+                cursor_id, cursor_account = decoded_cursor
+                legacy_operator = ">" if order == "oldest" else "<"
+                if cursor_account is None:
+                    clauses.append(f"m.message_id {legacy_operator} ?")
+                    params.append(cursor_id)
+                else:
+                    clauses.append(
+                        f"(m.message_id {legacy_operator} ? OR (m.message_id=? AND m.account_id {legacy_operator} ?))"
+                    )
+                    params.extend([cursor_id, cursor_id, cursor_account])
+        else:
+            decoded_sort_cursor = self._decode_media_sort_cursor(cursor)
+            if decoded_sort_cursor is not None:
+                if (
+                    decoded_sort_cursor["sort"] != resolved_sort
+                    or decoded_sort_cursor["direction"] != resolved_direction
+                ):
+                    raise ValueError("media sort cursor does not match requested ordering")
+                cursor_value = decoded_sort_cursor["value"]
+                cursor_account = decoded_sort_cursor["account"]
+                cursor_id = int(decoded_sort_cursor["id"])
                 clauses.append(
-                    f"(m.message_id {operator} ? OR (m.message_id=? AND m.account_id {operator} ?))"
+                    f"({sort_expression} {operator} ? OR "
+                    f"({sort_expression}=? AND (m.account_id {operator} ? OR "
+                    f"(m.account_id=? AND m.message_id {operator} ?))))"
                 )
-                params.extend([cursor_id, cursor_id, cursor_account])
+                params.extend([cursor_value, cursor_value, cursor_account, cursor_account, cursor_id])
         params.append(int(limit) + 1)
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -1843,10 +1927,17 @@ class Database:
                 "SELECT m.*, t.local_title, COALESCE(NULLIF(t.local_title,''), m.original_title) AS title, "
                 "(SELECT COUNT(*) FROM media_likes lc WHERE lc.account_id=m.account_id AND lc.message_id=m.message_id) AS like_count, "
                 "EXISTS(SELECT 1 FROM media_likes lm WHERE lm.user_id=? AND lm.account_id=m.account_id AND lm.message_id=m.message_id) AS liked_by_me, "
-                "CASE WHEN m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?) THEN 1 ELSE 0 END AS owned_by_me "
+                "CASE WHEN m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?) THEN 1 ELSE 0 END AS owned_by_me, "
+                f"{sort_expression} AS sort_value "
                 "FROM media_index m LEFT JOIN media_metadata_v2 t ON t.account_id=m.account_id AND t.message_id=m.message_id "
                 f"{fts_join} {folder_join} "
-                f"WHERE {' AND '.join(clauses)} ORDER BY m.message_id {direction}, m.account_id {direction} LIMIT ?",
+                f"WHERE {' AND '.join(clauses)} ORDER BY "
+                + (
+                    f"m.message_id {direction}, m.account_id {direction}"
+                    if legacy_order
+                    else f"sort_value {direction}, m.account_id {direction}, m.message_id {direction}"
+                )
+                + " LIMIT ?",
                 [viewer_id, viewer_id, str(owner_telegram_user_id or ""), *params],
             )
             rows = await cursor_obj.fetchall()
@@ -1856,7 +1947,16 @@ class Database:
         if not has_more or not items:
             return items, None, has_more
         next_cursor: str | int
-        if account_id:
+        if not legacy_order:
+            last_row = rows[-1]
+            next_cursor = self._encode_media_sort_cursor(
+                resolved_sort,
+                resolved_direction,
+                last_row["sort_value"],
+                str(last_row["account_id"]),
+                int(last_row["message_id"]),
+            )
+        elif account_id:
             next_cursor = items[-1]["id"]
         else:
             next_cursor = self._encode_media_cursor(items[-1]["id"], str(items[-1]["account_id"]))
@@ -3687,18 +3787,23 @@ class Database:
     async def list_folders(
         self,
         *,
+        owner_user_id: int | None = None,
         owner_telegram_user_id: str | None = None,
         include_hidden: bool = False,
     ) -> list[dict[str, Any]]:
         """List folders with per-item counts limited to what the caller may see."""
         count_condition = ""
         count_params: list[Any] = []
-        if owner_telegram_user_id:
+        restricted_owner = owner_user_id is not None or owner_telegram_user_id is not None
+        if restricted_owner:
             count_condition = (
-                " AND ((m.visibility='public' AND m.review_status='approved' AND m.hidden=0) "
-                "OR m.submitter_telegram_user_id=?)"
+                " AND (m.owner_user_id=? OR (m.owner_user_id IS NULL AND m.submitter_telegram_user_id=?))"
+                " AND m.requested_visibility='private' AND m.visibility='private' AND m.hidden=0"
             )
-            count_params.append(str(owner_telegram_user_id))
+            count_params.extend([
+                int(owner_user_id) if owner_user_id is not None else -1,
+                str(owner_telegram_user_id or ""),
+            ])
         elif not include_hidden:
             count_condition = " AND m.hidden=0"
         async with aiosqlite.connect(self.path) as db:
@@ -3713,7 +3818,26 @@ class Database:
                 "FROM media_folders f ORDER BY f.parent_id, f.name",
                 count_params,
             )
-            return [dict(row) for row in await cursor.fetchall()]
+            folders = [dict(row) for row in await cursor.fetchall()]
+        if not restricted_owner:
+            return folders
+
+        # Do not leak folder names that contain only another user's private
+        # media. Keep ancestors of the caller's visible folders so nested
+        # navigation remains intact without exposing unrelated sibling trees.
+        by_id = {int(folder["id"]): folder for folder in folders}
+        visible_ids = {int(folder["id"]) for folder in folders if int(folder["item_count"] or 0) > 0}
+        for folder_id in list(visible_ids):
+            current = by_id.get(folder_id)
+            seen: set[int] = set()
+            while current and int(current.get("parent_id") or 0) > 0:
+                parent_id = int(current["parent_id"])
+                if parent_id in seen:
+                    break
+                seen.add(parent_id)
+                visible_ids.add(parent_id)
+                current = by_id.get(parent_id)
+        return [folder for folder in folders if int(folder["id"]) in visible_ids]
 
     async def set_folder_items(self, folder_id: int, entries: Iterable[dict[str, Any]]) -> int:
         """Move media into one folder, replacing any previous folder location."""
