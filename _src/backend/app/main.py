@@ -14,13 +14,14 @@ import aiosqlite
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -426,6 +427,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SavedStream", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Apply a consistent browser hardening baseline to every response.
+
+    The service is deployed behind Caddy/Cloudflare, so these headers are set
+    at the application boundary as well as at the reverse proxy.  Keeping the
+    policy here also covers JSON errors, metadata endpoints, and static assets.
+    """
+    response = await call_next(request)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("Content-Security-Policy", "; ".join((
+        "default-src 'self'",
+        "base-uri 'self'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "font-src 'self' data:",
+        "connect-src 'self'",
+    )))
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 # Keep a process-local handle for administrator cancellation.  The upload
 # state itself remains durable in SQLite, so a restart still exposes the last
@@ -1262,7 +1297,21 @@ async def public_status(
     admin_cookie: str | None = Cookie(default=None, alias=ADMIN_COOKIE),
     principal: AccessPrincipal | None = Depends(optional_access_principal),
 ) -> dict:
-    tg_status = await telegram.status()
+    # Keep the unauthenticated bootstrap response deliberately small. In
+    # particular, Telegram connectivity, helper-bot identity, and detailed
+    # deployment state are operational information and must not be exposed to
+    # anonymous probes. Authenticated sessions still receive these fields so
+    # the UI can render account/connection state and administrators retain
+    # existing diagnostics.
+    authenticated_principal = principal is not None
+    tg_status: dict[str, Any] | None = None
+    helper_bot_username: str | None = None
+    if authenticated_principal:
+        tg_status = await telegram.status()
+        try:
+            helper_bot_username = (await telegram.helper_bot_status()).get("username")
+        except TelegramUnavailable:
+            helper_bot_username = None
     registration_enabled, _, _, _, registration_requires_approval = await _registration_config(database)
     if principal and principal.user_id and not principal.is_admin:
         user = await _sync_auth_user_binding(
@@ -1290,24 +1339,15 @@ async def public_status(
         media_session_id = hashlib.sha256(
             f"{settings.admin_key}\0{settings.api_hash}\0{principal.user_id}\0{principal.username}".encode("utf-8")
         ).hexdigest()[:32]
-    try:
-        helper_bot_username = (await telegram.helper_bot_status()).get("username")
-    except TelegramUnavailable:
-        helper_bot_username = None
-    return {
+    response: dict[str, Any] = {
         "configuration_ok": settings.configuration_ok,
-        "telegram_authenticated": tg_status["authenticated"],
-        "telegram_state": tg_status["state"],
-        "telegram_error": tg_status["error"],
         "access_restricted": True,
         "viewer_authenticated": media_authenticated,
         "admin_authenticated": admin_authenticated,
         "media_authenticated": media_authenticated,
         "access_status": "admin" if admin_authenticated else principal.user_status if principal else "unauthenticated",
         "access_account_id": principal.account_id if principal and not principal.is_admin else None,
-        "helper_bot_username": helper_bot_username,
         "public_album_enabled": public_enabled,
-        "public_key_configured": bool(public_key_hash),
         "public_authenticated": media_authenticated,
         "personal_features_available": bool(principal and principal.user_id is not None),
         "media_session_id": media_session_id,
@@ -1320,6 +1360,17 @@ async def public_status(
             "role": principal.role,
         } if principal and principal.is_admin else None,
     }
+    if tg_status is not None:
+        response.update({
+            "telegram_authenticated": bool(tg_status.get("authenticated")),
+            "telegram_state": tg_status.get("state"),
+            "telegram_error": tg_status.get("error"),
+            "helper_bot_username": helper_bot_username,
+        })
+        # The public-key provisioning state is an administrator/session detail;
+        # it is not needed by the anonymous login gate.
+        response["public_key_configured"] = bool(public_key_hash)
+    return response
 
 
 @app.post("/api/admin/login")
@@ -4865,13 +4916,95 @@ async def health() -> dict[str, str]:
 
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.api_route(
+    "/api/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def api_not_found(path: str) -> JSONResponse:
+    """Return a structured JSON 404 for every unknown API path.
+
+    This fallback is registered even when the production static bundle is not
+    mounted (for example during backend-only tests), so API typos never depend
+    on the SPA serving mode.
+    """
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": {"code": "API_NOT_FOUND", "path": f"/api/{path}"},
+            "code": "API_NOT_FOUND",
+        },
+    )
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+async def sitemap(request: Request) -> Response:
+    """Return a real sitemap instead of allowing the SPA fallback to answer."""
+    origin = xml_escape(str(request.base_url).rstrip("/"), {"'": "&apos;", '"': "&quot;"})
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{origin}/</loc></url>\n"
+        "</urlset>\n"
+    )
+    return Response(content=body, media_type="application/xml")
+
+
+@app.get("/.well-known/security.txt", include_in_schema=False)
+async def security_txt(request: Request) -> PlainTextResponse:
+    """Publish the standard security contact document with a text content type."""
+    origin = str(request.base_url).rstrip("/")
+    contact = os.getenv("SECURITY_CONTACT", "").strip()
+    if not contact:
+        raise HTTPException(status_code=404, detail={"code": "SECURITY_CONTACT_NOT_CONFIGURED"})
+    expires = (datetime.now(timezone.utc) + timedelta(days=365)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return PlainTextResponse(
+        "\n".join((
+            f"Contact: {contact}",
+            f"Canonical: {origin}/.well-known/security.txt",
+            f"Expires: {expires}",
+            "Preferred-Languages: zh, en",
+            "",
+        )),
+        media_type="text/plain",
+    )
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt(request: Request) -> PlainTextResponse:
+    origin = str(request.base_url).rstrip("/")
+    return PlainTextResponse(
+        "\n".join((
+            "User-agent: *",
+            "Disallow: /api/",
+            "Disallow: /admin",
+            f"Sitemap: {origin}/sitemap.xml",
+            "",
+        )),
+        media_type="text/plain",
+    )
+
+
 if STATIC_DIR.exists():
     assets_dir = STATIC_DIR / "assets"
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
-    async def spa(path: str) -> FileResponse:
+    async def spa(path: str) -> Response:
+        # Never serve the application shell for an unknown API endpoint. This
+        # makes typos and stale clients observable and prevents a misleading
+        # HTTP 200 HTML response from masking an API 404.
+        if path == "api" or path.startswith("api/"):
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": {"code": "API_NOT_FOUND", "path": f"/{path}"},
+                    "code": "API_NOT_FOUND",
+                },
+            )
         requested = STATIC_DIR / path
         if path and requested.is_file() and STATIC_DIR in requested.resolve().parents:
             return FileResponse(requested)

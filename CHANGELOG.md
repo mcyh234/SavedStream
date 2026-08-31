@@ -5,6 +5,12 @@
 > 本文档汇总最近一次功能迭代的全部变更：媒体库视图与管理员操作、文件夹、信箱通知、管理后台分页、主题切换，以及随后的修复与运维能力（缩略图流量优化、部署备份管理、存储感知告警）。
 > 项目整体结构、架构与原有功能说明见 [PROJECT.md](PROJECT.md)。
 
+## 渗透测试安全加固（2026-08-31）
+
+- 匿名访问 /api/status 仅返回登录引导所需的最小字段；Telegram 连接状态、Helper Bot 标识及公钥配置状态改为登录后返回。
+- 全站统一添加 HSTS、CSP、X-Content-Type-Options、Referrer-Policy、Permissions-Policy、点击劫持防护和 API no-store 缓存策略。
+- /sitemap.xml、/.well-known/security.txt、/robots.txt 返回正确的标准内容类型；未知 /api/* 路径不再回退 SPA HTML，改为结构化 JSON 404。
+
 ## 文件夹统一列表、列排序与快速下载
 
 - 文件夹不再使用独立的文件夹框，而是与普通文件共用同一个列表/网格区域，并始终置于当前目录文件之前；文件夹行显示类型、更新时间和快捷管理操作。

@@ -97,7 +97,10 @@ export default function App() {
     );
   }
 
-  if (!status.telegram_authenticated) {
+  // Anonymous bootstrap responses intentionally omit Telegram operational
+  // details. Authenticated sessions receive the field and can render the
+  // connection gate when the managed account is unavailable.
+  if (status.telegram_authenticated === false) {
     if (!status.admin_authenticated) return (
       <AccountStateGate
         accessStatus={status.access_status}

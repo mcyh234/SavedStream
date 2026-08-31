@@ -4,18 +4,19 @@ export type MediaVisibility = "public" | "private" | "hidden";
 
 export interface PublicStatus {
   configuration_ok: boolean;
-  telegram_authenticated: boolean;
-  telegram_state: string;
-  telegram_error: string | null;
+  /** Operational Telegram details are returned only after authentication. */
+  telegram_authenticated?: boolean;
+  telegram_state?: string;
+  telegram_error?: string | null;
   access_restricted: boolean;
   viewer_authenticated: boolean;
   admin_authenticated: boolean;
   media_authenticated: boolean;
   access_status: "unauthenticated" | "pending" | "approved" | "disabled" | "denied" | "admin";
   access_account_id: string | null;
-  helper_bot_username: string | null;
+  helper_bot_username?: string | null;
   public_album_enabled: boolean;
-  public_key_configured: boolean;
+  public_key_configured?: boolean;
   public_authenticated: boolean;
   personal_features_available: boolean;
   media_session_id: string | null;
